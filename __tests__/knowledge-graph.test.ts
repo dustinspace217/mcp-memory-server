@@ -651,4 +651,136 @@ describe('KnowledgeGraphManager', () => {
       expect(result.entities[0].name).toBe('Alice');
     });
   });
+
+  describe('observation deduplication within createEntities', () => {
+    it('should deduplicate observations within a single entity', async () => {
+      // Previously this bug allowed ['a', 'a'] to create two identical observations
+      const entities = await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: ['same', 'same', 'different'] },
+      ]);
+
+      expect(entities[0].observations).toHaveLength(2);
+      expect(entities[0].observations.map(o => o.content)).toEqual(['same', 'different']);
+    });
+  });
+
+  describe('addObservations dedup within single contents array', () => {
+    it('should deduplicate within the contents array itself', async () => {
+      // Previously addObservations(['foo', 'foo']) would add both because
+      // the dedup Set was built from existing observations only
+      await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: [] },
+      ]);
+
+      const results = await manager.addObservations([
+        { entityName: 'Alice', contents: ['foo', 'foo', 'bar'] },
+      ]);
+
+      expect(results[0].addedObservations).toHaveLength(2);
+      expect(results[0].addedObservations.map(o => o.content)).toEqual(['foo', 'bar']);
+
+      const graph = await manager.readGraph();
+      const alice = graph.entities.find(e => e.name === 'Alice');
+      expect(alice?.observations).toHaveLength(2);
+    });
+  });
+
+  describe('normalizeObservation validation', () => {
+    it('should throw on invalid observation format during load', async () => {
+      // Write a JSONL file with an entity that has an invalid observation (number instead of string/object)
+      const badEntity = JSON.stringify({
+        type: 'entity',
+        name: 'Bad',
+        entityType: 'test',
+        observations: [42],
+      });
+      await fs.writeFile(testFilePath, badEntity + '\n');
+
+      // loadGraph should skip malformed lines (the entity line itself will error
+      // during normalizeObservation and be caught by the per-line try/catch)
+      const graph = await manager.readGraph();
+      // The entity with invalid observations is skipped entirely
+      expect(graph.entities).toHaveLength(0);
+    });
+
+    it('should handle objects missing the content field', async () => {
+      const badEntity = JSON.stringify({
+        type: 'entity',
+        name: 'Bad',
+        entityType: 'test',
+        observations: [{ notContent: 'oops' }],
+      });
+      await fs.writeFile(testFilePath, badEntity + '\n');
+
+      const graph = await manager.readGraph();
+      expect(graph.entities).toHaveLength(0);
+    });
+  });
+
+  describe('malformed JSONL error isolation', () => {
+    it('should skip malformed lines and load valid ones', async () => {
+      const validEntity = JSON.stringify({
+        type: 'entity',
+        name: 'Valid',
+        entityType: 'test',
+        observations: ['good'],
+      });
+      const malformedLine = '{ this is not valid JSON }}';
+      const validRelation = JSON.stringify({
+        type: 'relation',
+        from: 'Valid',
+        to: 'Valid',
+        relationType: 'self',
+      });
+
+      // Write file with a malformed line sandwiched between valid lines
+      await fs.writeFile(testFilePath, [validEntity, malformedLine, validRelation].join('\n') + '\n');
+
+      const graph = await manager.readGraph();
+      expect(graph.entities).toHaveLength(1);
+      expect(graph.entities[0].name).toBe('Valid');
+      expect(graph.relations).toHaveLength(1);
+    });
+
+    it('should skip lines with unrecognized type values', async () => {
+      const futureType = JSON.stringify({
+        type: 'tag',
+        value: 'something-new',
+      });
+      const validEntity = JSON.stringify({
+        type: 'entity',
+        name: 'Present',
+        entityType: 'test',
+        observations: [],
+      });
+
+      await fs.writeFile(testFilePath, [futureType, validEntity].join('\n') + '\n');
+
+      const graph = await manager.readGraph();
+      // Unrecognized types are silently ignored (forward compatibility)
+      expect(graph.entities).toHaveLength(1);
+      expect(graph.entities[0].name).toBe('Present');
+    });
+  });
+
+  describe('atomic writes', () => {
+    it('should write a trailing newline to the JSONL file', async () => {
+      await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: [] },
+      ]);
+
+      const fileContent = await fs.readFile(testFilePath, 'utf-8');
+      // JSONL files should end with a trailing newline
+      expect(fileContent.endsWith('\n')).toBe(true);
+    });
+
+    it('should not leave temp files after successful write', async () => {
+      await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: [] },
+      ]);
+
+      // The .tmp file should be renamed to the real file, not left behind
+      await expect(fs.access(testFilePath + '.tmp')).rejects.toThrow();
+    });
+  });
 });

@@ -7,10 +7,22 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// Define memory file path using environment variable with fallback
+// Default memory file path, used when MEMORY_FILE_PATH env var is not set
 export const defaultMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.jsonl');
 
-// Handle backward compatibility: migrate memory.json to memory.jsonl if needed
+/**
+ * Resolves the memory file path with backward-compatibility migration.
+ *
+ * Priority:
+ * 1. If MEMORY_FILE_PATH env var is set, use it (resolving relative paths against
+ *    the script directory, not cwd).
+ * 2. If no env var is set, check for a legacy "memory.json" file alongside the script.
+ *    If found (and no "memory.jsonl" exists), rename it to "memory.jsonl" and log
+ *    the migration to stderr.
+ * 3. Otherwise, return the default "memory.jsonl" path alongside the script.
+ *
+ * @returns Absolute path to the JSONL memory file.
+ */
 export async function ensureMemoryFilePath(): Promise<string> {
   if (process.env.MEMORY_FILE_PATH) {
     // Custom path provided, use it as-is (with absolute path resolution)
@@ -43,10 +55,8 @@ export async function ensureMemoryFilePath(): Promise<string> {
   }
 }
 
-// Initialize memory file path (will be set during startup)
+// Memory file path — declared here, set by main() after resolving env var and migration logic
 let MEMORY_FILE_PATH: string;
-
-// We are storing our memory using entities, relations, and observations in a graph structure
 
 // An observation is a single piece of knowledge attached to an entity.
 // Each observation carries a creation timestamp for staleness detection.
@@ -72,13 +82,31 @@ export interface KnowledgeGraph {
   relations: Relation[];
 }
 
-// Converts a legacy string observation (from old JSONL files) into an Observation object.
-// Uses 'unknown' as the timestamp since we don't know when it was originally created.
+/**
+ * Converts a legacy string observation (from old JSONL files) into an Observation object,
+ * or validates that an existing object has the required shape.
+ *
+ * String observations get createdAt: 'unknown' since we don't know when they were created.
+ * Object observations are validated for required fields — malformed data throws rather than
+ * silently propagating corruption through the graph.
+ *
+ * @param obs - Raw observation from JSONL: either a plain string (legacy) or an object
+ * @returns A valid Observation with content and createdAt fields
+ * @throws Error if obs is not a string and doesn't have a valid content field
+ */
 function normalizeObservation(obs: unknown): Observation {
   if (typeof obs === 'string') {
     return { content: obs, createdAt: 'unknown' };
   }
-  return obs as Observation;
+  // Validate object shape instead of blindly casting — catches corrupted JSONL entries
+  if (typeof obs === 'object' && obs !== null && 'content' in obs && typeof (obs as any).content === 'string') {
+    const o = obs as { content: string; createdAt?: unknown };
+    return {
+      content: o.content,
+      createdAt: typeof o.createdAt === 'string' ? o.createdAt : 'unknown',
+    };
+  }
+  throw new Error(`Invalid observation format: ${JSON.stringify(obs)}`);
 }
 
 // Creates a new Observation with the current UTC timestamp.
@@ -91,28 +119,48 @@ function createObservation(content: string): Observation {
 export class KnowledgeGraphManager {
   constructor(private memoryFilePath: string) {}
 
+  /**
+   * Reads the JSONL file from disk and parses it into a KnowledgeGraph.
+   * Each line is a JSON object with a "type" field ("entity" or "relation") used for
+   * routing during parsing — the type field is NOT included in the returned objects.
+   *
+   * Legacy observations (stored as plain strings in old files) are auto-migrated to
+   * Observation objects with createdAt: 'unknown' via normalizeObservation().
+   *
+   * Malformed lines are logged to stderr and skipped rather than crashing the entire load.
+   * Lines with unrecognized type values are silently ignored (forward compatibility).
+   *
+   * @returns The full knowledge graph. Returns an empty graph if the file does not exist.
+   * @throws Re-throws any file read error that is not ENOENT (file not found).
+   */
   private async loadGraph(): Promise<KnowledgeGraph> {
     try {
       const data = await fs.readFile(this.memoryFilePath, "utf-8");
       const lines = data.split("\n").filter(line => line.trim() !== "");
-      return lines.reduce((graph: KnowledgeGraph, line) => {
-        const item = JSON.parse(line);
-        if (item.type === "entity") {
-          graph.entities.push({
-            name: item.name,
-            entityType: item.entityType,
-            observations: (item.observations || []).map(normalizeObservation)
-          });
+      const graph: KnowledgeGraph = { entities: [], relations: [] };
+      for (const line of lines) {
+        try {
+          const item = JSON.parse(line);
+          if (item.type === "entity") {
+            graph.entities.push({
+              name: item.name,
+              entityType: item.entityType,
+              observations: (item.observations || []).map(normalizeObservation)
+            });
+          } else if (item.type === "relation") {
+            graph.relations.push({
+              from: item.from,
+              to: item.to,
+              relationType: item.relationType
+            });
+          }
+          // Lines with unrecognized type values are silently skipped (forward compatibility)
+        } catch (parseError) {
+          // Skip malformed lines instead of crashing the entire load
+          console.error(`Skipping malformed JSONL line: ${line.substring(0, 100)}${line.length > 100 ? '...' : ''}`);
         }
-        if (item.type === "relation") {
-          graph.relations.push({
-            from: item.from,
-            to: item.to,
-            relationType: item.relationType
-          });
-        }
-        return graph;
-      }, { entities: [], relations: [] });
+      }
+      return graph;
     } catch (error) {
       if (error instanceof Error && 'code' in error && (error as any).code === "ENOENT") {
         return { entities: [], relations: [] };
@@ -121,6 +169,17 @@ export class KnowledgeGraphManager {
     }
   }
 
+  /**
+   * Serializes the entire knowledge graph to the JSONL file, overwriting its contents.
+   * Each entity and relation is written as a single JSON line with a "type" discriminator
+   * field added for parsing on reload. Entities are written first, then relations.
+   *
+   * Uses atomic write (temp file + rename) to prevent data corruption if the process
+   * crashes mid-write. fs.rename is atomic on POSIX-compliant filesystems when source
+   * and destination are on the same mount.
+   *
+   * @param graph - The complete graph to persist. Comes from loadGraph() after modification.
+   */
   private async saveGraph(graph: KnowledgeGraph): Promise<void> {
     const lines = [
       ...graph.entities.map(e => JSON.stringify({
@@ -136,41 +195,81 @@ export class KnowledgeGraphManager {
         relationType: r.relationType
       })),
     ];
-    await fs.writeFile(this.memoryFilePath, lines.join("\n"));
+    // Write to temp file then atomically rename to prevent corruption on crash
+    const tmpPath = this.memoryFilePath + '.tmp';
+    await fs.writeFile(tmpPath, lines.join("\n") + "\n");
+    await fs.rename(tmpPath, this.memoryFilePath);
   }
 
-  // Accepts observations as strings (auto-timestamped) or Observation objects (passed through).
-  // This flexibility lets tests pass plain strings while the MCP tool handler also passes strings.
+  /**
+   * Creates new entities in the graph. Skips any entity whose name already exists
+   * (deduplication is by name only — entityType and observations are ignored for
+   * existing entities).
+   *
+   * Observations can be passed as plain strings (auto-timestamped with the current UTC
+   * time) or as Observation objects (passed through as-is for migration/test scenarios).
+   * Duplicate observations within a single entity are deduplicated by content string.
+   *
+   * @param entities - Array of entities to create. Each has a name, entityType, and observations.
+   * @returns Only the entities that were actually created (excludes name-duplicates).
+   */
   async createEntities(entities: Array<{ name: string; entityType: string; observations: (string | Observation)[] }>): Promise<Entity[]> {
     const graph = await this.loadGraph();
-    // Normalize incoming observations: strings get a fresh timestamp, objects pass through
+    // Normalize incoming observations: strings get a fresh timestamp, objects pass through.
+    // Deduplicate observations within each entity by content string using a Map.
     const normalized: Entity[] = entities.map(e => ({
       name: e.name,
       entityType: e.entityType,
-      observations: e.observations.map(obs =>
-        typeof obs === 'string' ? createObservation(obs) : obs
-      ),
+      observations: [...new Map(
+        e.observations.map(obs => {
+          const o = typeof obs === 'string' ? createObservation(obs) : obs;
+          return [o.content, o] as const;
+        })
+      ).values()],
     }));
-    const newEntities = normalized.filter(e => !graph.entities.some(existingEntity => existingEntity.name === e.name));
+    // Use a Set for O(1) name lookups instead of .some() which is O(n*m)
+    const existingNames = new Set(graph.entities.map(e => e.name));
+    const newEntities = normalized.filter(e => !existingNames.has(e.name));
     graph.entities.push(...newEntities);
     await this.saveGraph(graph);
     return newEntities;
   }
 
+  /**
+   * Creates new relations in the graph. A relation is a directed edge from one entity
+   * to another with a relation type (e.g., "Alice" --knows--> "Bob").
+   * Deduplicates by checking all three fields (from, to, relationType).
+   *
+   * NOTE: This does NOT validate that the referenced entity names actually exist
+   * in the graph. Dangling relations are possible. SQLite foreign keys (Phase 2)
+   * will resolve this structurally.
+   *
+   * @param relations - Array of { from, to, relationType } objects.
+   * @returns Only the relations that were actually created (excludes duplicates).
+   */
   async createRelations(relations: Relation[]): Promise<Relation[]> {
     const graph = await this.loadGraph();
-    const newRelations = relations.filter(r => !graph.relations.some(existingRelation =>
-      existingRelation.from === r.from &&
-      existingRelation.to === r.to &&
-      existingRelation.relationType === r.relationType
-    ));
+    // Use a Set of composite keys for O(1) dedup lookups instead of nested .some()
+    const existingKeys = new Set(graph.relations.map(r => `${r.from}|${r.to}|${r.relationType}`));
+    const newRelations = relations.filter(r => !existingKeys.has(`${r.from}|${r.to}|${r.relationType}`));
     graph.relations.push(...newRelations);
     await this.saveGraph(graph);
     return newRelations;
   }
 
-  // Accepts content strings, creates timestamped Observation objects, deduplicates by content.
-  // Returns the newly added Observation objects (with timestamps) so callers can see what was added.
+  /**
+   * Adds new observations to existing entities. Each observation string is
+   * auto-timestamped with the current UTC time and wrapped in an Observation object.
+   * Deduplicates by content string — if an observation with the same content already
+   * exists on the entity OR appears earlier in the same contents array, it is skipped.
+   *
+   * @param observations - Array of { entityName, contents: string[] }.
+   * @returns Array of { entityName, addedObservations: Observation[] } — only the
+   *          observations that were actually added (with their new timestamps).
+   * @throws Error if any entityName does not match an existing entity. The error is
+   *         thrown before saving, so no partial writes occur for entities listed after
+   *         the missing one.
+   */
   async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: Observation[] }[]> {
     const graph = await this.loadGraph();
     const results = observations.map(o => {
@@ -178,11 +277,16 @@ export class KnowledgeGraphManager {
       if (!entity) {
         throw new Error(`Entity with name ${o.entityName} not found`);
       }
-      // Use a Set of existing content strings for O(1) dedup lookups
+      // Use a Set of existing content strings for O(1) dedup lookups.
+      // Add to the Set as we go so duplicates within the same contents array are also caught.
       const existingContents = new Set(entity.observations.map(obs => obs.content));
-      const newObservations = o.contents
-        .filter(content => !existingContents.has(content))
-        .map(content => createObservation(content));
+      const newObservations: Observation[] = [];
+      for (const content of o.contents) {
+        if (!existingContents.has(content)) {
+          existingContents.add(content);
+          newObservations.push(createObservation(content));
+        }
+      }
       entity.observations.push(...newObservations);
       return { entityName: o.entityName, addedObservations: newObservations };
     });
@@ -190,14 +294,31 @@ export class KnowledgeGraphManager {
     return results;
   }
 
+  /**
+   * Deletes entities by name and cascade-deletes relations: any relation where the
+   * deleted entity appears as either the "from" or "to" endpoint is also removed.
+   * Silently ignores names that do not match any existing entity (idempotent).
+   *
+   * @param entityNames - Array of entity name strings to delete.
+   */
   async deleteEntities(entityNames: string[]): Promise<void> {
     const graph = await this.loadGraph();
-    graph.entities = graph.entities.filter(e => !entityNames.includes(e.name));
-    graph.relations = graph.relations.filter(r => !entityNames.includes(r.from) && !entityNames.includes(r.to));
+    // Use a Set for O(1) lookups instead of Array.includes() which is O(n) per check
+    const namesToDelete = new Set(entityNames);
+    graph.entities = graph.entities.filter(e => !namesToDelete.has(e.name));
+    graph.relations = graph.relations.filter(r => !namesToDelete.has(r.from) && !namesToDelete.has(r.to));
     await this.saveGraph(graph);
   }
 
-  // Deletes observations by content string — callers don't need to know timestamps.
+  /**
+   * Deletes observations by content string — callers don't need to know timestamps.
+   * Silently ignores non-existent entities (idempotent by design — "it's already gone"
+   * is success). This differs from addObservations which throws on missing entities,
+   * because adds are constructive (you need a valid target) while deletes are
+   * destructive (the goal is absence, which is already achieved if the entity is gone).
+   *
+   * @param deletions - Array of { entityName, observations: string[] } to remove.
+   */
   async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<void> {
     const graph = await this.loadGraph();
     deletions.forEach(d => {
@@ -210,29 +331,51 @@ export class KnowledgeGraphManager {
     await this.saveGraph(graph);
   }
 
+  /**
+   * Deletes specific relations by exact match on all three fields (from, to, relationType).
+   * Silently ignores relations that do not exist (idempotent).
+   *
+   * @param relations - Array of { from, to, relationType } to remove.
+   */
   async deleteRelations(relations: Relation[]): Promise<void> {
     const graph = await this.loadGraph();
-    graph.relations = graph.relations.filter(r => !relations.some(delRelation =>
-      r.from === delRelation.from &&
-      r.to === delRelation.to &&
-      r.relationType === delRelation.relationType
-    ));
+    // Use a Set of composite keys for O(1) lookups instead of nested .some()
+    const keysToDelete = new Set(relations.map(r => `${r.from}|${r.to}|${r.relationType}`));
+    graph.relations = graph.relations.filter(r => !keysToDelete.has(`${r.from}|${r.to}|${r.relationType}`));
     await this.saveGraph(graph);
   }
 
+  /**
+   * Returns the entire knowledge graph (all entities and all relations).
+   * For an empty or missing file, returns { entities: [], relations: [] }.
+   */
   async readGraph(): Promise<KnowledgeGraph> {
     return this.loadGraph();
   }
 
-  // Very basic search function
+  /**
+   * Searches for entities matching the query string (case-insensitive substring match
+   * against entity name, entityType, or any observation's content string).
+   *
+   * Returns matching entities plus any relation where at least one endpoint is in
+   * the matched set. This means the result may reference entity names that are NOT
+   * in the returned entities array — the caller can use open_nodes to fetch those.
+   *
+   * @param query - The search string. Matched as a case-insensitive substring.
+   * @returns A filtered KnowledgeGraph containing only matching entities and their
+   *          connected relations. Returns { entities: [], relations: [] } for no matches.
+   */
   async searchNodes(query: string): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
 
-    // Filter entities
+    // Hoist toLowerCase outside the filter to avoid calling it up to 3x per entity
+    const lowerQuery = query.toLowerCase();
+
+    // Filter entities by case-insensitive substring match on name, type, or observation content
     const filteredEntities = graph.entities.filter(e =>
-      e.name.toLowerCase().includes(query.toLowerCase()) ||
-      e.entityType.toLowerCase().includes(query.toLowerCase()) ||
-      e.observations.some(o => o.content.toLowerCase().includes(query.toLowerCase()))
+      e.name.toLowerCase().includes(lowerQuery) ||
+      e.entityType.toLowerCase().includes(lowerQuery) ||
+      e.observations.some(o => o.content.toLowerCase().includes(lowerQuery))
     );
 
     // Create a Set of filtered entity names for quick lookup
@@ -252,11 +395,24 @@ export class KnowledgeGraphManager {
     return filteredGraph;
   }
 
+  /**
+   * Retrieves specific entities by exact name match and includes any relation
+   * where at least one endpoint is in the requested set.
+   *
+   * Changed from requiring BOTH endpoints to match (which silently hid connections
+   * to nodes outside the request set) to requiring only ONE endpoint. See the
+   * inline comment below for the rationale.
+   *
+   * @param names - Array of entity name strings to retrieve.
+   * @returns A KnowledgeGraph containing the requested entities and their connected
+   *          relations. Non-existent names are silently skipped.
+   */
   async openNodes(names: string[]): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
 
-    // Filter entities
-    const filteredEntities = graph.entities.filter(e => names.includes(e.name));
+    // Use a Set for O(1) lookups instead of Array.includes() which is O(n) per entity
+    const nameSet = new Set(names);
+    const filteredEntities = graph.entities.filter(e => nameSet.has(e.name));
 
     // Create a Set of filtered entity names for quick lookup
     const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
@@ -280,19 +436,21 @@ export class KnowledgeGraphManager {
 
 let knowledgeGraphManager: KnowledgeGraphManager;
 
-// Zod schemas for entities and relations.
+// Zod schemas for MCP tool input/output validation.
 // Input schemas accept plain strings for observations (server adds timestamps).
 // Output schemas return full Observation objects with timestamps.
+// String fields have .min(1) to prevent empty-name entities and .max() to prevent
+// context window blowouts when observations are returned to MCP clients.
 
 const ObservationSchema = z.object({
-  content: z.string().describe("The content of the observation"),
+  content: z.string().min(1).describe("The content of the observation"),
   createdAt: z.string().describe("ISO 8601 UTC timestamp when the observation was created, or 'unknown' for migrated data"),
 });
 
 const EntityInputSchema = z.object({
-  name: z.string().describe("The name of the entity"),
-  entityType: z.string().describe("The type of the entity"),
-  observations: z.array(z.string()).describe("An array of observation contents associated with the entity"),
+  name: z.string().min(1).max(500).describe("The name of the entity"),
+  entityType: z.string().min(1).max(500).describe("The type of the entity"),
+  observations: z.array(z.string().min(1).max(5000)).describe("An array of observation contents associated with the entity"),
 });
 
 const EntityOutputSchema = z.object({
@@ -302,9 +460,9 @@ const EntityOutputSchema = z.object({
 });
 
 const RelationSchema = z.object({
-  from: z.string().describe("The name of the entity where the relation starts"),
-  to: z.string().describe("The name of the entity where the relation ends"),
-  relationType: z.string().describe("The type of the relation")
+  from: z.string().min(1).max(500).describe("The name of the entity where the relation starts"),
+  to: z.string().min(1).max(500).describe("The name of the entity where the relation ends"),
+  relationType: z.string().min(1).max(500).describe("The type of the relation")
 });
 
 // The server instance and tools exposed to Claude
@@ -313,7 +471,6 @@ const server = new McpServer({
   version: "0.7.0",
 });
 
-// Register create_entities tool
 server.registerTool(
   "create_entities",
   {
@@ -335,7 +492,6 @@ server.registerTool(
   }
 );
 
-// Register create_relations tool
 server.registerTool(
   "create_relations",
   {
@@ -357,7 +513,6 @@ server.registerTool(
   }
 );
 
-// Register add_observations tool
 server.registerTool(
   "add_observations",
   {
@@ -365,8 +520,8 @@ server.registerTool(
     description: "Add new observations to existing entities in the knowledge graph",
     inputSchema: {
       observations: z.array(z.object({
-        entityName: z.string().describe("The name of the entity to add the observations to"),
-        contents: z.array(z.string()).describe("An array of observation contents to add")
+        entityName: z.string().min(1).max(500).describe("The name of the entity to add the observations to"),
+        contents: z.array(z.string().min(1).max(5000)).describe("An array of observation contents to add")
       }))
     },
     outputSchema: {
@@ -385,14 +540,13 @@ server.registerTool(
   }
 );
 
-// Register delete_entities tool
 server.registerTool(
   "delete_entities",
   {
     title: "Delete Entities",
     description: "Delete multiple entities and their associated relations from the knowledge graph",
     inputSchema: {
-      entityNames: z.array(z.string()).describe("An array of entity names to delete")
+      entityNames: z.array(z.string().min(1).max(500)).describe("An array of entity names to delete")
     },
     outputSchema: {
       success: z.boolean(),
@@ -408,7 +562,6 @@ server.registerTool(
   }
 );
 
-// Register delete_observations tool
 server.registerTool(
   "delete_observations",
   {
@@ -416,8 +569,8 @@ server.registerTool(
     description: "Delete specific observations from entities in the knowledge graph",
     inputSchema: {
       deletions: z.array(z.object({
-        entityName: z.string().describe("The name of the entity containing the observations"),
-        observations: z.array(z.string()).describe("An array of observations to delete")
+        entityName: z.string().min(1).max(500).describe("The name of the entity containing the observations"),
+        observations: z.array(z.string().min(1).max(5000)).describe("An array of observations to delete")
       }))
     },
     outputSchema: {
@@ -434,7 +587,6 @@ server.registerTool(
   }
 );
 
-// Register delete_relations tool
 server.registerTool(
   "delete_relations",
   {
@@ -457,7 +609,6 @@ server.registerTool(
   }
 );
 
-// Register read_graph tool
 server.registerTool(
   "read_graph",
   {
@@ -478,14 +629,13 @@ server.registerTool(
   }
 );
 
-// Register search_nodes tool
 server.registerTool(
   "search_nodes",
   {
     title: "Search Nodes",
     description: "Search for nodes in the knowledge graph based on a query",
     inputSchema: {
-      query: z.string().describe("The search query to match against entity names, types, and observation content")
+      query: z.string().min(1).describe("The search query to match against entity names, types, and observation content")
     },
     outputSchema: {
       entities: z.array(EntityOutputSchema),
@@ -501,14 +651,13 @@ server.registerTool(
   }
 );
 
-// Register open_nodes tool
 server.registerTool(
   "open_nodes",
   {
     title: "Open Nodes",
     description: "Open specific nodes in the knowledge graph by their names",
     inputSchema: {
-      names: z.array(z.string()).describe("An array of entity names to retrieve")
+      names: z.array(z.string().min(1).max(500)).describe("An array of entity names to retrieve")
     },
     outputSchema: {
       entities: z.array(EntityOutputSchema),

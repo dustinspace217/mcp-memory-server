@@ -10,7 +10,7 @@ This project is derived from [`@modelcontextprotocol/server-memory`](https://git
 
 This fork adds features tailored for long-running, multi-session workflows:
 
-- **Timestamped observations** — observations can carry `[YYYY-MM-DD HH:MM UTC]` prefixes for staleness detection
+- **Timestamped observations** — each observation is a `{ content, createdAt }` object with an ISO 8601 UTC timestamp for staleness detection
 - *(Planned)* SQLite + FTS5 backend for faster search and concurrent access
 - *(Planned)* Project-scoped entities for multi-project filtering
 - *(Planned)* Paginated results for large graphs
@@ -68,9 +68,9 @@ The `MEMORY_FILE_PATH` environment variable is optional. If omitted, the server 
 
 The server uses a knowledge graph with three primitives:
 
-- **Entities** — named nodes with a type and a list of observation strings
+- **Entities** — named nodes with a type and a list of observations
 - **Relations** — directed edges between entities with a relation type
-- **Observations** — free-text strings attached to an entity (the atomic unit of knowledge)
+- **Observations** — `{ content, createdAt }` objects attached to an entity (the atomic unit of knowledge). `createdAt` is an ISO 8601 UTC timestamp, or `'unknown'` for data migrated from the original string format
 
 Data is stored as newline-delimited JSON (JSONL) for simplicity and append-friendliness.
 
@@ -85,4 +85,4 @@ npm run watch      # compile in watch mode
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for the full text and original copyright notices.
+See [LICENSE](LICENSE) for the full text and original copyright notices. The upstream project is transitioning from MIT to Apache-2.0; documentation is licensed under CC-BY-4.0.

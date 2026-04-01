@@ -11,17 +11,26 @@ Standalone fork of @modelcontextprotocol/server-memory. Provides persistent memo
 - Test: `npm test` (vitest run)
 
 ## Architecture
-- Single entry point: `index.ts` (~540 lines)
+- Single entry point: `index.ts` (~690 lines)
 - `KnowledgeGraphManager` class: all CRUD operations on the graph
 - `Observation` type: `{ content: string; createdAt: string }` — each observation carries an ISO 8601 UTC timestamp (or `'unknown'` for data migrated from old string format)
 - `ensureMemoryFilePath()`: resolves storage path with backward-compat migration from .json to .jsonl
-- `normalizeObservation()` / `createObservation()`: helpers for migration vs new-data timestamping
+- `normalizeObservation()`: validates observation shape (structural check, not unsafe cast); throws on invalid format
+- `createObservation()`: creates new observations with current UTC timestamp
 - MCP tools registered via `server.registerTool()` with separate input/output Zod schemas
-- Storage: JSONL file, full load/save on every operation (no incremental writes yet)
+- Zod schemas enforce `.min(1)` on all string inputs and `.max(500)` on names / `.max(5000)` on observation content
+- Storage: JSONL file with atomic writes (temp file + `fs.rename`), full load/save on every operation
+- `loadGraph()` uses per-line error isolation — malformed JSONL lines are logged to stderr and skipped
+- All dedup operations use Set-based O(1) lookups (entity names, composite relation keys, observation content)
+- Delete operations are idempotent (silently ignore missing targets); add operations throw on missing entities
 - Data path: `MEMORY_FILE_PATH` env var, or `memory.jsonl` alongside index.ts
 
+## Known Limitations
+- No file locking for concurrent access (resolved by Phase 2 SQLite)
+- No validation that relation endpoints reference existing entities (resolved by Phase 2 FK constraints)
+
 ## Tests
-- `__tests__/knowledge-graph.test.ts` — 44 tests covering all CRUD operations, deduplication, search, edge cases, and observation timestamps
+- `__tests__/knowledge-graph.test.ts` — 52 tests covering all CRUD operations, deduplication (including within-entity and within-array bugs), search, edge cases, observation timestamps, malformed JSONL isolation, normalizeObservation validation, and atomic writes
 - `__tests__/file-path.test.ts` — 9 tests covering path resolution and .json→.jsonl migration
 
 ## Planned Phases
