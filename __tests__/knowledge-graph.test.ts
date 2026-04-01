@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { KnowledgeGraphManager, Entity, Relation, KnowledgeGraph } from '../index.js';
+import { KnowledgeGraphManager, Entity, Observation, Relation, KnowledgeGraph } from '../index.js';
 
 describe('KnowledgeGraphManager', () => {
   let manager: KnowledgeGraphManager;
@@ -28,26 +28,28 @@ describe('KnowledgeGraphManager', () => {
 
   describe('createEntities', () => {
     it('should create new entities', async () => {
-      const entities: Entity[] = [
+      const newEntities = await manager.createEntities([
         { name: 'Alice', entityType: 'person', observations: ['works at Acme Corp'] },
         { name: 'Bob', entityType: 'person', observations: ['likes programming'] },
-      ];
+      ]);
 
-      const newEntities = await manager.createEntities(entities);
       expect(newEntities).toHaveLength(2);
-      expect(newEntities).toEqual(entities);
+      expect(newEntities[0]).toEqual(expect.objectContaining({ name: 'Alice', entityType: 'person' }));
+      expect(newEntities[0].observations).toHaveLength(1);
+      expect(newEntities[0].observations[0]).toEqual(expect.objectContaining({ content: 'works at Acme Corp' }));
+      expect(newEntities[0].observations[0].createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 
       const graph = await manager.readGraph();
       expect(graph.entities).toHaveLength(2);
     });
 
     it('should not create duplicate entities', async () => {
-      const entities: Entity[] = [
+      await manager.createEntities([
         { name: 'Alice', entityType: 'person', observations: ['works at Acme Corp'] },
-      ];
-
-      await manager.createEntities(entities);
-      const newEntities = await manager.createEntities(entities);
+      ]);
+      const newEntities = await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: ['works at Acme Corp'] },
+      ]);
 
       expect(newEntities).toHaveLength(0);
 
@@ -138,7 +140,7 @@ describe('KnowledgeGraphManager', () => {
       ]);
 
       expect(results[0].addedObservations).toHaveLength(1);
-      expect(results[0].addedObservations).toContain('has a dog');
+      expect(results[0].addedObservations[0]).toEqual(expect.objectContaining({ content: 'has a dog' }));
 
       const graph = await manager.readGraph();
       const alice = graph.entities.find(e => e.name === 'Alice');
@@ -207,7 +209,7 @@ describe('KnowledgeGraphManager', () => {
       const graph = await manager.readGraph();
       const alice = graph.entities.find(e => e.name === 'Alice');
       expect(alice?.observations).toHaveLength(1);
-      expect(alice?.observations).toContain('works at Acme Corp');
+      expect(alice?.observations[0]).toEqual(expect.objectContaining({ content: 'works at Acme Corp' }));
     });
 
     it('should handle deleting from non-existent entities', async () => {
@@ -407,6 +409,8 @@ describe('KnowledgeGraphManager', () => {
 
       expect(graph.entities).toHaveLength(1);
       expect(graph.entities[0].name).toBe('Alice');
+      expect(graph.entities[0].observations[0]).toEqual(expect.objectContaining({ content: 'persistent data' }));
+      expect(graph.entities[0].observations[0].createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     });
 
     it('should handle JSONL format correctly', async () => {
@@ -513,6 +517,138 @@ describe('KnowledgeGraphManager', () => {
 
       expect(result.relations).toHaveLength(1);
       expect(result.relations[0]).not.toHaveProperty('type');
+    });
+  });
+
+  describe('observation timestamps', () => {
+    it('should assign ISO 8601 timestamps to observations created via createEntities', async () => {
+      const before = new Date().toISOString();
+      await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: ['works at Acme'] },
+      ]);
+      const after = new Date().toISOString();
+
+      const graph = await manager.readGraph();
+      const obs = graph.entities[0].observations[0];
+      expect(obs.content).toBe('works at Acme');
+      expect(obs.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+      expect(obs.createdAt >= before).toBe(true);
+      expect(obs.createdAt <= after).toBe(true);
+    });
+
+    it('should assign ISO 8601 timestamps to observations added via addObservations', async () => {
+      await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: [] },
+      ]);
+
+      const before = new Date().toISOString();
+      await manager.addObservations([
+        { entityName: 'Alice', contents: ['likes coffee'] },
+      ]);
+      const after = new Date().toISOString();
+
+      const graph = await manager.readGraph();
+      const obs = graph.entities[0].observations[0];
+      expect(obs.content).toBe('likes coffee');
+      expect(obs.createdAt >= before).toBe(true);
+      expect(obs.createdAt <= after).toBe(true);
+    });
+
+    it('should migrate legacy string observations with createdAt "unknown"', async () => {
+      // Write a legacy-format JSONL file directly (observations as plain strings)
+      const legacyEntity = JSON.stringify({
+        type: 'entity',
+        name: 'LegacyAlice',
+        entityType: 'person',
+        observations: ['old observation'],
+      });
+      await fs.writeFile(testFilePath, legacyEntity);
+
+      const graph = await manager.readGraph();
+      const alice = graph.entities[0];
+      expect(alice.observations[0]).toEqual({
+        content: 'old observation',
+        createdAt: 'unknown',
+      });
+    });
+
+    it('should preserve timestamps across save/load cycles', async () => {
+      await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: ['test'] },
+      ]);
+
+      const graph1 = await manager.readGraph();
+      const timestamp1 = graph1.entities[0].observations[0].createdAt;
+
+      // Create a new manager instance to force re-read from disk
+      const manager2 = new KnowledgeGraphManager(testFilePath);
+      const graph2 = await manager2.readGraph();
+      const timestamp2 = graph2.entities[0].observations[0].createdAt;
+
+      expect(timestamp2).toBe(timestamp1);
+    });
+
+    it('should handle mixed legacy and new observations in the same entity', async () => {
+      // Write a file with legacy string observations
+      const legacyEntity = JSON.stringify({
+        type: 'entity',
+        name: 'Alice',
+        entityType: 'person',
+        observations: ['old observation'],
+      });
+      await fs.writeFile(testFilePath, legacyEntity);
+
+      // Add new observations through the manager API
+      await manager.addObservations([
+        { entityName: 'Alice', contents: ['new observation'] },
+      ]);
+
+      const graph = await manager.readGraph();
+      const alice = graph.entities[0];
+      expect(alice.observations).toHaveLength(2);
+      expect(alice.observations[0]).toEqual({ content: 'old observation', createdAt: 'unknown' });
+      expect(alice.observations[1].content).toBe('new observation');
+      expect(alice.observations[1].createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      expect(alice.observations[1].createdAt).not.toBe('unknown');
+    });
+
+    it('should deduplicate by content when adding to entities with timestamped observations', async () => {
+      await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: ['existing'] },
+      ]);
+
+      const results = await manager.addObservations([
+        { entityName: 'Alice', contents: ['existing', 'new one'] },
+      ]);
+
+      expect(results[0].addedObservations).toHaveLength(1);
+      expect(results[0].addedObservations[0].content).toBe('new one');
+    });
+
+    it('should delete observations by content string even with timestamps', async () => {
+      await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: ['keep this', 'delete this'] },
+      ]);
+
+      await manager.deleteObservations([
+        { entityName: 'Alice', observations: ['delete this'] },
+      ]);
+
+      const graph = await manager.readGraph();
+      const alice = graph.entities[0];
+      expect(alice.observations).toHaveLength(1);
+      expect(alice.observations[0].content).toBe('keep this');
+    });
+
+    it('should search observation content with timestamps', async () => {
+      await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: ['works at Acme Corp'] },
+        { name: 'Bob', entityType: 'person', observations: ['works at TechCo'] },
+      ]);
+
+      const result = await manager.searchNodes('Acme');
+      expect(result.entities).toHaveLength(1);
+      expect(result.entities[0].name).toBe('Alice');
     });
   });
 });

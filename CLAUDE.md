@@ -11,19 +11,21 @@ Standalone fork of @modelcontextprotocol/server-memory. Provides persistent memo
 - Test: `npm test` (vitest run)
 
 ## Architecture
-- Single entry point: `index.ts` (~490 lines)
+- Single entry point: `index.ts` (~540 lines)
 - `KnowledgeGraphManager` class: all CRUD operations on the graph
+- `Observation` type: `{ content: string; createdAt: string }` — each observation carries an ISO 8601 UTC timestamp (or `'unknown'` for data migrated from old string format)
 - `ensureMemoryFilePath()`: resolves storage path with backward-compat migration from .json to .jsonl
-- MCP tools registered via `server.registerTool()` with Zod schemas
+- `normalizeObservation()` / `createObservation()`: helpers for migration vs new-data timestamping
+- MCP tools registered via `server.registerTool()` with separate input/output Zod schemas
 - Storage: JSONL file, full load/save on every operation (no incremental writes yet)
 - Data path: `MEMORY_FILE_PATH` env var, or `memory.jsonl` alongside index.ts
 
 ## Tests
-- `__tests__/knowledge-graph.test.ts` — 36 tests covering all CRUD operations, deduplication, search, and edge cases
+- `__tests__/knowledge-graph.test.ts` — 44 tests covering all CRUD operations, deduplication, search, edge cases, and observation timestamps
 - `__tests__/file-path.test.ts` — 9 tests covering path resolution and .json→.jsonl migration
 
 ## Planned Phases
-1. **Timestamps** — add created_at/updated_at to observations for staleness detection
+1. ~~**Timestamps**~~ — DONE: observations are `{ content, createdAt }` objects; legacy string observations auto-migrate with `createdAt: 'unknown'`
 2. **SQLite + FTS5** — replace JSONL with SQLite for indexed search and concurrent access
 3. **Project filtering** — scope entities to projects so multi-project memory stays clean
 4. **Pagination** — cursor-based pagination for read_graph and search_nodes

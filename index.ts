@@ -47,10 +47,18 @@ export async function ensureMemoryFilePath(): Promise<string> {
 let MEMORY_FILE_PATH: string;
 
 // We are storing our memory using entities, relations, and observations in a graph structure
+
+// An observation is a single piece of knowledge attached to an entity.
+// Each observation carries a creation timestamp for staleness detection.
+export interface Observation {
+  content: string;
+  createdAt: string;  // ISO 8601 UTC, or 'unknown' for data migrated from the old string format
+}
+
 export interface Entity {
   name: string;
   entityType: string;
-  observations: string[];
+  observations: Observation[];
 }
 
 export interface Relation {
@@ -62,6 +70,21 @@ export interface Relation {
 export interface KnowledgeGraph {
   entities: Entity[];
   relations: Relation[];
+}
+
+// Converts a legacy string observation (from old JSONL files) into an Observation object.
+// Uses 'unknown' as the timestamp since we don't know when it was originally created.
+function normalizeObservation(obs: unknown): Observation {
+  if (typeof obs === 'string') {
+    return { content: obs, createdAt: 'unknown' };
+  }
+  return obs as Observation;
+}
+
+// Creates a new Observation with the current UTC timestamp.
+// Called when observations are added through the API (not during migration).
+function createObservation(content: string): Observation {
+  return { content, createdAt: new Date().toISOString() };
 }
 
 // The KnowledgeGraphManager class contains all operations to interact with the knowledge graph
@@ -78,7 +101,7 @@ export class KnowledgeGraphManager {
           graph.entities.push({
             name: item.name,
             entityType: item.entityType,
-            observations: item.observations
+            observations: (item.observations || []).map(normalizeObservation)
           });
         }
         if (item.type === "relation") {
@@ -116,9 +139,19 @@ export class KnowledgeGraphManager {
     await fs.writeFile(this.memoryFilePath, lines.join("\n"));
   }
 
-  async createEntities(entities: Entity[]): Promise<Entity[]> {
+  // Accepts observations as strings (auto-timestamped) or Observation objects (passed through).
+  // This flexibility lets tests pass plain strings while the MCP tool handler also passes strings.
+  async createEntities(entities: Array<{ name: string; entityType: string; observations: (string | Observation)[] }>): Promise<Entity[]> {
     const graph = await this.loadGraph();
-    const newEntities = entities.filter(e => !graph.entities.some(existingEntity => existingEntity.name === e.name));
+    // Normalize incoming observations: strings get a fresh timestamp, objects pass through
+    const normalized: Entity[] = entities.map(e => ({
+      name: e.name,
+      entityType: e.entityType,
+      observations: e.observations.map(obs =>
+        typeof obs === 'string' ? createObservation(obs) : obs
+      ),
+    }));
+    const newEntities = normalized.filter(e => !graph.entities.some(existingEntity => existingEntity.name === e.name));
     graph.entities.push(...newEntities);
     await this.saveGraph(graph);
     return newEntities;
@@ -136,14 +169,20 @@ export class KnowledgeGraphManager {
     return newRelations;
   }
 
-  async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
+  // Accepts content strings, creates timestamped Observation objects, deduplicates by content.
+  // Returns the newly added Observation objects (with timestamps) so callers can see what was added.
+  async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: Observation[] }[]> {
     const graph = await this.loadGraph();
     const results = observations.map(o => {
       const entity = graph.entities.find(e => e.name === o.entityName);
       if (!entity) {
         throw new Error(`Entity with name ${o.entityName} not found`);
       }
-      const newObservations = o.contents.filter(content => !entity.observations.includes(content));
+      // Use a Set of existing content strings for O(1) dedup lookups
+      const existingContents = new Set(entity.observations.map(obs => obs.content));
+      const newObservations = o.contents
+        .filter(content => !existingContents.has(content))
+        .map(content => createObservation(content));
       entity.observations.push(...newObservations);
       return { entityName: o.entityName, addedObservations: newObservations };
     });
@@ -158,12 +197,14 @@ export class KnowledgeGraphManager {
     await this.saveGraph(graph);
   }
 
+  // Deletes observations by content string — callers don't need to know timestamps.
   async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<void> {
     const graph = await this.loadGraph();
     deletions.forEach(d => {
       const entity = graph.entities.find(e => e.name === d.entityName);
       if (entity) {
-        entity.observations = entity.observations.filter(o => !d.observations.includes(o));
+        const toDelete = new Set(d.observations);
+        entity.observations = entity.observations.filter(o => !toDelete.has(o.content));
       }
     });
     await this.saveGraph(graph);
@@ -191,7 +232,7 @@ export class KnowledgeGraphManager {
     const filteredEntities = graph.entities.filter(e =>
       e.name.toLowerCase().includes(query.toLowerCase()) ||
       e.entityType.toLowerCase().includes(query.toLowerCase()) ||
-      e.observations.some(o => o.toLowerCase().includes(query.toLowerCase()))
+      e.observations.some(o => o.content.toLowerCase().includes(query.toLowerCase()))
     );
 
     // Create a Set of filtered entity names for quick lookup
@@ -239,11 +280,25 @@ export class KnowledgeGraphManager {
 
 let knowledgeGraphManager: KnowledgeGraphManager;
 
-// Zod schemas for entities and relations
-const EntitySchema = z.object({
+// Zod schemas for entities and relations.
+// Input schemas accept plain strings for observations (server adds timestamps).
+// Output schemas return full Observation objects with timestamps.
+
+const ObservationSchema = z.object({
+  content: z.string().describe("The content of the observation"),
+  createdAt: z.string().describe("ISO 8601 UTC timestamp when the observation was created, or 'unknown' for migrated data"),
+});
+
+const EntityInputSchema = z.object({
   name: z.string().describe("The name of the entity"),
   entityType: z.string().describe("The type of the entity"),
-  observations: z.array(z.string()).describe("An array of observation contents associated with the entity")
+  observations: z.array(z.string()).describe("An array of observation contents associated with the entity"),
+});
+
+const EntityOutputSchema = z.object({
+  name: z.string().describe("The name of the entity"),
+  entityType: z.string().describe("The type of the entity"),
+  observations: z.array(ObservationSchema).describe("An array of observations with content and timestamps"),
 });
 
 const RelationSchema = z.object({
@@ -255,7 +310,7 @@ const RelationSchema = z.object({
 // The server instance and tools exposed to Claude
 const server = new McpServer({
   name: "memory-server",
-  version: "0.6.3",
+  version: "0.7.0",
 });
 
 // Register create_entities tool
@@ -265,10 +320,10 @@ server.registerTool(
     title: "Create Entities",
     description: "Create multiple new entities in the knowledge graph",
     inputSchema: {
-      entities: z.array(EntitySchema)
+      entities: z.array(EntityInputSchema)
     },
     outputSchema: {
-      entities: z.array(EntitySchema)
+      entities: z.array(EntityOutputSchema)
     }
   },
   async ({ entities }) => {
@@ -317,7 +372,7 @@ server.registerTool(
     outputSchema: {
       results: z.array(z.object({
         entityName: z.string(),
-        addedObservations: z.array(z.string())
+        addedObservations: z.array(ObservationSchema)
       }))
     }
   },
@@ -410,7 +465,7 @@ server.registerTool(
     description: "Read the entire knowledge graph",
     inputSchema: {},
     outputSchema: {
-      entities: z.array(EntitySchema),
+      entities: z.array(EntityOutputSchema),
       relations: z.array(RelationSchema)
     }
   },
@@ -433,7 +488,7 @@ server.registerTool(
       query: z.string().describe("The search query to match against entity names, types, and observation content")
     },
     outputSchema: {
-      entities: z.array(EntitySchema),
+      entities: z.array(EntityOutputSchema),
       relations: z.array(RelationSchema)
     }
   },
@@ -456,7 +511,7 @@ server.registerTool(
       names: z.array(z.string()).describe("An array of entity names to retrieve")
     },
     outputSchema: {
-      entities: z.array(EntitySchema),
+      entities: z.array(EntityOutputSchema),
       relations: z.array(RelationSchema)
     }
   },
