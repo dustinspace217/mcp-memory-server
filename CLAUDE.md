@@ -18,10 +18,10 @@ Standalone fork of @modelcontextprotocol/server-memory. Provides persistent memo
 - `normalizeObservation()`: validates observation shape (structural check, not unsafe cast); throws on invalid format
 - `createObservation()`: creates new observations with current UTC timestamp
 - MCP tools registered via `server.registerTool()` with separate input/output Zod schemas
-- Zod schemas enforce `.min(1)` on all string inputs and `.max(500)` on names / `.max(5000)` on observation content
+- Zod schemas enforce `.min(1)` on all string inputs, `.max(500)` on names / `.max(5000)` on observation content, and `.max(100)` on all input arrays
 - Storage: JSONL file with atomic writes (temp file + `fs.rename`), full load/save on every operation
 - `loadGraph()` uses per-line error isolation — malformed JSONL lines are logged to stderr and skipped
-- All dedup operations use Set-based O(1) lookups (entity names, composite relation keys, observation content)
+- All dedup operations use Set-based O(1) lookups (entity names, JSON-serialized composite relation keys, observation content) with within-batch dedup (Sets updated during iteration)
 - Delete operations are idempotent (silently ignore missing targets); add operations throw on missing entities
 - Data path: `MEMORY_FILE_PATH` env var, or `memory.jsonl` alongside index.ts
 
@@ -30,7 +30,7 @@ Standalone fork of @modelcontextprotocol/server-memory. Provides persistent memo
 - No validation that relation endpoints reference existing entities (resolved by Phase 2 FK constraints)
 
 ## Tests
-- `__tests__/knowledge-graph.test.ts` — 52 tests covering all CRUD operations, deduplication (including within-entity and within-array bugs), search, edge cases, observation timestamps, malformed JSONL isolation, normalizeObservation validation, and atomic writes
+- `__tests__/knowledge-graph.test.ts` — 60 tests covering all CRUD operations, deduplication (within-entity, within-array, and within-batch), composite key safety, search, edge cases, observation timestamps, malformed JSONL isolation, normalizeObservation validation, atomic writes, and idempotent delete edge cases
 - `__tests__/file-path.test.ts` — 9 tests covering path resolution and .json→.jsonl migration
 
 ## Planned Phases

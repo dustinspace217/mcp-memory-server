@@ -18,12 +18,9 @@ describe('KnowledgeGraphManager', () => {
   });
 
   afterEach(async () => {
-    // Clean up test file
-    try {
-      await fs.unlink(testFilePath);
-    } catch (error) {
-      // Ignore errors if file doesn't exist
-    }
+    // Clean up test file and any orphaned temp files from atomic writes
+    try { await fs.unlink(testFilePath); } catch { /* file may not exist */ }
+    try { await fs.unlink(testFilePath + '.tmp'); } catch { /* temp file may not exist */ }
   });
 
   describe('createEntities', () => {
@@ -781,6 +778,160 @@ describe('KnowledgeGraphManager', () => {
 
       // The .tmp file should be renamed to the real file, not left behind
       await expect(fs.access(testFilePath + '.tmp')).rejects.toThrow();
+    });
+  });
+
+  describe('within-batch deduplication', () => {
+    it('should deduplicate entities within the same createEntities call', async () => {
+      // Two entities with the same name in one batch — only the first should be created
+      const result = await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: ['first'] },
+        { name: 'Alice', entityType: 'robot', observations: ['second'] },
+      ]);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].entityType).toBe('person');
+
+      const graph = await manager.readGraph();
+      expect(graph.entities).toHaveLength(1);
+    });
+
+    it('should deduplicate relations within the same createRelations call', async () => {
+      await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: [] },
+        { name: 'Bob', entityType: 'person', observations: [] },
+      ]);
+
+      // Two identical relations in one batch — only one should be created
+      const result = await manager.createRelations([
+        { from: 'Alice', to: 'Bob', relationType: 'knows' },
+        { from: 'Alice', to: 'Bob', relationType: 'knows' },
+      ]);
+
+      expect(result).toHaveLength(1);
+
+      const graph = await manager.readGraph();
+      expect(graph.relations).toHaveLength(1);
+    });
+  });
+
+  describe('composite key safety', () => {
+    it('should not collide when entity names contain pipe characters', async () => {
+      await manager.createEntities([
+        { name: 'A|B', entityType: 'test', observations: [] },
+        { name: 'A', entityType: 'test', observations: [] },
+        { name: 'C', entityType: 'test', observations: [] },
+        { name: 'B|C', entityType: 'test', observations: [] },
+      ]);
+
+      // These two relations have different from/to but would collide with a pipe separator:
+      // "A|B" + "C" + "knows" vs "A" + "B|C" + "knows" both produce "A|B|C|knows"
+      const result = await manager.createRelations([
+        { from: 'A|B', to: 'C', relationType: 'knows' },
+        { from: 'A', to: 'B|C', relationType: 'knows' },
+      ]);
+
+      // Both should be created since they are semantically different relations
+      expect(result).toHaveLength(2);
+
+      const graph = await manager.readGraph();
+      expect(graph.relations).toHaveLength(2);
+    });
+
+    it('should correctly delete relations with pipe characters in names', async () => {
+      await manager.createEntities([
+        { name: 'A|B', entityType: 'test', observations: [] },
+        { name: 'C', entityType: 'test', observations: [] },
+        { name: 'A', entityType: 'test', observations: [] },
+        { name: 'B|C', entityType: 'test', observations: [] },
+      ]);
+
+      await manager.createRelations([
+        { from: 'A|B', to: 'C', relationType: 'knows' },
+        { from: 'A', to: 'B|C', relationType: 'knows' },
+      ]);
+
+      // Delete only the first relation — the second should remain
+      await manager.deleteRelations([
+        { from: 'A|B', to: 'C', relationType: 'knows' },
+      ]);
+
+      const graph = await manager.readGraph();
+      expect(graph.relations).toHaveLength(1);
+      expect(graph.relations[0].from).toBe('A');
+      expect(graph.relations[0].to).toBe('B|C');
+    });
+  });
+
+  describe('normalizeObservation edge cases', () => {
+    it('should handle object with content but non-string createdAt', async () => {
+      // An observation object where createdAt is a number — should fall back to 'unknown'
+      const entity = JSON.stringify({
+        type: 'entity',
+        name: 'Test',
+        entityType: 'test',
+        observations: [{ content: 'hello', createdAt: 12345 }],
+      });
+      await fs.writeFile(testFilePath, entity + '\n');
+
+      const graph = await manager.readGraph();
+      expect(graph.entities).toHaveLength(1);
+      expect(graph.entities[0].observations[0]).toEqual({
+        content: 'hello',
+        createdAt: 'unknown',
+      });
+    });
+
+    it('should handle entity with missing observations field', async () => {
+      // JSONL line with no observations key — the || [] fallback should produce empty array
+      const entity = JSON.stringify({
+        type: 'entity',
+        name: 'Bare',
+        entityType: 'test',
+      });
+      await fs.writeFile(testFilePath, entity + '\n');
+
+      const graph = await manager.readGraph();
+      expect(graph.entities).toHaveLength(1);
+      expect(graph.entities[0].observations).toEqual([]);
+    });
+  });
+
+  describe('idempotent delete edge cases', () => {
+    it('should silently handle deleting observations that do not exist on entity', async () => {
+      await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: ['keep this'] },
+      ]);
+
+      // Delete an observation that doesn't exist — should not throw or affect existing obs
+      await manager.deleteObservations([
+        { entityName: 'Alice', observations: ['nonexistent'] },
+      ]);
+
+      const graph = await manager.readGraph();
+      const alice = graph.entities.find(e => e.name === 'Alice');
+      expect(alice?.observations).toHaveLength(1);
+      expect(alice?.observations[0].content).toBe('keep this');
+    });
+
+    it('should silently handle deleting relations that do not exist', async () => {
+      await manager.createEntities([
+        { name: 'Alice', entityType: 'person', observations: [] },
+        { name: 'Bob', entityType: 'person', observations: [] },
+      ]);
+
+      await manager.createRelations([
+        { from: 'Alice', to: 'Bob', relationType: 'knows' },
+      ]);
+
+      // Delete a relation that doesn't exist — should not affect existing relations
+      await manager.deleteRelations([
+        { from: 'Alice', to: 'Bob', relationType: 'nonexistent' },
+      ]);
+
+      const graph = await manager.readGraph();
+      expect(graph.relations).toHaveLength(1);
+      expect(graph.relations[0].relationType).toBe('knows');
     });
   });
 });

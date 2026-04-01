@@ -55,8 +55,7 @@ export async function ensureMemoryFilePath(): Promise<string> {
   }
 }
 
-// Memory file path — declared here, set by main() after resolving env var and migration logic
-let MEMORY_FILE_PATH: string;
+
 
 // An observation is a single piece of knowledge attached to an entity.
 // Each observation carries a creation timestamp for staleness detection.
@@ -195,10 +194,17 @@ export class KnowledgeGraphManager {
         relationType: r.relationType
       })),
     ];
-    // Write to temp file then atomically rename to prevent corruption on crash
+    // Write to temp file then atomically rename to prevent corruption on crash.
+    // If rename fails, clean up the temp file so it doesn't leak on disk.
     const tmpPath = this.memoryFilePath + '.tmp';
     await fs.writeFile(tmpPath, lines.join("\n") + "\n");
-    await fs.rename(tmpPath, this.memoryFilePath);
+    try {
+      await fs.rename(tmpPath, this.memoryFilePath);
+    } catch (renameError) {
+      // Clean up orphaned temp file before re-throwing
+      try { await fs.unlink(tmpPath); } catch { /* best effort */ }
+      throw renameError;
+    }
   }
 
   /**
@@ -227,9 +233,17 @@ export class KnowledgeGraphManager {
         })
       ).values()],
     }));
-    // Use a Set for O(1) name lookups instead of .some() which is O(n*m)
+    // Use a Set for O(1) name lookups instead of .some() which is O(n*m).
+    // Add to the Set as each entity is accepted so duplicates within the same
+    // input batch are also caught (e.g., two entities named "A" in one call).
     const existingNames = new Set(graph.entities.map(e => e.name));
-    const newEntities = normalized.filter(e => !existingNames.has(e.name));
+    const newEntities: Entity[] = [];
+    for (const e of normalized) {
+      if (!existingNames.has(e.name)) {
+        existingNames.add(e.name);
+        newEntities.push(e);
+      }
+    }
     graph.entities.push(...newEntities);
     await this.saveGraph(graph);
     return newEntities;
@@ -249,9 +263,18 @@ export class KnowledgeGraphManager {
    */
   async createRelations(relations: Relation[]): Promise<Relation[]> {
     const graph = await this.loadGraph();
-    // Use a Set of composite keys for O(1) dedup lookups instead of nested .some()
-    const existingKeys = new Set(graph.relations.map(r => `${r.from}|${r.to}|${r.relationType}`));
-    const newRelations = relations.filter(r => !existingKeys.has(`${r.from}|${r.to}|${r.relationType}`));
+    // Use a Set of composite keys for O(1) dedup lookups instead of nested .some().
+    // Add to the Set as each relation is accepted so duplicates within the same
+    // input batch are also caught.
+    const existingKeys = new Set(graph.relations.map(r => JSON.stringify([r.from, r.to, r.relationType])));
+    const newRelations: Relation[] = [];
+    for (const r of relations) {
+      const key = JSON.stringify([r.from, r.to, r.relationType]);
+      if (!existingKeys.has(key)) {
+        existingKeys.add(key);
+        newRelations.push(r);
+      }
+    }
     graph.relations.push(...newRelations);
     await this.saveGraph(graph);
     return newRelations;
@@ -340,8 +363,8 @@ export class KnowledgeGraphManager {
   async deleteRelations(relations: Relation[]): Promise<void> {
     const graph = await this.loadGraph();
     // Use a Set of composite keys for O(1) lookups instead of nested .some()
-    const keysToDelete = new Set(relations.map(r => `${r.from}|${r.to}|${r.relationType}`));
-    graph.relations = graph.relations.filter(r => !keysToDelete.has(`${r.from}|${r.to}|${r.relationType}`));
+    const keysToDelete = new Set(relations.map(r => JSON.stringify([r.from, r.to, r.relationType])));
+    graph.relations = graph.relations.filter(r => !keysToDelete.has(JSON.stringify([r.from, r.to, r.relationType])));
     await this.saveGraph(graph);
   }
 
@@ -450,7 +473,7 @@ const ObservationSchema = z.object({
 const EntityInputSchema = z.object({
   name: z.string().min(1).max(500).describe("The name of the entity"),
   entityType: z.string().min(1).max(500).describe("The type of the entity"),
-  observations: z.array(z.string().min(1).max(5000)).describe("An array of observation contents associated with the entity"),
+  observations: z.array(z.string().min(1).max(5000)).max(100).describe("An array of observation contents associated with the entity"),
 });
 
 const EntityOutputSchema = z.object({
@@ -477,7 +500,7 @@ server.registerTool(
     title: "Create Entities",
     description: "Create multiple new entities in the knowledge graph",
     inputSchema: {
-      entities: z.array(EntityInputSchema)
+      entities: z.array(EntityInputSchema).max(100)
     },
     outputSchema: {
       entities: z.array(EntityOutputSchema)
@@ -498,7 +521,7 @@ server.registerTool(
     title: "Create Relations",
     description: "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice",
     inputSchema: {
-      relations: z.array(RelationSchema)
+      relations: z.array(RelationSchema).max(100)
     },
     outputSchema: {
       relations: z.array(RelationSchema)
@@ -521,8 +544,8 @@ server.registerTool(
     inputSchema: {
       observations: z.array(z.object({
         entityName: z.string().min(1).max(500).describe("The name of the entity to add the observations to"),
-        contents: z.array(z.string().min(1).max(5000)).describe("An array of observation contents to add")
-      }))
+        contents: z.array(z.string().min(1).max(5000)).max(100).describe("An array of observation contents to add")
+      })).max(100)
     },
     outputSchema: {
       results: z.array(z.object({
@@ -546,7 +569,7 @@ server.registerTool(
     title: "Delete Entities",
     description: "Delete multiple entities and their associated relations from the knowledge graph",
     inputSchema: {
-      entityNames: z.array(z.string().min(1).max(500)).describe("An array of entity names to delete")
+      entityNames: z.array(z.string().min(1).max(500)).max(100).describe("An array of entity names to delete")
     },
     outputSchema: {
       success: z.boolean(),
@@ -570,8 +593,8 @@ server.registerTool(
     inputSchema: {
       deletions: z.array(z.object({
         entityName: z.string().min(1).max(500).describe("The name of the entity containing the observations"),
-        observations: z.array(z.string().min(1).max(5000)).describe("An array of observations to delete")
-      }))
+        observations: z.array(z.string().min(1).max(5000)).max(100).describe("An array of observations to delete")
+      })).max(100)
     },
     outputSchema: {
       success: z.boolean(),
@@ -593,7 +616,7 @@ server.registerTool(
     title: "Delete Relations",
     description: "Delete multiple relations from the knowledge graph",
     inputSchema: {
-      relations: z.array(RelationSchema).describe("An array of relations to delete")
+      relations: z.array(RelationSchema).max(100).describe("An array of relations to delete")
     },
     outputSchema: {
       success: z.boolean(),
@@ -657,7 +680,7 @@ server.registerTool(
     title: "Open Nodes",
     description: "Open specific nodes in the knowledge graph by their names",
     inputSchema: {
-      names: z.array(z.string().min(1).max(500)).describe("An array of entity names to retrieve")
+      names: z.array(z.string().min(1).max(500)).max(100).describe("An array of entity names to retrieve")
     },
     outputSchema: {
       entities: z.array(EntityOutputSchema),
@@ -674,11 +697,10 @@ server.registerTool(
 );
 
 async function main() {
-  // Initialize memory file path with backward compatibility
-  MEMORY_FILE_PATH = await ensureMemoryFilePath();
-
-  // Initialize knowledge graph manager with the memory file path
-  knowledgeGraphManager = new KnowledgeGraphManager(MEMORY_FILE_PATH);
+  // Resolve the memory file path (env var → migration fallback → default),
+  // then initialize the knowledge graph manager
+  const memoryFilePath = await ensureMemoryFilePath();
+  knowledgeGraphManager = new KnowledgeGraphManager(memoryFilePath);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
