@@ -1,0 +1,30 @@
+{
+  "name": "mcp-memory-server",
+  "version": "0.7.0",
+  "description": "An MCP server that provides knowledge-graph-based persistent memory using entities, relations, and observations. Forked from @modelcontextprotocol/server-memory.",
+  "license": "MIT",
+  "author": "dustinspace217",
+  "type": "module",
+  "bin": {
+    "mcp-memory-server": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "watch": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.9"
+  }
+}
