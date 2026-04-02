@@ -137,7 +137,8 @@ const SkippedEntitySchema = z.object({
   existingProject: z.string().nullable(),
 });
 
-// Pagination output schema — included in read_graph and search_nodes responses
+// Pagination output schema — included in read_graph and search_nodes responses.
+// Plain object (not z.object()) because registerTool's outputSchema expects { [key]: ZodType }.
 const PaginatedOutputSchema = {
   entities: z.array(EntityOutputSchema),
   relations: z.array(RelationSchema),
@@ -287,6 +288,8 @@ server.registerTool(
     outputSchema: PaginatedOutputSchema,
   },
   async ({ projectId, cursor, limit }) => {
+    // limit is always a number (Zod default 40), so pagination is always active via MCP.
+    // The store's "return all" path only triggers for direct programmatic callers.
     const result = await store.readGraph(normalizeProjectId(projectId), { cursor, limit });
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
