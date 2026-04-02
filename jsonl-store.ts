@@ -18,7 +18,82 @@ import {
   type AddObservationResult,
   type SkippedEntity,
   type CreateEntitiesResult,
+  type PaginationParams,
+  type PaginatedKnowledgeGraph,
+  InvalidCursorError,
 } from './types.js';
+
+// --- Pagination constants and cursor utilities ---
+// These are duplicated from sqlite-store.ts intentionally (small, avoids shared module)
+
+/** Default number of entities per page when no limit is specified */
+const DEFAULT_PAGE_SIZE = 40;
+
+/** Maximum allowed page size — protects against unbounded responses */
+const MAX_PAGE_SIZE = 100;
+
+/**
+ * Internal structure of a cursor. Encodes position within a sorted result set.
+ * u = updatedAt timestamp of the last entity on the previous page
+ * i = integer id (always 0 for JSONL — no integer ids; uses name as tiebreaker)
+ * n = entity name, used as tiebreaker when multiple entities share the same updatedAt
+ * q = query fingerprint, ensures a cursor from one query can't be reused with a different query
+ */
+interface CursorPayload {
+  u: string;
+  i: number;
+  n?: string;
+  q: string;
+}
+
+/**
+ * Encodes a CursorPayload as a base64 string for use as an opaque cursor.
+ *
+ * @param payload - The cursor data to encode
+ * @returns Base64-encoded JSON string
+ */
+function encodeCursor(payload: CursorPayload): string {
+  return Buffer.from(JSON.stringify(payload)).toString('base64');
+}
+
+/**
+ * Decodes a base64 cursor string back into a CursorPayload.
+ * Validates structure and checks that the query fingerprint matches.
+ * Throws InvalidCursorError on any problem — never silently falls back to page 1.
+ *
+ * @param cursor - Base64-encoded cursor string from the client
+ * @param expectedFingerprint - Query fingerprint to validate against (must match cursor.q)
+ * @returns Decoded CursorPayload
+ * @throws InvalidCursorError if cursor is malformed or doesn't match the current query
+ */
+function decodeCursor(cursor: string, expectedFingerprint: string): CursorPayload {
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
+    if (typeof parsed.u !== 'string' || typeof parsed.i !== 'number' || typeof parsed.q !== 'string') {
+      throw new InvalidCursorError('Cursor has invalid structure');
+    }
+    if (parsed.q !== expectedFingerprint) {
+      throw new InvalidCursorError('Cursor does not match current query');
+    }
+    return parsed;
+  } catch (err) {
+    if (err instanceof InvalidCursorError) throw err;
+    throw new InvalidCursorError('Cursor is malformed');
+  }
+}
+
+/**
+ * Clamps a user-provided limit to the valid range [1, MAX_PAGE_SIZE],
+ * defaulting to DEFAULT_PAGE_SIZE when not provided.
+ *
+ * @param limit - Optional user-provided page size
+ * @returns Clamped page size between 1 and MAX_PAGE_SIZE
+ */
+function clampLimit(limit?: number): number {
+  if (limit === undefined) return DEFAULT_PAGE_SIZE;
+  // Math.max/min ensures the value stays within [1, MAX_PAGE_SIZE]
+  return Math.max(1, Math.min(limit, MAX_PAGE_SIZE));
+}
 
 /**
  * Handles the legacy memory.json -> memory.jsonl migration.
@@ -197,6 +272,94 @@ export class JsonlStore implements GraphStore {
   }
 
   /**
+   * Sorts entities by updatedAt DESC (name ASC as tiebreaker), applies cursor-based
+   * pagination, and returns the paginated result with nextCursor and totalCount.
+   * The full relation-filtering logic is handled by the caller.
+   *
+   * @param allEntities - Pre-filtered entity array (project/search filtering already applied)
+   * @param allRelations - All relations in the graph (caller will filter)
+   * @param fingerprint - Query fingerprint for cursor validation
+   * @param pagination - Optional cursor and limit
+   * @returns PaginatedKnowledgeGraph with sorted, paginated entities
+   */
+  private paginateEntities(
+    allEntities: Entity[],
+    allRelations: Relation[],
+    fingerprint: string,
+    pagination?: PaginationParams,
+  ): PaginatedKnowledgeGraph {
+    // Clamp the limit to [1, MAX_PAGE_SIZE], defaulting to DEFAULT_PAGE_SIZE
+    const limit = clampLimit(pagination?.limit);
+    // totalCount reflects the full filtered set (before pagination slices it)
+    const totalCount = allEntities.length;
+
+    // Sort by updatedAt DESC (most recently updated first),
+    // then by name ASC for deterministic tiebreaking when timestamps match
+    const sorted = [...allEntities].sort((a, b) => {
+      if (a.updatedAt !== b.updatedAt) {
+        return a.updatedAt > b.updatedAt ? -1 : 1;  // DESC
+      }
+      return a.name < b.name ? -1 : 1;  // ASC tiebreaker
+    });
+
+    // Find the cursor position if a cursor was provided.
+    // startIndex is where the current page begins in the sorted array.
+    let startIndex = 0;
+    if (pagination?.cursor) {
+      // decodeCursor validates structure and fingerprint match — throws on any problem
+      const cursor = decodeCursor(pagination.cursor, fingerprint);
+      // Find the entity matching the cursor — the next page starts AFTER this entity.
+      // Cursor stores the updatedAt and name of the last entity from the previous page.
+      const cursorIndex = sorted.findIndex(e =>
+        e.updatedAt === cursor.u && e.name === (cursor.n ?? '')
+      );
+      if (cursorIndex === -1) {
+        // Cursor entity was deleted or mutated — documented edge case of keyset pagination
+        throw new InvalidCursorError('Cursor position not found — entity may have been modified or deleted');
+      }
+      startIndex = cursorIndex + 1;
+    }
+
+    // Slice the page plus one extra to detect if there's a next page
+    const pageWithExtra = sorted.slice(startIndex, startIndex + limit + 1);
+    // If we got more than `limit` entities, there's at least one more page
+    const hasMore = pageWithExtra.length > limit;
+    // Trim to exactly `limit` entities for the current page
+    const pageEntities = hasMore ? pageWithExtra.slice(0, limit) : pageWithExtra;
+
+    // Build next cursor from the last entity on this page (if there are more pages)
+    let nextCursor: string | null = null;
+    if (hasMore && pageEntities.length > 0) {
+      const last = pageEntities[pageEntities.length - 1];
+      nextCursor = encodeCursor({
+        u: last.updatedAt,
+        i: 0,  // JSONL has no integer id — uses name as tiebreaker instead
+        n: last.name,
+        q: fingerprint,
+      });
+    }
+
+    // Filter relations to the current page. When all filtered entities fit on one page
+    // (no cursor offset and no overflow), pass through the caller's pre-filtered relations
+    // unchanged — this preserves OR-logic relation inclusion for unpaginated searchNodes.
+    // Only narrow to AND-logic (both endpoints on page) when pagination actually slices
+    // the entity set, since showing a relation to an off-page entity would be confusing.
+    let filteredRelations: Relation[];
+    if (startIndex === 0 && !hasMore) {
+      // Full result set fits on this page — use caller's relation filtering as-is
+      filteredRelations = allRelations;
+    } else {
+      // Pagination sliced the entity set — only show relations where both endpoints are visible
+      const pageEntityNames = new Set(pageEntities.map(e => e.name));
+      filteredRelations = allRelations.filter(r =>
+        pageEntityNames.has(r.from) && pageEntityNames.has(r.to)
+      );
+    }
+
+    return { entities: pageEntities, relations: filteredRelations, nextCursor, totalCount };
+  }
+
+  /**
    * Creates new entities, optionally scoped to a project.
    * Skips name-duplicates (both existing and within-batch) and reports which
    * entities were skipped along with the project that owns the existing entity.
@@ -339,44 +502,63 @@ export class JsonlStore implements GraphStore {
   }
 
   /**
-   * Returns the knowledge graph, optionally filtered by project.
+   * Returns the knowledge graph, optionally filtered by project, with cursor-based pagination.
+   * Entities are sorted by most recently updated first.
    * When projectId is provided, returns entities belonging to that project
    * plus global entities (project === null). Relations are included only
    * when both endpoints are in the filtered entity set.
-   * When projectId is omitted, returns the entire unfiltered graph.
+   * When projectId is omitted and no pagination is requested, returns the entire unfiltered graph
+   * (fast path — no sorting, for backward compat with existing tests).
    *
    * @param projectId - Optional project name to filter by; normalized to lowercase/trimmed
-   * @returns KnowledgeGraph with entities and relations
+   * @param pagination - Optional cursor and limit for paginated results
+   * @returns PaginatedKnowledgeGraph with entities, relations, nextCursor, and totalCount
    */
-  async readGraph(projectId?: string): Promise<KnowledgeGraph> {
+  async readGraph(projectId?: string, pagination?: PaginationParams): Promise<PaginatedKnowledgeGraph> {
     const graph = await this.loadGraph();
-    if (!projectId) return graph;
+    // Fingerprint encodes the query parameters so cursors can't be reused across different queries
+    const fingerprint = `readGraph:${projectId ?? ''}`;
 
-    const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
-    const filteredEntities = graph.entities.filter(e =>
-      e.project === normalizedProject || e.project === null
-    );
-    const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
-    const filteredRelations = graph.relations.filter(r =>
-      filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to)
-    );
-    return { entities: filteredEntities, relations: filteredRelations };
+    if (!projectId && !pagination) {
+      // Fast path: no filtering, no pagination — return everything unsorted
+      // (important for backward compat since existing tests don't expect sorted results)
+      return { ...graph, nextCursor: null, totalCount: graph.entities.length };
+    }
+
+    // Start with all entities; narrow down if project-scoped
+    let filteredEntities = graph.entities;
+    let filteredRelations = graph.relations;
+
+    if (projectId) {
+      const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
+      filteredEntities = graph.entities.filter(e =>
+        e.project === normalizedProject || e.project === null
+      );
+      const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
+      filteredRelations = graph.relations.filter(r =>
+        filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to)
+      );
+    }
+
+    return this.paginateEntities(filteredEntities, filteredRelations, fingerprint, pagination);
   }
 
   /**
-   * Searches for entities matching the query (case-insensitive substring match
-   * against name, entityType, or observation content). Optionally filters by project
-   * (matching entities must belong to the project or be global).
-   * Returns matching entities plus relations where both endpoints are in the result set.
+   * Searches for entities matching the query. Results are paginated by most recently updated first.
+   * Case-insensitive substring match against name, entityType, or observation content.
+   * Optionally filters by project (matching entities must belong to the project or be global).
    *
    * @param query - Case-insensitive substring to search for
    * @param projectId - Optional project name; only returns entities in this project or global
-   * @returns KnowledgeGraph with matching entities and connected relations
+   * @param pagination - Optional cursor and limit for paginated results
+   * @returns PaginatedKnowledgeGraph with matching entities, relations, nextCursor, and totalCount
    */
-  async searchNodes(query: string, projectId?: string): Promise<KnowledgeGraph> {
+  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams): Promise<PaginatedKnowledgeGraph> {
     const graph = await this.loadGraph();
     const lowerQuery = query.toLowerCase();
     const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
+    // Fingerprint includes both projectId and query so cursors can't cross-pollinate
+    const fingerprint = `searchNodes:${projectId ?? ''}:${query}`;
 
     // First filter: match by name, type, or observation content
     let filteredEntities = graph.entities.filter(e =>
@@ -392,16 +574,16 @@ export class JsonlStore implements GraphStore {
       );
     }
 
-    const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
+    // Build the full relation set before pagination slices the entities.
     // When project-filtered, use AND logic (both endpoints must be in the result set)
     // to avoid leaking cross-project relations. Without a project filter, use OR
     // logic (at least one endpoint matches) for backward compatibility.
-    const filteredRelations = graph.relations.filter(r =>
-      normalizedProject
-        ? filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to)
-        : filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to)
-    );
-    return { entities: filteredEntities, relations: filteredRelations };
+    const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
+    const filteredRelations = normalizedProject
+      ? graph.relations.filter(r => filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to))
+      : graph.relations.filter(r => filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to));
+
+    return this.paginateEntities(filteredEntities, filteredRelations, fingerprint, pagination);
   }
 
   /**
