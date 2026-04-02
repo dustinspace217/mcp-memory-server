@@ -11,6 +11,13 @@ export interface Observation {
   createdAt: string;
 }
 
+/**
+ * Sentinel value for entity timestamps on legacy data that predates Phase 4.
+ * Sorts last in DESC ordering (lexicographically before any real ISO 8601 timestamp).
+ * Chosen over empty string to be self-documenting and avoid semantic collision.
+ */
+export const ENTITY_TIMESTAMP_SENTINEL = '0000-00-00T00:00:00.000Z';
+
 /** A named node in the knowledge graph with a type and attached observations.
  *  project scopes the entity to a specific project (null = global, never undefined). */
 export interface Entity {
@@ -18,6 +25,8 @@ export interface Entity {
   entityType: string;
   observations: Observation[];
   project: string | null;  // null = global, never undefined
+  updatedAt: string;       // ISO 8601 UTC, or ENTITY_TIMESTAMP_SENTINEL for legacy data
+  createdAt: string;       // ISO 8601 UTC, or ENTITY_TIMESTAMP_SENTINEL for legacy data
 }
 
 /** A directed edge between two entities with a relation type. */
