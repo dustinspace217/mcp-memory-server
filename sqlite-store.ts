@@ -208,16 +208,63 @@ export class SqliteStore implements GraphStore {
     return results;
   }
 
-  async deleteEntities(_entityNames: string[]): Promise<void> {
-    throw new Error('SqliteStore.deleteEntities not implemented');
+  /**
+   * Deletes entities by name. ON DELETE CASCADE on the observations and relations
+   * foreign keys automatically removes related rows -- no manual cleanup needed.
+   * Silently ignores names that don't exist (idempotent).
+   *
+   * @param entityNames - Array of entity name strings to delete
+   */
+  async deleteEntities(entityNames: string[]): Promise<void> {
+    const del = this.db.prepare('DELETE FROM entities WHERE name = ?');
+    const txn = this.db.transaction(() => {
+      for (const name of entityNames) {
+        del.run(name);
+      }
+    });
+    txn();
   }
 
-  async deleteObservations(_deletions: DeleteObservationInput[]): Promise<void> {
-    throw new Error('SqliteStore.deleteObservations not implemented');
+  /**
+   * Deletes specific observations by content string from the named entities.
+   * Silently ignores non-existent entities (idempotent -- absence is the goal).
+   *
+   * @param deletions - Array of { entityName, contents: string[] }
+   */
+  async deleteObservations(deletions: DeleteObservationInput[]): Promise<void> {
+    const findEntity = this.db.prepare('SELECT id FROM entities WHERE name = ?');
+    const delObs = this.db.prepare(
+      'DELETE FROM observations WHERE entity_id = ? AND content = ?'
+    );
+
+    const txn = this.db.transaction(() => {
+      for (const d of deletions) {
+        const row = findEntity.get(d.entityName) as { id: number } | undefined;
+        if (!row) continue;
+        for (const content of d.contents) {
+          delObs.run(row.id, content);
+        }
+      }
+    });
+    txn();
   }
 
-  async deleteRelations(_relations: Relation[]): Promise<void> {
-    throw new Error('SqliteStore.deleteRelations not implemented');
+  /**
+   * Deletes specific relations by exact match on all three fields.
+   * Silently ignores non-existent relations (idempotent).
+   *
+   * @param relations - Array of { from, to, relationType }
+   */
+  async deleteRelations(relations: Relation[]): Promise<void> {
+    const del = this.db.prepare(
+      'DELETE FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ?'
+    );
+    const txn = this.db.transaction(() => {
+      for (const r of relations) {
+        del.run(r.from, r.to, r.relationType);
+      }
+    });
+    txn();
   }
 
   async readGraph(): Promise<KnowledgeGraph> {
