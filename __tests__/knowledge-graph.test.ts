@@ -1061,5 +1061,117 @@ describe('JsonlStore-specific', () => {
 // ============================================================
 
 describe('SqliteStore-specific', () => {
-	// Tests added in Task 12
+	let store: SqliteStore;
+	let storePath: string;
+
+	beforeEach(async () => {
+		storePath = path.join(testDir, `test-sqlite-${Date.now()}.db`);
+		store = new SqliteStore(storePath);
+		await store.init();
+	});
+
+	afterEach(async () => {
+		await store.close();
+		for (const suffix of ['', '-wal', '-shm']) {
+			try { await fs.unlink(storePath + suffix); } catch { /* ignore */ }
+		}
+	});
+
+	describe('foreign key constraints', () => {
+		it('should reject relations referencing non-existent entities', async () => {
+			await expect(
+				store.createRelations([
+					{ from: 'Ghost', to: 'Phantom', relationType: 'knows' },
+				])
+			).rejects.toThrow();
+		});
+
+		it('should cascade-delete observations when entity is deleted', async () => {
+			await store.createEntities([
+				{ name: 'Alice', entityType: 'person', observations: ['obs1', 'obs2'] },
+			]);
+			await store.deleteEntities(['Alice']);
+
+			// Re-create Alice -- should have no leftover observations
+			await store.createEntities([
+				{ name: 'Alice', entityType: 'person', observations: [] },
+			]);
+			const graph = await store.readGraph();
+			expect(graph.entities[0].observations).toHaveLength(0);
+		});
+
+		it('should cascade-delete relations when entity is deleted', async () => {
+			await store.createEntities([
+				{ name: 'Alice', entityType: 'person', observations: [] },
+				{ name: 'Bob', entityType: 'person', observations: [] },
+			]);
+			await store.createRelations([
+				{ from: 'Alice', to: 'Bob', relationType: 'knows' },
+			]);
+			await store.deleteEntities(['Alice']);
+
+			const graph = await store.readGraph();
+			expect(graph.relations).toHaveLength(0);
+		});
+	});
+
+	describe('LIKE wildcard escaping', () => {
+		it('should treat % as a literal character in search', async () => {
+			await store.createEntities([
+				{ name: '100% complete', entityType: 'status', observations: [] },
+				{ name: 'incomplete', entityType: 'status', observations: [] },
+			]);
+
+			const result = await store.searchNodes('100%');
+			expect(result.entities).toHaveLength(1);
+			expect(result.entities[0].name).toBe('100% complete');
+		});
+
+		it('should treat _ as a literal character in search', async () => {
+			await store.createEntities([
+				{ name: 'my_var', entityType: 'variable', observations: [] },
+				{ name: 'myXvar', entityType: 'variable', observations: [] },
+			]);
+
+			const result = await store.searchNodes('my_var');
+			expect(result.entities).toHaveLength(1);
+			expect(result.entities[0].name).toBe('my_var');
+		});
+	});
+
+	describe('WAL journal mode', () => {
+		it('should use WAL journal mode', async () => {
+			// Access private db field for this infrastructure test
+			const mode = (store as any).db.pragma('journal_mode', { simple: true });
+			expect(mode).toBe('wal');
+		});
+	});
+
+	describe('INSERT OR IGNORE behavior', () => {
+		it('should silently skip duplicate entity names', async () => {
+			await store.createEntities([
+				{ name: 'Alice', entityType: 'person', observations: ['first'] },
+			]);
+			const result = await store.createEntities([
+				{ name: 'Alice', entityType: 'robot', observations: ['second'] },
+			]);
+
+			expect(result).toHaveLength(0);
+			const graph = await store.readGraph();
+			expect(graph.entities).toHaveLength(1);
+			expect(graph.entities[0].entityType).toBe('person');
+		});
+
+		it('should silently skip duplicate observations on same entity', async () => {
+			await store.createEntities([
+				{ name: 'Alice', entityType: 'person', observations: ['original'] },
+			]);
+			const result = await store.addObservations([
+				{ entityName: 'Alice', contents: ['original', 'new one'] },
+			]);
+
+			expect(result[0].addedObservations).toHaveLength(1);
+			expect(result[0].addedObservations[0].content).toBe('new one');
+		});
+	});
 });
