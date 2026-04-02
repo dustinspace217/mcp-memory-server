@@ -67,7 +67,7 @@ export async function ensureMemoryFilePath(): Promise<StoreConfig> {
 }
 
 // Re-export types that tests and external consumers may need
-export { type Observation, type Entity, type Relation, type KnowledgeGraph, type CreateEntitiesResult, type SkippedEntity } from './types.js';
+export { type Observation, type Entity, type Relation, type KnowledgeGraph, type CreateEntitiesResult, type SkippedEntity, type PaginationParams, type PaginatedKnowledgeGraph, InvalidCursorError } from './types.js';
 export { JsonlStore, normalizeObservation } from './jsonl-store.js';
 export { SqliteStore } from './sqlite-store.js';
 
@@ -95,6 +95,8 @@ const EntityOutputSchema = z.object({
   entityType: z.string().describe("The type of the entity"),
   observations: z.array(ObservationSchema).describe("An array of observations with content and timestamps"),
   project: z.string().nullable().describe("Project this entity belongs to, or null for global"),
+  updatedAt: z.string().describe("ISO 8601 UTC timestamp of last update, or sentinel for legacy data"),
+  createdAt: z.string().describe("ISO 8601 UTC timestamp of creation, or sentinel for legacy data"),
 });
 
 const RelationSchema = z.object({
@@ -135,9 +137,17 @@ const SkippedEntitySchema = z.object({
   existingProject: z.string().nullable(),
 });
 
+// Pagination output schema — included in read_graph and search_nodes responses
+const PaginatedOutputSchema = {
+  entities: z.array(EntityOutputSchema),
+  relations: z.array(RelationSchema),
+  nextCursor: z.string().nullable().describe("Cursor for the next page, or null if this is the last page"),
+  totalCount: z.number().describe("Total number of matching entities across all pages"),
+};
+
 const server = new McpServer({
   name: "memory-server",
-  version: "0.9.0",
+  version: "0.10.0",
 });
 
 server.registerTool(
@@ -268,15 +278,19 @@ server.registerTool(
   "read_graph",
   {
     title: "Read Graph",
-    description: "Read the entire knowledge graph",
-    inputSchema: { projectId: ProjectIdSchema },
-    outputSchema: { entities: z.array(EntityOutputSchema), relations: z.array(RelationSchema) }
+    description: "Read the knowledge graph. Returns entities sorted by most recently updated, paginated. Use the returned nextCursor to fetch subsequent pages. Omit cursor for the first page.",
+    inputSchema: {
+      projectId: ProjectIdSchema,
+      cursor: z.string().optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page."),
+      limit: z.number().int().min(1).max(100).optional().default(40).describe("Max entities per page (default 40, max 100)"),
+    },
+    outputSchema: PaginatedOutputSchema,
   },
-  async ({ projectId }) => {
-    const graph = await store.readGraph(normalizeProjectId(projectId));
+  async ({ projectId, cursor, limit }) => {
+    const result = await store.readGraph(normalizeProjectId(projectId), { cursor, limit });
     return {
-      content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
-      structuredContent: { ...graph }
+      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      structuredContent: { ...result }
     };
   }
 );
@@ -285,18 +299,20 @@ server.registerTool(
   "search_nodes",
   {
     title: "Search Nodes",
-    description: "Search for nodes in the knowledge graph based on a query",
+    description: "Search for nodes in the knowledge graph. Returns matching entities sorted by most recently updated, paginated. Use the returned nextCursor to fetch subsequent pages. Omit cursor for the first page.",
     inputSchema: {
       query: z.string().min(1).max(5000).describe("The search query to match against entity names, types, and observation content"),
       projectId: ProjectIdSchema,
+      cursor: z.string().optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page."),
+      limit: z.number().int().min(1).max(100).optional().default(40).describe("Max entities per page (default 40, max 100)"),
     },
-    outputSchema: { entities: z.array(EntityOutputSchema), relations: z.array(RelationSchema) }
+    outputSchema: PaginatedOutputSchema,
   },
-  async ({ query, projectId }) => {
-    const graph = await store.searchNodes(query, normalizeProjectId(projectId));
+  async ({ query, projectId, cursor, limit }) => {
+    const result = await store.searchNodes(query, normalizeProjectId(projectId), { cursor, limit });
     return {
-      content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
-      structuredContent: { ...graph }
+      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      structuredContent: { ...result }
     };
   }
 );
