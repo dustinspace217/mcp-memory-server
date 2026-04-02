@@ -2,10 +2,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { KnowledgeGraphManager, Entity, Observation, Relation, KnowledgeGraph } from '../index.js';
+import { Entity, Observation, Relation, KnowledgeGraph } from '../types.js';
+import { JsonlStore } from '../jsonl-store.js';
 
-describe('KnowledgeGraphManager', () => {
-  let manager: KnowledgeGraphManager;
+describe('JsonlStore', () => {
+  let manager: JsonlStore;
   let testFilePath: string;
 
   beforeEach(async () => {
@@ -14,7 +15,7 @@ describe('KnowledgeGraphManager', () => {
       path.dirname(fileURLToPath(import.meta.url)),
       `test-memory-${Date.now()}.jsonl`
     );
-    manager = new KnowledgeGraphManager(testFilePath);
+    manager = new JsonlStore(testFilePath);
   });
 
   afterEach(async () => {
@@ -200,7 +201,7 @@ describe('KnowledgeGraphManager', () => {
       ]);
 
       await manager.deleteObservations([
-        { entityName: 'Alice', observations: ['likes coffee'] },
+        { entityName: 'Alice', contents: ['likes coffee'] },
       ]);
 
       const graph = await manager.readGraph();
@@ -211,7 +212,7 @@ describe('KnowledgeGraphManager', () => {
 
     it('should handle deleting from non-existent entities', async () => {
       await manager.deleteObservations([
-        { entityName: 'NonExistent', observations: ['some observation'] },
+        { entityName: 'NonExistent', contents: ['some observation'] },
       ]);
       // Should not throw error
       const graph = await manager.readGraph();
@@ -401,7 +402,7 @@ describe('KnowledgeGraphManager', () => {
       ]);
 
       // Create new manager instance with same file path
-      const manager2 = new KnowledgeGraphManager(testFilePath);
+      const manager2 = new JsonlStore(testFilePath);
       const graph = await manager2.readGraph();
 
       expect(graph.entities).toHaveLength(1);
@@ -449,7 +450,7 @@ describe('KnowledgeGraphManager', () => {
       expect(fileRelation).toHaveProperty('type', 'relation');
 
       // Create new manager instance to force reload from file
-      const manager2 = new KnowledgeGraphManager(testFilePath);
+      const manager2 = new JsonlStore(testFilePath);
       const graph = await manager2.readGraph();
 
       // Verify loaded entities don't have type field
@@ -480,7 +481,7 @@ describe('KnowledgeGraphManager', () => {
       ]);
 
       // Create new manager instance to force reload from file
-      const manager2 = new KnowledgeGraphManager(testFilePath);
+      const manager2 = new JsonlStore(testFilePath);
       const result = await manager2.searchNodes('Alice');
 
       // Verify search results don't have type field
@@ -503,7 +504,7 @@ describe('KnowledgeGraphManager', () => {
       ]);
 
       // Create new manager instance to force reload from file
-      const manager2 = new KnowledgeGraphManager(testFilePath);
+      const manager2 = new JsonlStore(testFilePath);
       const result = await manager2.openNodes(['Alice', 'Bob']);
 
       // Verify open results don't have type field
@@ -578,7 +579,7 @@ describe('KnowledgeGraphManager', () => {
       const timestamp1 = graph1.entities[0].observations[0].createdAt;
 
       // Create a new manager instance to force re-read from disk
-      const manager2 = new KnowledgeGraphManager(testFilePath);
+      const manager2 = new JsonlStore(testFilePath);
       const graph2 = await manager2.readGraph();
       const timestamp2 = graph2.entities[0].observations[0].createdAt;
 
@@ -628,7 +629,7 @@ describe('KnowledgeGraphManager', () => {
       ]);
 
       await manager.deleteObservations([
-        { entityName: 'Alice', observations: ['delete this'] },
+        { entityName: 'Alice', contents: ['delete this'] },
       ]);
 
       const graph = await manager.readGraph();
@@ -905,7 +906,7 @@ describe('KnowledgeGraphManager', () => {
 
       // Delete an observation that doesn't exist — should not throw or affect existing obs
       await manager.deleteObservations([
-        { entityName: 'Alice', observations: ['nonexistent'] },
+        { entityName: 'Alice', contents: ['nonexistent'] },
       ]);
 
       const graph = await manager.readGraph();
