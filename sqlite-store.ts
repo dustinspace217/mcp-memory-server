@@ -592,7 +592,7 @@ export class SqliteStore implements GraphStore {
    * @param entityRows - Array of { name, entityType, project } from an entities query
    * @returns Entity array with observations attached
    */
-  private buildEntities(entityRows: { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[]): Entity[] {
+  private buildEntities(entityRows: { name: string; entityType: string; project: string | null; updated_at: string; created_at: string; id?: number }[]): Entity[] {
     if (entityRows.length === 0) return [];
 
     const names = entityRows.map(e => e.name);
@@ -744,18 +744,23 @@ export class SqliteStore implements GraphStore {
       nextCursor = encodeCursor({ u: last.updated_at, i: last.id, n: last.name, q: fingerprint });
     }
 
-    // Count total matching entities (same WHERE conditions but without cursor/limit).
-    // This tells the caller how many entities match overall, not just this page.
-    const countConditions: string[] = [];
-    const countParams: (string | number)[] = [];
-    if (normalizedProject) {
-      countConditions.push('(project = ? OR project IS NULL)');
-      countParams.push(normalizedProject);
+    // Count total matching entities. When unpaginated, we already have all rows,
+    // so skip the COUNT query and use the array length directly.
+    let totalCount: number;
+    if (isPaginated) {
+      const countConditions: string[] = [];
+      const countParams: (string | number)[] = [];
+      if (normalizedProject) {
+        countConditions.push('(project = ? OR project IS NULL)');
+        countParams.push(normalizedProject);
+      }
+      const countWhere = countConditions.length > 0 ? `WHERE ${countConditions.join(' AND ')}` : '';
+      totalCount = (this.db.prepare(
+        `SELECT COUNT(*) AS cnt FROM entities ${countWhere}`
+      ).get(...countParams) as { cnt: number }).cnt;
+    } else {
+      totalCount = pageRows.length;
     }
-    const countWhere = countConditions.length > 0 ? `WHERE ${countConditions.join(' AND ')}` : '';
-    const totalCount = (this.db.prepare(
-      `SELECT COUNT(*) AS cnt FROM entities ${countWhere}`
-    ).get(...countParams) as { cnt: number }).cnt;
 
     // Build full Entity objects with observations from the page rows
     const entities = this.buildEntities(pageRows);
@@ -876,19 +881,24 @@ export class SqliteStore implements GraphStore {
       nextCursor = encodeCursor({ u: last.updated_at, i: last.id, n: last.name, q: fingerprint });
     }
 
-    // Count total matching entities (same search/project conditions, no cursor/limit).
-    // Uses COUNT(DISTINCT id) because the LEFT JOIN can produce duplicates.
-    const countParams: (string | number)[] = [pattern, pattern, pattern];
-    let countSql = `
-      SELECT COUNT(DISTINCT e2.id) AS cnt FROM entities e2
-      LEFT JOIN observations o ON o.entity_id = e2.id
-      WHERE (e2.name LIKE ? ESCAPE '\\' OR e2.entity_type LIKE ? ESCAPE '\\' OR o.content LIKE ? ESCAPE '\\')
-    `;
-    if (normalizedProject) {
-      countSql += ' AND (e2.project = ? OR e2.project IS NULL)';
-      countParams.push(normalizedProject);
+    // Count total matching entities. When unpaginated, skip the expensive COUNT query
+    // (which requires a LEFT JOIN + 3 LIKE patterns) and use the array length directly.
+    let totalCount: number;
+    if (isPaginated) {
+      const countParams: (string | number)[] = [pattern, pattern, pattern];
+      let countSql = `
+        SELECT COUNT(DISTINCT e2.id) AS cnt FROM entities e2
+        LEFT JOIN observations o ON o.entity_id = e2.id
+        WHERE (e2.name LIKE ? ESCAPE '\\' OR e2.entity_type LIKE ? ESCAPE '\\' OR o.content LIKE ? ESCAPE '\\')
+      `;
+      if (normalizedProject) {
+        countSql += ' AND (e2.project = ? OR e2.project IS NULL)';
+        countParams.push(normalizedProject);
+      }
+      totalCount = (this.db.prepare(countSql).get(...countParams) as { cnt: number }).cnt;
+    } else {
+      totalCount = pageRows.length;
     }
-    const totalCount = (this.db.prepare(countSql).get(...countParams) as { cnt: number }).cnt;
 
     // Build full Entity objects with observations
     const entities = this.buildEntities(pageRows);
