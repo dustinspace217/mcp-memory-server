@@ -288,8 +288,6 @@ export class JsonlStore implements GraphStore {
     fingerprint: string,
     pagination?: PaginationParams,
   ): PaginatedKnowledgeGraph {
-    // Clamp the limit to [1, MAX_PAGE_SIZE], defaulting to DEFAULT_PAGE_SIZE
-    const limit = clampLimit(pagination?.limit);
     // totalCount reflects the full filtered set (before pagination slices it)
     const totalCount = allEntities.length;
 
@@ -302,10 +300,20 @@ export class JsonlStore implements GraphStore {
       return a.name < b.name ? -1 : 1;  // ASC tiebreaker
     });
 
+    // When pagination is not requested, return all sorted entities.
+    // This matches SQLite behavior (which omits LIMIT when pagination is undefined)
+    // and preserves backward compatibility for direct API callers.
+    if (!pagination) {
+      return { entities: sorted, relations: allRelations, nextCursor: null, totalCount };
+    }
+
+    // Clamp the limit to [1, MAX_PAGE_SIZE], defaulting to DEFAULT_PAGE_SIZE
+    const limit = clampLimit(pagination.limit);
+
     // Find the cursor position if a cursor was provided.
     // startIndex is where the current page begins in the sorted array.
     let startIndex = 0;
-    if (pagination?.cursor) {
+    if (pagination.cursor) {
       // decodeCursor validates structure and fingerprint match — throws on any problem
       const cursor = decodeCursor(pagination.cursor, fingerprint);
       // Find the entity matching the cursor — the next page starts AFTER this entity.
