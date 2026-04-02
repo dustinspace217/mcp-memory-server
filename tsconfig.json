@@ -14,7 +14,10 @@
     "sourceMap": true
   },
   "include": [
-    "index.ts"
+    "index.ts",
+    "types.ts",
+    "jsonl-store.ts",
+    "sqlite-store.ts"
   ],
   "exclude": [
     "node_modules",
