@@ -200,12 +200,13 @@ export class SqliteStore implements GraphStore {
     const txn = this.db.transaction(() => {
       for (const entity of graph.entities) {
         // INSERT OR IGNORE: if name already exists (duplicate in JSONL), skip silently.
-        // Normalize the project value (trim + lowercase) to match the normalization
+        // Normalize the project value (trim + lowercase + NFC) to match the normalization
         // applied by createEntities. Without this, mixed-case project values from JSONL
         // (e.g., "My-Project") would be stored verbatim and become invisible to
         // project-filtered queries that normalize to lowercase ("my-project").
+        // NFC normalization ensures macOS (NFD) and Linux (NFC) path-derived names match.
         const migratedProject = typeof entity.project === 'string'
-          ? entity.project.trim().toLowerCase() || null
+          ? entity.project.trim().toLowerCase().normalize('NFC') || null
           : null;
         insertEntity.run(entity.name, entity.entityType, migratedProject);
         const row = getEntityId.get(entity.name) as { id: number };
