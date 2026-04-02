@@ -319,7 +319,8 @@ export class JsonlStore implements GraphStore {
       if (entity) {
         const toDelete = new Set(d.contents);
         entity.observations = entity.observations.filter(o => !toDelete.has(o.content));
-        // Bump updatedAt — entity content has changed
+        // Bump updatedAt unconditionally — deletion is idempotent, so even if
+        // no observations matched, the caller expressed intent to modify this entity
         entity.updatedAt = new Date().toISOString();
       }
     });
