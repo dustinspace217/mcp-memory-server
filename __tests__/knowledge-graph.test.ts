@@ -1892,4 +1892,80 @@ describe('SqliteStore-specific', () => {
 			}
 		});
 	});
+
+	describe('timestamp column migration', () => {
+		it('should migrate existing database by adding timestamp columns and backfilling', async () => {
+			const migrationPath = path.join(testDir, `test-migration-timestamps-${Date.now()}.db`);
+
+			// Create a pre-Phase-4 database (has project column but no timestamp columns).
+			// Imports better-sqlite3 directly to build a schema matching Phase 3 state,
+			// simulating a database created before Phase 4 was implemented.
+			const Database = (await import('better-sqlite3')).default;
+			const rawDb = new Database(migrationPath);
+			rawDb.pragma('journal_mode = WAL');
+			rawDb.pragma('foreign_keys = ON');
+			rawDb.exec(`
+				CREATE TABLE IF NOT EXISTS entities (
+					id          INTEGER PRIMARY KEY AUTOINCREMENT,
+					name        TEXT NOT NULL UNIQUE,
+					entity_type TEXT NOT NULL,
+					project     TEXT
+				);
+				CREATE TABLE IF NOT EXISTS observations (
+					id          INTEGER PRIMARY KEY AUTOINCREMENT,
+					entity_id   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+					content     TEXT NOT NULL,
+					created_at  TEXT NOT NULL,
+					UNIQUE(entity_id, content)
+				);
+				CREATE TABLE IF NOT EXISTS relations (
+					id            INTEGER PRIMARY KEY AUTOINCREMENT,
+					from_entity   TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+					to_entity     TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+					relation_type TEXT NOT NULL,
+					UNIQUE(from_entity, to_entity, relation_type)
+				);
+			`);
+
+			// Insert entity WITH observations (for backfill testing)
+			rawDb.prepare('INSERT INTO entities (name, entity_type) VALUES (?, ?)').run('WithObs', 'test');
+			const entityId = (rawDb.prepare('SELECT id FROM entities WHERE name = ?').get('WithObs') as { id: number }).id;
+			rawDb.prepare('INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)').run(entityId, 'obs1', '2026-03-15T10:00:00.000Z');
+			rawDb.prepare('INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)').run(entityId, 'obs2', '2026-04-01T15:30:00.000Z');
+
+			// Insert entity WITHOUT valid observations (should keep sentinel)
+			rawDb.prepare('INSERT INTO entities (name, entity_type) VALUES (?, ?)').run('NoObs', 'test');
+
+			rawDb.close();
+
+			// Re-open with SqliteStore — init() should detect missing columns and migrate
+			const store2 = new SqliteStore(migrationPath);
+			await store2.init();
+
+			const graph = await store2.readGraph();
+
+			// Entity with observations should have updatedAt backfilled from MAX(observations.created_at)
+			const withObs = graph.entities.find(e => e.name === 'WithObs');
+			expect(withObs).toBeDefined();
+			expect(withObs!.updatedAt).toBe('2026-04-01T15:30:00.000Z');
+			expect(withObs!.createdAt).toBe('2026-03-15T10:00:00.000Z');
+
+			// Entity without observations should have sentinel timestamp
+			const noObs = graph.entities.find(e => e.name === 'NoObs');
+			expect(noObs).toBeDefined();
+			expect(noObs!.updatedAt).toBe('0000-00-00T00:00:00.000Z');
+			expect(noObs!.createdAt).toBe('0000-00-00T00:00:00.000Z');
+
+			// Verify pagination works on migrated data (updatedAt should order correctly)
+			const paginated = await store2.readGraph(undefined, { limit: 1 });
+			// WithObs has a real timestamp, should come first in DESC order
+			expect(paginated.entities[0].name).toBe('WithObs');
+			expect(paginated.nextCursor).not.toBeNull();
+
+			await store2.close();
+			for (const suffix of ['', '-wal', '-shm']) {
+				try { await fs.unlink(migrationPath + suffix); } catch { /* ignore */ }
+			}
+		});
+	});
 });
