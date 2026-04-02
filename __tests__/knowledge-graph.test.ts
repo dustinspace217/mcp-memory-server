@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import type { GraphStore, Relation, PaginatedKnowledgeGraph } from '../types.js';
+import type { GraphStore, Relation } from '../types.js';
 import { InvalidCursorError } from '../types.js';
 import { JsonlStore, normalizeObservation } from '../jsonl-store.js';
 import { SqliteStore } from '../sqlite-store.js';
