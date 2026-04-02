@@ -15,6 +15,8 @@ import {
   type AddObservationInput,
   type DeleteObservationInput,
   type AddObservationResult,
+  type SkippedEntity,
+  type CreateEntitiesResult,
 } from './types.js';
 import { JsonlStore } from './jsonl-store.js';
 
@@ -109,11 +111,13 @@ export class SqliteStore implements GraphStore {
 
     // Create tables. IF NOT EXISTS makes this safe to call on an existing database.
     // entities.name has a UNIQUE constraint so it can be referenced by relations.
+    // project is nullable: NULL means global (visible to all projects).
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS entities (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         name        TEXT NOT NULL UNIQUE,
-        entity_type TEXT NOT NULL
+        entity_type TEXT NOT NULL,
+        project     TEXT
       );
       CREATE TABLE IF NOT EXISTS observations (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,6 +134,14 @@ export class SqliteStore implements GraphStore {
         UNIQUE(from_entity, to_entity, relation_type)
       );
     `);
+
+    // Migration: add project column if upgrading from an older schema.
+    // SQLite's ALTER TABLE ADD COLUMN is safe with IF NOT EXISTS via a try/catch.
+    try {
+      this.db.exec('ALTER TABLE entities ADD COLUMN project TEXT');
+    } catch {
+      // Column already exists -- safe to ignore "duplicate column name" error
+    }
 
     // --- Run migration if data was loaded from JSONL ---
     if (migrationData) {
@@ -217,34 +229,52 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
-   * Creates new entities in the SQLite database.
+   * Creates new entities in the SQLite database, optionally scoped to a project.
    * Uses INSERT OR IGNORE to skip name-duplicates (both existing and within-batch).
    * Observations are inserted with INSERT OR IGNORE to deduplicate by (entity_id, content).
+   * Returns a CreateEntitiesResult with created entities and skipped duplicates.
    *
    * @param entities - Array of entities to create, each with observations as strings or objects
-   * @returns Only the entities that were actually created (excludes name-duplicates)
+   * @param projectId - Optional project name; normalized to lowercase/trimmed. Omit for global.
+   * @returns CreateEntitiesResult with created entities and skipped duplicates
    */
-  async createEntities(entities: EntityInput[]): Promise<Entity[]> {
+  async createEntities(entities: EntityInput[], projectId?: string): Promise<CreateEntitiesResult> {
+    // Normalize the project ID: trim whitespace, lowercase, or null for global
+    const normalizedProject = projectId?.trim().toLowerCase() || null;
+
     // Prepared statements are compiled once and reused -- faster than db.exec() per row
     const insertEntity = this.db.prepare(
-      'INSERT OR IGNORE INTO entities (name, entity_type) VALUES (?, ?)'
+      'INSERT OR IGNORE INTO entities (name, entity_type, project) VALUES (?, ?, ?)'
     );
     const getEntityId = this.db.prepare(
       'SELECT id FROM entities WHERE name = ?'
+    );
+    // Look up existing entity's project for skip reporting
+    const getExistingProject = this.db.prepare(
+      'SELECT project FROM entities WHERE name = ?'
     );
     const insertObs = this.db.prepare(
       'INSERT OR IGNORE INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)'
     );
 
-    const results: Entity[] = [];
+    const created: Entity[] = [];
+    const skipped: SkippedEntity[] = [];
 
     // db.transaction() wraps the callback in BEGIN/COMMIT. If the callback throws,
     // it automatically rolls back. This is a better-sqlite3 feature (not raw SQL).
     const txn = this.db.transaction(() => {
       for (const e of entities) {
         // INSERT OR IGNORE returns changes=0 if the name already exists (UNIQUE constraint)
-        const info = insertEntity.run(e.name, e.entityType);
-        if (info.changes === 0) continue;
+        const info = insertEntity.run(e.name, e.entityType, normalizedProject);
+        if (info.changes === 0) {
+          // Entity already exists -- report it as skipped with its existing project
+          const existing = getExistingProject.get(e.name) as { project: string | null } | undefined;
+          skipped.push({
+            name: e.name,
+            existingProject: existing?.project ?? null,
+          });
+          continue;
+        }
 
         // Get the auto-generated id for inserting observations
         const row = getEntityId.get(e.name) as { id: number };
@@ -258,12 +288,12 @@ export class SqliteStore implements GraphStore {
           }
         }
 
-        results.push({ name: e.name, entityType: e.entityType, observations });
+        created.push({ name: e.name, entityType: e.entityType, observations, project: normalizedProject });
       }
     });
     txn();
 
-    return results;
+    return { created, skipped };
   }
 
   /**
@@ -401,10 +431,10 @@ export class SqliteStore implements GraphStore {
    * Uses a single query per chunk to fetch all observations (avoids N+1 queries).
    * Chunks the IN clause to stay within SQLite's SQLITE_MAX_VARIABLE_NUMBER limit (default 999).
    *
-   * @param entityRows - Array of { name, entityType } from an entities query
+   * @param entityRows - Array of { name, entityType, project } from an entities query
    * @returns Entity array with observations attached
    */
-  private buildEntities(entityRows: { name: string; entityType: string }[]): Entity[] {
+  private buildEntities(entityRows: { name: string; entityType: string; project: string | null }[]): Entity[] {
     if (entityRows.length === 0) return [];
 
     const names = entityRows.map(e => e.name);
@@ -433,6 +463,7 @@ export class SqliteStore implements GraphStore {
       name: e.name,
       entityType: e.entityType,
       observations: obsMap.get(e.name) || [],
+      project: e.project,
     }));
   }
 
@@ -475,15 +506,43 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
-   * Returns the entire knowledge graph (all entities with observations, all relations).
-   * For an empty database, returns { entities: [], relations: [] }.
+   * Returns the knowledge graph, optionally filtered by project.
+   * When projectId is provided, returns entities belonging to that project
+   * plus global entities (project IS NULL). Relations are included only
+   * when both endpoints are in the filtered entity set.
+   * When projectId is omitted, returns the entire unfiltered graph.
+   *
+   * @param projectId - Optional project name to filter by; normalized to lowercase/trimmed
    */
-  async readGraph(): Promise<KnowledgeGraph> {
-    const entityRows = this.db.prepare(
-      'SELECT name, entity_type AS entityType FROM entities'
-    ).all() as { name: string; entityType: string }[];
+  async readGraph(projectId?: string): Promise<KnowledgeGraph> {
+    let entityRows: { name: string; entityType: string; project: string | null }[];
+
+    if (projectId) {
+      const normalizedProject = projectId.trim().toLowerCase();
+      // Return entities matching the project OR global entities (project IS NULL)
+      entityRows = this.db.prepare(
+        'SELECT name, entity_type AS entityType, project FROM entities WHERE project = ? OR project IS NULL'
+      ).all(normalizedProject) as { name: string; entityType: string; project: string | null }[];
+    } else {
+      entityRows = this.db.prepare(
+        'SELECT name, entity_type AS entityType, project FROM entities'
+      ).all() as { name: string; entityType: string; project: string | null }[];
+    }
 
     const entities = this.buildEntities(entityRows);
+
+    if (projectId) {
+      // When filtering by project, only include relations where both endpoints
+      // are in the filtered entity set (avoids dangling cross-project edges)
+      const entityNames = new Set(entityRows.map(e => e.name));
+      const allRelations = this.db.prepare(
+        'SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType FROM relations'
+      ).all() as Relation[];
+      const filteredRelations = allRelations.filter(r =>
+        entityNames.has(r.from) && entityNames.has(r.to)
+      );
+      return { entities, relations: filteredRelations };
+    }
 
     const relations = this.db.prepare(
       'SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType FROM relations'
@@ -495,54 +554,117 @@ export class SqliteStore implements GraphStore {
   /**
    * Searches entities by case-insensitive substring match against name, entityType,
    * or observation content. Uses LIKE with escaped wildcards.
+   * When projectId is provided, results are restricted to entities belonging to
+   * the project or global entities (project IS NULL).
    *
    * SQLite's LIKE is case-insensitive for ASCII characters (A-Z) by default.
    * For full Unicode case folding, FTS5 with ICU would be needed.
    *
    * @param query - The search string, matched as a case-insensitive substring
-   * @returns Matching entities + relations where at least one endpoint matches
+   * @param projectId - Optional project name; only returns entities in this project or global
+   * @returns Matching entities + relations where both endpoints are in the result set
    */
-  async searchNodes(query: string): Promise<KnowledgeGraph> {
+  async searchNodes(query: string, projectId?: string): Promise<KnowledgeGraph> {
     const escaped = escapeLike(query);
     const pattern = `%${escaped}%`;
 
-    // Find entities matching the query in name, type, or any observation content.
-    // LEFT JOIN ensures entities with no observations are still checked.
-    // DISTINCT prevents duplicates when multiple observations match.
-    const entityRows = this.db.prepare(`
-      SELECT DISTINCT e.name, e.entity_type AS entityType
-      FROM entities e
-      LEFT JOIN observations o ON o.entity_id = e.id
-      WHERE e.name LIKE ? ESCAPE '\\'
-         OR e.entity_type LIKE ? ESCAPE '\\'
-         OR o.content LIKE ? ESCAPE '\\'
-    `).all(pattern, pattern, pattern) as { name: string; entityType: string }[];
+    let entityRows: { name: string; entityType: string; project: string | null }[];
+
+    if (projectId) {
+      const normalizedProject = projectId.trim().toLowerCase();
+      // Find entities matching the query AND belonging to the project or global
+      entityRows = this.db.prepare(`
+        SELECT DISTINCT e.name, e.entity_type AS entityType, e.project
+        FROM entities e
+        LEFT JOIN observations o ON o.entity_id = e.id
+        WHERE (e.name LIKE ? ESCAPE '\\'
+           OR e.entity_type LIKE ? ESCAPE '\\'
+           OR o.content LIKE ? ESCAPE '\\')
+          AND (e.project = ? OR e.project IS NULL)
+      `).all(pattern, pattern, pattern, normalizedProject) as { name: string; entityType: string; project: string | null }[];
+    } else {
+      // No project filter -- search across all entities
+      entityRows = this.db.prepare(`
+        SELECT DISTINCT e.name, e.entity_type AS entityType, e.project
+        FROM entities e
+        LEFT JOIN observations o ON o.entity_id = e.id
+        WHERE e.name LIKE ? ESCAPE '\\'
+           OR e.entity_type LIKE ? ESCAPE '\\'
+           OR o.content LIKE ? ESCAPE '\\'
+      `).all(pattern, pattern, pattern) as { name: string; entityType: string; project: string | null }[];
+    }
 
     const entities = this.buildEntities(entityRows);
-    const relations = this.getConnectedRelations(entityRows.map(e => e.name));
+    // When project-filtered, use AND logic for relations (both endpoints in result set);
+    // when unfiltered, use OR logic (at least one endpoint matches) for backward compat
+    const entityNames = new Set(entityRows.map(e => e.name));
+    if (projectId) {
+      const allRelations = this.getConnectedRelations(entityRows.map(e => e.name));
+      const filteredRelations = allRelations.filter(r =>
+        entityNames.has(r.from) && entityNames.has(r.to)
+      );
+      return { entities, relations: filteredRelations };
+    }
 
+    const relations = this.getConnectedRelations(entityRows.map(e => e.name));
     return { entities, relations };
   }
 
   /**
    * Retrieves specific entities by exact name match. Returns matching entities
-   * plus relations where at least one endpoint is in the requested set.
+   * plus relations where both endpoints are in the result set.
    * Non-existent names are silently skipped.
+   * When projectId is provided, only returns entities in the project or global.
    *
    * @param names - Array of entity name strings to retrieve
+   * @param projectId - Optional project name; only returns entities in this project or global
    * @returns Matching entities with observations + connected relations
    */
-  async openNodes(names: string[]): Promise<KnowledgeGraph> {
+  async openNodes(names: string[], projectId?: string): Promise<KnowledgeGraph> {
     if (names.length === 0) return { entities: [], relations: [] };
 
-    const placeholders = names.map(() => '?').join(',');
-    const entityRows = this.db.prepare(
-      `SELECT name, entity_type AS entityType FROM entities WHERE name IN (${placeholders})`
-    ).all(...names) as { name: string; entityType: string }[];
+    let entityRows: { name: string; entityType: string; project: string | null }[];
+
+    if (projectId) {
+      const normalizedProject = projectId.trim().toLowerCase();
+      const placeholders = names.map(() => '?').join(',');
+      entityRows = this.db.prepare(
+        `SELECT name, entity_type AS entityType, project FROM entities WHERE name IN (${placeholders}) AND (project = ? OR project IS NULL)`
+      ).all(...names, normalizedProject) as { name: string; entityType: string; project: string | null }[];
+    } else {
+      const placeholders = names.map(() => '?').join(',');
+      entityRows = this.db.prepare(
+        `SELECT name, entity_type AS entityType, project FROM entities WHERE name IN (${placeholders})`
+      ).all(...names) as { name: string; entityType: string; project: string | null }[];
+    }
 
     const entities = this.buildEntities(entityRows);
-    const relations = this.getConnectedRelations(entityRows.map(e => e.name));
 
+    // When project-filtered, use AND logic for relations (both endpoints in result set);
+    // when unfiltered, use OR logic (at least one endpoint matches) for backward compat
+    if (projectId) {
+      const entityNames = new Set(entityRows.map(e => e.name));
+      const allRelations = this.getConnectedRelations(entityRows.map(e => e.name));
+      const filteredRelations = allRelations.filter(r =>
+        entityNames.has(r.from) && entityNames.has(r.to)
+      );
+      return { entities, relations: filteredRelations };
+    }
+
+    const relations = this.getConnectedRelations(entityRows.map(e => e.name));
     return { entities, relations };
+  }
+
+  /**
+   * Lists all distinct project names that have at least one entity.
+   * Global entities (project IS NULL) are excluded from the list.
+   *
+   * @returns Sorted array of project name strings
+   */
+  async listProjects(): Promise<string[]> {
+    const rows = this.db.prepare(
+      'SELECT DISTINCT project FROM entities WHERE project IS NOT NULL ORDER BY project'
+    ).all() as { project: string }[];
+    return rows.map(r => r.project);
   }
 }

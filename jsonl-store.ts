@@ -15,6 +15,8 @@ import {
   type AddObservationInput,
   type DeleteObservationInput,
   type AddObservationResult,
+  type SkippedEntity,
+  type CreateEntitiesResult,
 } from './types.js';
 
 /**
@@ -128,7 +130,8 @@ export class JsonlStore implements GraphStore {
             graph.entities.push({
               name: item.name,
               entityType: item.entityType,
-              observations: (item.observations || []).map(normalizeObservation)
+              observations: (item.observations || []).map(normalizeObservation),
+              project: typeof item.project === 'string' ? item.project : null,
             });
           } else if (item.type === "relation") {
             // Validate required fields exist and are strings before pushing
@@ -164,7 +167,8 @@ export class JsonlStore implements GraphStore {
   private async saveGraph(graph: KnowledgeGraph): Promise<void> {
     const lines = [
       ...graph.entities.map(e => JSON.stringify({
-        type: "entity", name: e.name, entityType: e.entityType, observations: e.observations
+        type: "entity", name: e.name, entityType: e.entityType,
+        observations: e.observations, project: e.project
       })),
       ...graph.relations.map(r => JSON.stringify({
         type: "relation", from: r.from, to: r.to, relationType: r.relationType
@@ -181,12 +185,21 @@ export class JsonlStore implements GraphStore {
   }
 
   /**
-   * Creates new entities. Skips name-duplicates (both existing and within-batch).
+   * Creates new entities, optionally scoped to a project.
+   * Skips name-duplicates (both existing and within-batch) and reports which
+   * entities were skipped along with the project that owns the existing entity.
    * Observations can be strings (auto-timestamped) or Observation objects.
    * Duplicate observations within a single entity are deduplicated by content.
+   *
+   * @param entities - Array of EntityInput to create
+   * @param projectId - Optional project name; normalized to lowercase/trimmed. Omit for global.
+   * @returns CreateEntitiesResult with created entities and skipped duplicates
    */
-  async createEntities(entities: EntityInput[]): Promise<Entity[]> {
+  async createEntities(entities: EntityInput[], projectId?: string): Promise<CreateEntitiesResult> {
     const graph = await this.loadGraph();
+    // Normalize the project ID: trim whitespace, lowercase, or null for global
+    const normalizedProject = projectId?.trim().toLowerCase() || null;
+
     const normalized: Entity[] = entities.map(e => ({
       name: e.name,
       entityType: e.entityType,
@@ -196,18 +209,25 @@ export class JsonlStore implements GraphStore {
           return [o.content, o] as const;
         })
       ).values()],
+      project: normalizedProject,
     }));
-    const existingNames = new Set(graph.entities.map(e => e.name));
-    const newEntities: Entity[] = [];
+
+    // Map of entity name → owning project, used for both dedup and skip reporting
+    const existingEntityMap = new Map(graph.entities.map(e => [e.name, e.project]));
+    const created: Entity[] = [];
+    const skipped: SkippedEntity[] = [];
+
     for (const e of normalized) {
-      if (!existingNames.has(e.name)) {
-        existingNames.add(e.name);
-        newEntities.push(e);
+      if (existingEntityMap.has(e.name)) {
+        skipped.push({ name: e.name, existingProject: existingEntityMap.get(e.name)! });
+      } else {
+        existingEntityMap.set(e.name, e.project);
+        created.push(e);
       }
     }
-    graph.entities.push(...newEntities);
+    graph.entities.push(...created);
     await this.saveGraph(graph);
-    return newEntities;
+    return { created, skipped };
   }
 
   /**
@@ -295,43 +315,120 @@ export class JsonlStore implements GraphStore {
     await this.saveGraph(graph);
   }
 
-  /** Returns the entire knowledge graph. */
-  async readGraph(): Promise<KnowledgeGraph> {
-    return this.loadGraph();
+  /**
+   * Returns the knowledge graph, optionally filtered by project.
+   * When projectId is provided, returns entities belonging to that project
+   * plus global entities (project === null). Relations are included only
+   * when both endpoints are in the filtered entity set.
+   * When projectId is omitted, returns the entire unfiltered graph.
+   *
+   * @param projectId - Optional project name to filter by; normalized to lowercase/trimmed
+   * @returns KnowledgeGraph with entities and relations
+   */
+  async readGraph(projectId?: string): Promise<KnowledgeGraph> {
+    const graph = await this.loadGraph();
+    if (!projectId) return graph;
+
+    const normalizedProject = projectId.trim().toLowerCase();
+    const filteredEntities = graph.entities.filter(e =>
+      e.project === normalizedProject || e.project === null
+    );
+    const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
+    const filteredRelations = graph.relations.filter(r =>
+      filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to)
+    );
+    return { entities: filteredEntities, relations: filteredRelations };
   }
 
   /**
    * Searches for entities matching the query (case-insensitive substring match
-   * against name, entityType, or observation content). Returns matching entities
-   * plus relations where at least one endpoint is in the matched set.
+   * against name, entityType, or observation content). Optionally filters by project
+   * (matching entities must belong to the project or be global).
+   * Returns matching entities plus relations where both endpoints are in the result set.
+   *
+   * @param query - Case-insensitive substring to search for
+   * @param projectId - Optional project name; only returns entities in this project or global
+   * @returns KnowledgeGraph with matching entities and connected relations
    */
-  async searchNodes(query: string): Promise<KnowledgeGraph> {
+  async searchNodes(query: string, projectId?: string): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
     const lowerQuery = query.toLowerCase();
-    const filteredEntities = graph.entities.filter(e =>
+    const normalizedProject = projectId?.trim().toLowerCase();
+
+    // First filter: match by name, type, or observation content
+    let filteredEntities = graph.entities.filter(e =>
       e.name.toLowerCase().includes(lowerQuery) ||
       e.entityType.toLowerCase().includes(lowerQuery) ||
       e.observations.some(o => o.content.toLowerCase().includes(lowerQuery))
     );
+
+    // Second filter: restrict to project + globals if a projectId was given
+    if (normalizedProject) {
+      filteredEntities = filteredEntities.filter(e =>
+        e.project === normalizedProject || e.project === null
+      );
+    }
+
     const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
+    // When project-filtered, use AND logic (both endpoints must be in the result set)
+    // to avoid leaking cross-project relations. Without a project filter, use OR
+    // logic (at least one endpoint matches) for backward compatibility.
     const filteredRelations = graph.relations.filter(r =>
-      filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to)
+      normalizedProject
+        ? filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to)
+        : filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to)
     );
     return { entities: filteredEntities, relations: filteredRelations };
   }
 
   /**
-   * Retrieves specific entities by exact name match. Includes relations where
-   * at least one endpoint is in the requested set.
+   * Retrieves specific entities by exact name match. Optionally filters by project
+   * (only returns entities in the specified project or global).
+   * Returns matching entities plus relations where both endpoints are in the result set.
+   *
+   * @param names - Array of entity name strings to retrieve
+   * @param projectId - Optional project name; only returns entities in this project or global
+   * @returns KnowledgeGraph with matching entities and connected relations
    */
-  async openNodes(names: string[]): Promise<KnowledgeGraph> {
+  async openNodes(names: string[], projectId?: string): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
     const nameSet = new Set(names);
-    const filteredEntities = graph.entities.filter(e => nameSet.has(e.name));
+    const normalizedProject = projectId?.trim().toLowerCase();
+
+    // First filter: match by name
+    let filteredEntities = graph.entities.filter(e => nameSet.has(e.name));
+
+    // Second filter: restrict to project + globals if a projectId was given
+    if (normalizedProject) {
+      filteredEntities = filteredEntities.filter(e =>
+        e.project === normalizedProject || e.project === null
+      );
+    }
+
     const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
+    // When project-filtered, use AND logic (both endpoints must be in the result set)
+    // to avoid leaking cross-project relations. Without a project filter, use OR
+    // logic (at least one endpoint matches) for backward compatibility.
     const filteredRelations = graph.relations.filter(r =>
-      filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to)
+      normalizedProject
+        ? filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to)
+        : filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to)
     );
     return { entities: filteredEntities, relations: filteredRelations };
+  }
+
+  /**
+   * Lists all distinct project names that have at least one entity.
+   * Global entities (project === null) are excluded from the list.
+   *
+   * @returns Sorted array of project name strings
+   */
+  async listProjects(): Promise<string[]> {
+    const graph = await this.loadGraph();
+    const projects = new Set<string>();
+    for (const e of graph.entities) {
+      if (e.project !== null) projects.add(e.project);
+    }
+    return [...projects].sort();
   }
 }

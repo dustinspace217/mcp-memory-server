@@ -11,11 +11,13 @@ export interface Observation {
   createdAt: string;
 }
 
-/** A named node in the knowledge graph with a type and attached observations. */
+/** A named node in the knowledge graph with a type and attached observations.
+ *  project scopes the entity to a specific project (null = global, never undefined). */
 export interface Entity {
   name: string;
   entityType: string;
   observations: Observation[];
+  project: string | null;  // null = global, never undefined
 }
 
 /** A directed edge between two entities with a relation type. */
@@ -61,6 +63,20 @@ export type AddObservationResult = {
   addedObservations: Observation[];
 };
 
+/** An entity that was skipped during createEntities because its name
+ *  already exists (possibly in a different project). */
+export type SkippedEntity = {
+  name: string;
+  existingProject: string | null;
+};
+
+/** Return type for createEntities. Reports both created entities and
+ *  skipped duplicates with their owning project for collision feedback. */
+export type CreateEntitiesResult = {
+  created: Entity[];
+  skipped: SkippedEntity[];
+};
+
 /**
  * The GraphStore interface -- the contract both JsonlStore and SqliteStore implement.
  * Methods mirror the MCP tool operations. Return types use Readonly to prevent
@@ -73,15 +89,16 @@ export interface GraphStore {
   /** Cleanup: close DB connection. No-op for JSONL. */
   close(): Promise<void>;
 
-  createEntities(entities: EntityInput[]): Promise<Readonly<Entity[]>>;
+  createEntities(entities: EntityInput[], projectId?: string): Promise<Readonly<CreateEntitiesResult>>;
   createRelations(relations: Relation[]): Promise<Readonly<Relation[]>>;
   addObservations(observations: AddObservationInput[]): Promise<Readonly<AddObservationResult[]>>;
   deleteEntities(entityNames: string[]): Promise<void>;
   deleteObservations(deletions: DeleteObservationInput[]): Promise<void>;
   deleteRelations(relations: Relation[]): Promise<void>;
-  readGraph(): Promise<Readonly<KnowledgeGraph>>;
-  searchNodes(query: string): Promise<Readonly<KnowledgeGraph>>;
-  openNodes(names: string[]): Promise<Readonly<KnowledgeGraph>>;
+  readGraph(projectId?: string): Promise<Readonly<KnowledgeGraph>>;
+  searchNodes(query: string, projectId?: string): Promise<Readonly<KnowledgeGraph>>;
+  openNodes(names: string[], projectId?: string): Promise<Readonly<KnowledgeGraph>>;
+  listProjects(): Promise<string[]>;
 }
 
 /**
