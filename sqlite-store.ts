@@ -174,17 +174,28 @@ export class SqliteStore implements GraphStore {
           // INSERT OR IGNORE handles duplicate relations; the try/catch handles FK violations
           // (relation referencing an entity name that doesn't exist in this DB)
           insertRel.run(rel.from, rel.to, rel.relationType);
-        } catch {
+        } catch (err: unknown) {
           // FK violation -- one or both endpoint entities don't exist. Skip silently.
+          // Re-throw unexpected errors to trigger transaction rollback.
+          if (err instanceof Error && err.message.includes('FOREIGN KEY')) {
+            // Dangling relation from JSONL -- skip
+          } else {
+            throw err;
+          }
         }
       }
     });
     txn();
   }
 
-  /** Closes the database connection. Call when done to release the file lock. */
+  /**
+   * Closes the database connection. Call when done to release the file lock.
+   * Guarded against double-close and uninitialized state (safe to call before init()).
+   */
   async close(): Promise<void> {
-    this.db.close();
+    if (this.db) {
+      this.db.close();
+    }
   }
 
   /**

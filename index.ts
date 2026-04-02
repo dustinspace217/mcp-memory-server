@@ -244,3 +244,14 @@ main().catch((error) => {
   console.error("Fatal error in main():", error);
   process.exit(1);
 });
+
+// Graceful shutdown: close the store to release SQLite file locks and flush WAL.
+// Without this, -wal and -shm sidecar files may linger on disk after unclean exit.
+process.on('SIGINT', async () => {
+  if (store) await store.close();
+  process.exit(0);
+});
+process.on('SIGTERM', async () => {
+  if (store) await store.close();
+  process.exit(0);
+});
