@@ -42,6 +42,39 @@ export interface KnowledgeGraph {
   relations: Relation[];
 }
 
+/** Pagination parameters for readGraph and searchNodes.
+ *  cursor is an opaque base64-encoded string from a previous PaginatedKnowledgeGraph response.
+ *  limit controls page size (1-100, default 40 in the implementation). */
+export interface PaginationParams {
+  cursor?: string;   // Opaque base64-encoded cursor from a previous response
+  limit?: number;    // 1-100, default 40
+}
+
+/**
+ * Paginated knowledge graph result.
+ * Extends KnowledgeGraph with cursor metadata for fetching subsequent pages.
+ * Code that only needs { entities, relations } continues to work unchanged
+ * because this is a superset of KnowledgeGraph.
+ */
+export interface PaginatedKnowledgeGraph extends KnowledgeGraph {
+  nextCursor: string | null;  // null = no more pages
+  totalCount: number;         // Total matching entities (may vary between pages if data mutates)
+}
+
+/**
+ * Thrown when an opaque cursor string cannot be decoded or is structurally invalid.
+ * Also thrown when a cursor from one query context is used with a different query.
+ * This is a class (not an interface) so it can be thrown and caught with instanceof.
+ */
+export class InvalidCursorError extends Error {
+  // message is the human-readable reason the cursor was rejected
+  constructor(message: string) {
+    super(message);
+    // Explicitly set the name so stack traces show "InvalidCursorError" instead of "Error"
+    this.name = 'InvalidCursorError';
+  }
+}
+
 // --- Named input/output types for GraphStore methods ---
 
 /** Input type for createEntities. Observations can be plain strings (auto-timestamped)
@@ -104,8 +137,8 @@ export interface GraphStore {
   deleteEntities(entityNames: string[]): Promise<void>;
   deleteObservations(deletions: DeleteObservationInput[]): Promise<void>;
   deleteRelations(relations: Relation[]): Promise<void>;
-  readGraph(projectId?: string): Promise<Readonly<KnowledgeGraph>>;
-  searchNodes(query: string, projectId?: string): Promise<Readonly<KnowledgeGraph>>;
+  readGraph(projectId?: string, pagination?: PaginationParams): Promise<Readonly<PaginatedKnowledgeGraph>>;
+  searchNodes(query: string, projectId?: string, pagination?: PaginationParams): Promise<Readonly<PaginatedKnowledgeGraph>>;
   openNodes(names: string[], projectId?: string): Promise<Readonly<KnowledgeGraph>>;
   listProjects(): Promise<string[]>;
 }
