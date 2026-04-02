@@ -36,9 +36,9 @@ The server is split across 4 source files:
 - Deduplication is enforced at the database level via `UNIQUE` constraints on entity names, relation triples, and (entity + observation content) pairs — `INSERT OR IGNORE` silently skips duplicate inserts
 - Relations must reference existing entity names (FK constraints), so adding a relation with a missing endpoint throws rather than silently creating a dangling edge
 
-### `index.ts` (~240 lines)
+### `index.ts` (~300 lines)
 - Entry point: registers all MCP tools via `server.registerTool()`
-- `resolveStorePath()` / `StoreConfig`: resolves the storage path from `MEMORY_FILE_PATH` and returns which store class to use
+- `StoreConfig` type and `ensureMemoryFilePath()`: resolves the storage path from `MEMORY_FILE_PATH` env var and returns which store class to use
   - `.jsonl` extension → `JsonlStore`
   - `.db` or `.sqlite` extension → `SqliteStore`
   - No extension / omitted → defaults to `memory.db` (SQLite)

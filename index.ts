@@ -2,18 +2,73 @@
 
 // index.ts -- MCP server entry point. Registers tools, wires store, starts transport.
 // All data types live in types.ts; store implementations in jsonl-store.ts / sqlite-store.ts.
+// Store selection (StoreConfig, ensureMemoryFilePath) lives here because it's an
+// entry-point concern -- deciding which backend to instantiate based on file extension.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import path from 'path';
+import { fileURLToPath } from 'url';
 import type { GraphStore } from './types.js';
-import { ensureMemoryFilePath, JsonlStore } from './jsonl-store.js';
+import { JsonlStore, migrateJsonToJsonl } from './jsonl-store.js';
 import { SqliteStore } from './sqlite-store.js';
+
+// --- Store configuration ---
+// Determines which backend to use and where to store data.
+
+/** Configuration returned by ensureMemoryFilePath() -- determines which store to use. */
+export type StoreConfig = { path: string; storeType: 'jsonl' | 'sqlite' };
+
+// Default memory file path, used when MEMORY_FILE_PATH env var is not set.
+// Points to memory.db alongside the compiled script in dist/.
+export const defaultMemoryPath = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  'memory.db'
+);
+
+/**
+ * Resolves the memory storage configuration from the MEMORY_FILE_PATH env var.
+ * Determines the store type from the file extension and handles legacy migrations.
+ *
+ * Selection logic:
+ * - .jsonl extension -> JSONL store (with .json->.jsonl migration)
+ * - .db or .sqlite extension -> SQLite store
+ * - Other extension -> throws with helpful message
+ * - No env var -> defaults to memory.db (SQLite)
+ *
+ * @returns StoreConfig with the resolved path and store type
+ * @throws Error if MEMORY_FILE_PATH has an unrecognized extension
+ */
+export async function ensureMemoryFilePath(): Promise<StoreConfig> {
+  const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+
+  if (process.env.MEMORY_FILE_PATH) {
+    const envPath = path.isAbsolute(process.env.MEMORY_FILE_PATH)
+      ? process.env.MEMORY_FILE_PATH
+      : path.join(scriptDir, process.env.MEMORY_FILE_PATH);
+
+    if (envPath.endsWith('.jsonl')) {
+      // Handle legacy .json -> .jsonl migration for JSONL users
+      await migrateJsonToJsonl(scriptDir, envPath);
+      return { path: envPath, storeType: 'jsonl' };
+    }
+    if (envPath.endsWith('.db') || envPath.endsWith('.sqlite')) {
+      return { path: envPath, storeType: 'sqlite' };
+    }
+    throw new Error(
+      `Unsupported file extension for MEMORY_FILE_PATH: "${process.env.MEMORY_FILE_PATH}". ` +
+      `Use .jsonl for JSONL storage or .db/.sqlite for SQLite storage.`
+    );
+  }
+
+  // No env var -- default to SQLite
+  return { path: defaultMemoryPath, storeType: 'sqlite' };
+}
 
 // Re-export types that tests and external consumers may need
 export { type Observation, type Entity, type Relation, type KnowledgeGraph } from './types.js';
-export { JsonlStore, ensureMemoryFilePath, defaultMemoryPath, normalizeObservation } from './jsonl-store.js';
-export { type StoreConfig } from './jsonl-store.js';
+export { JsonlStore, normalizeObservation } from './jsonl-store.js';
 export { SqliteStore } from './sqlite-store.js';
 
 // Module-level store reference -- initialized in main(), used by all tool handlers
