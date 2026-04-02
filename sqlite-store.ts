@@ -267,15 +267,129 @@ export class SqliteStore implements GraphStore {
     txn();
   }
 
+  /**
+   * Fetches full Entity objects for a set of entity rows, including their observations.
+   * Groups observation rows by entity name and assembles complete Entity objects.
+   * Uses a single query to fetch all observations (avoids N+1 queries).
+   *
+   * @param entityRows - Array of { name, entityType } from an entities query
+   * @returns Entity array with observations attached
+   */
+  private buildEntities(entityRows: { name: string; entityType: string }[]): Entity[] {
+    if (entityRows.length === 0) return [];
+
+    // Build placeholder string for SQL IN clause (one '?' per entity)
+    const names = entityRows.map(e => e.name);
+    const placeholders = names.map(() => '?').join(',');
+
+    // Fetch all observations for these entities in one query
+    const obsRows = this.db.prepare(`
+      SELECT e.name AS entityName, o.content, o.created_at AS createdAt
+      FROM observations o
+      JOIN entities e ON o.entity_id = e.id
+      WHERE e.name IN (${placeholders})
+    `).all(...names) as { entityName: string; content: string; createdAt: string }[];
+
+    // Group observations by entity name using a Map
+    const obsMap = new Map<string, Observation[]>();
+    for (const o of obsRows) {
+      if (!obsMap.has(o.entityName)) obsMap.set(o.entityName, []);
+      obsMap.get(o.entityName)!.push({ content: o.content, createdAt: o.createdAt });
+    }
+
+    return entityRows.map(e => ({
+      name: e.name,
+      entityType: e.entityType,
+      observations: obsMap.get(e.name) || [],
+    }));
+  }
+
+  /**
+   * Fetches all relations where at least one endpoint is in the given name set.
+   *
+   * @param entityNames - Array of entity name strings
+   * @returns Relation array with from/to/relationType fields
+   */
+  private getConnectedRelations(entityNames: string[]): Relation[] {
+    if (entityNames.length === 0) return [];
+
+    const placeholders = entityNames.map(() => '?').join(',');
+    return this.db.prepare(`
+      SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType
+      FROM relations
+      WHERE from_entity IN (${placeholders}) OR to_entity IN (${placeholders})
+    `).all(...entityNames, ...entityNames) as Relation[];
+  }
+
+  /**
+   * Returns the entire knowledge graph (all entities with observations, all relations).
+   * For an empty database, returns { entities: [], relations: [] }.
+   */
   async readGraph(): Promise<KnowledgeGraph> {
-    throw new Error('SqliteStore.readGraph not implemented');
+    const entityRows = this.db.prepare(
+      'SELECT name, entity_type AS entityType FROM entities'
+    ).all() as { name: string; entityType: string }[];
+
+    const entities = this.buildEntities(entityRows);
+
+    const relations = this.db.prepare(
+      'SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType FROM relations'
+    ).all() as Relation[];
+
+    return { entities, relations };
   }
 
-  async searchNodes(_query: string): Promise<KnowledgeGraph> {
-    throw new Error('SqliteStore.searchNodes not implemented');
+  /**
+   * Searches entities by case-insensitive substring match against name, entityType,
+   * or observation content. Uses LIKE with escaped wildcards.
+   *
+   * SQLite's LIKE is case-insensitive for ASCII characters (A-Z) by default.
+   * For full Unicode case folding, FTS5 with ICU would be needed.
+   *
+   * @param query - The search string, matched as a case-insensitive substring
+   * @returns Matching entities + relations where at least one endpoint matches
+   */
+  async searchNodes(query: string): Promise<KnowledgeGraph> {
+    const escaped = escapeLike(query);
+    const pattern = `%${escaped}%`;
+
+    // Find entities matching the query in name, type, or any observation content.
+    // LEFT JOIN ensures entities with no observations are still checked.
+    // DISTINCT prevents duplicates when multiple observations match.
+    const entityRows = this.db.prepare(`
+      SELECT DISTINCT e.name, e.entity_type AS entityType
+      FROM entities e
+      LEFT JOIN observations o ON o.entity_id = e.id
+      WHERE e.name LIKE ? ESCAPE '\\'
+         OR e.entity_type LIKE ? ESCAPE '\\'
+         OR o.content LIKE ? ESCAPE '\\'
+    `).all(pattern, pattern, pattern) as { name: string; entityType: string }[];
+
+    const entities = this.buildEntities(entityRows);
+    const relations = this.getConnectedRelations(entityRows.map(e => e.name));
+
+    return { entities, relations };
   }
 
-  async openNodes(_names: string[]): Promise<KnowledgeGraph> {
-    throw new Error('SqliteStore.openNodes not implemented');
+  /**
+   * Retrieves specific entities by exact name match. Returns matching entities
+   * plus relations where at least one endpoint is in the requested set.
+   * Non-existent names are silently skipped.
+   *
+   * @param names - Array of entity name strings to retrieve
+   * @returns Matching entities with observations + connected relations
+   */
+  async openNodes(names: string[]): Promise<KnowledgeGraph> {
+    if (names.length === 0) return { entities: [], relations: [] };
+
+    const placeholders = names.map(() => '?').join(',');
+    const entityRows = this.db.prepare(
+      `SELECT name, entity_type AS entityType FROM entities WHERE name IN (${placeholders})`
+    ).all(...names) as { name: string; entityType: string }[];
+
+    const entities = this.buildEntities(entityRows);
+    const relations = this.getConnectedRelations(entityRows.map(e => e.name));
+
+    return { entities, relations };
   }
 }
