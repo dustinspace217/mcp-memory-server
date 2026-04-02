@@ -246,7 +246,7 @@ server.registerTool(
   {
     title: "Search Nodes",
     description: "Search for nodes in the knowledge graph based on a query",
-    inputSchema: { query: z.string().min(1).describe("The search query to match against entity names, types, and observation content") },
+    inputSchema: { query: z.string().min(1).max(5000).describe("The search query to match against entity names, types, and observation content") },
     outputSchema: { entities: z.array(EntityOutputSchema), relations: z.array(RelationSchema) }
   },
   async ({ query }) => {
@@ -302,11 +302,21 @@ main().catch((error) => {
 
 // Graceful shutdown: close the store to release SQLite file locks and flush WAL.
 // Without this, -wal and -shm sidecar files may linger on disk after unclean exit.
+// Wrapped in try/catch so process.exit() always runs even if close() throws
+// (e.g., double-close, database corruption, or mid-transaction signal).
 process.on('SIGINT', async () => {
-  if (store) await store.close();
+  try {
+    if (store) await store.close();
+  } catch (err) {
+    console.error('Error closing store during SIGINT shutdown:', err);
+  }
   process.exit(0);
 });
 process.on('SIGTERM', async () => {
-  if (store) await store.close();
+  try {
+    if (store) await store.close();
+  } catch (err) {
+    console.error('Error closing store during SIGTERM shutdown:', err);
+  }
   process.exit(0);
 });

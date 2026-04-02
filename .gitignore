@@ -1,5 +1,10 @@
 node_modules/
 dist/
 *.jsonl
+*.jsonl.bak
 *.json.bak
 *.tmp
+*.db
+*.sqlite
+*-wal
+*-shm

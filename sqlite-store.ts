@@ -20,13 +20,24 @@ import { JsonlStore } from './jsonl-store.js';
 
 /**
  * Checks if a file exists at the given path.
- * Uses fs.access() which resolves if the file is reachable and rejects otherwise.
+ * Only treats ENOENT (file not found) as "doesn't exist."
+ * Permission errors (EACCES), I/O errors (EIO), etc. propagate so they
+ * aren't mistaken for "file doesn't exist."
  *
  * @param filePath - Absolute path to check
- * @returns true if the file is accessible, false otherwise
+ * @returns true if the file exists and is accessible
+ * @throws Error for non-ENOENT filesystem errors (EACCES, EIO, etc.)
  */
 async function fileExists(filePath: string): Promise<boolean> {
-  try { await fs.access(filePath); return true; } catch { return false; }
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch (err: unknown) {
+    if (err instanceof Error && 'code' in err && (err as any).code === 'ENOENT') {
+      return false;
+    }
+    throw err;
+  }
 }
 
 /**
@@ -39,6 +50,10 @@ async function fileExists(filePath: string): Promise<boolean> {
 function escapeLike(query: string): string {
   return query.replace(/[%_\\]/g, '\\$&');
 }
+
+// Max parameters per SQL IN clause. SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999.
+// We use 900 to leave headroom for other parameters in the same query.
+const CHUNK_SIZE = 900;
 
 /**
  * SQLite-backed knowledge graph store. Uses WAL mode for concurrent read performance
@@ -175,10 +190,11 @@ export class SqliteStore implements GraphStore {
           // (relation referencing an entity name that doesn't exist in this DB)
           insertRel.run(rel.from, rel.to, rel.relationType);
         } catch (err: unknown) {
-          // FK violation -- one or both endpoint entities don't exist. Skip silently.
+          // FK violation -- one or both endpoint entities don't exist.
+          // Log the details so the user knows what was dropped.
           // Re-throw unexpected errors to trigger transaction rollback.
           if (err instanceof Error && err.message.includes('FOREIGN KEY')) {
-            // Dangling relation from JSONL -- skip
+            console.error(`WARNING: Skipped dangling relation during migration: ${rel.from} -> ${rel.to} [${rel.relationType}] (entity not found)`);
           } else {
             throw err;
           }
@@ -191,10 +207,12 @@ export class SqliteStore implements GraphStore {
   /**
    * Closes the database connection. Call when done to release the file lock.
    * Guarded against double-close and uninitialized state (safe to call before init()).
+   * Sets this.db to null after closing so subsequent calls are no-ops.
    */
   async close(): Promise<void> {
     if (this.db) {
       this.db.close();
+      this.db = null!;
     }
   }
 
@@ -380,7 +398,8 @@ export class SqliteStore implements GraphStore {
   /**
    * Fetches full Entity objects for a set of entity rows, including their observations.
    * Groups observation rows by entity name and assembles complete Entity objects.
-   * Uses a single query to fetch all observations (avoids N+1 queries).
+   * Uses a single query per chunk to fetch all observations (avoids N+1 queries).
+   * Chunks the IN clause to stay within SQLite's SQLITE_MAX_VARIABLE_NUMBER limit (default 999).
    *
    * @param entityRows - Array of { name, entityType } from an entities query
    * @returns Entity array with observations attached
@@ -388,23 +407,26 @@ export class SqliteStore implements GraphStore {
   private buildEntities(entityRows: { name: string; entityType: string }[]): Entity[] {
     if (entityRows.length === 0) return [];
 
-    // Build placeholder string for SQL IN clause (one '?' per entity)
     const names = entityRows.map(e => e.name);
-    const placeholders = names.map(() => '?').join(',');
 
-    // Fetch all observations for these entities in one query
-    const obsRows = this.db.prepare(`
-      SELECT e.name AS entityName, o.content, o.created_at AS createdAt
-      FROM observations o
-      JOIN entities e ON o.entity_id = e.id
-      WHERE e.name IN (${placeholders})
-    `).all(...names) as { entityName: string; content: string; createdAt: string }[];
-
-    // Group observations by entity name using a Map
+    // Group observations by entity name using a Map, fetching in chunks
+    // to avoid exceeding SQLite's parameter limit (default 999)
     const obsMap = new Map<string, Observation[]>();
-    for (const o of obsRows) {
-      if (!obsMap.has(o.entityName)) obsMap.set(o.entityName, []);
-      obsMap.get(o.entityName)!.push({ content: o.content, createdAt: o.createdAt });
+    for (let i = 0; i < names.length; i += CHUNK_SIZE) {
+      const chunk = names.slice(i, i + CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+
+      const obsRows = this.db.prepare(`
+        SELECT e.name AS entityName, o.content, o.created_at AS createdAt
+        FROM observations o
+        JOIN entities e ON o.entity_id = e.id
+        WHERE e.name IN (${placeholders})
+      `).all(...chunk) as { entityName: string; content: string; createdAt: string }[];
+
+      for (const o of obsRows) {
+        if (!obsMap.has(o.entityName)) obsMap.set(o.entityName, []);
+        obsMap.get(o.entityName)!.push({ content: o.content, createdAt: o.createdAt });
+      }
     }
 
     return entityRows.map(e => ({
@@ -416,6 +438,8 @@ export class SqliteStore implements GraphStore {
 
   /**
    * Fetches all relations where at least one endpoint is in the given name set.
+   * Chunks the IN clause to stay within SQLite's parameter limit.
+   * Uses CHUNK_SIZE / 2 per chunk because each name appears twice (from OR to).
    *
    * @param entityNames - Array of entity name strings
    * @returns Relation array with from/to/relationType fields
@@ -423,12 +447,31 @@ export class SqliteStore implements GraphStore {
   private getConnectedRelations(entityNames: string[]): Relation[] {
     if (entityNames.length === 0) return [];
 
-    const placeholders = entityNames.map(() => '?').join(',');
-    return this.db.prepare(`
-      SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType
-      FROM relations
-      WHERE from_entity IN (${placeholders}) OR to_entity IN (${placeholders})
-    `).all(...entityNames, ...entityNames) as Relation[];
+    // Each name is bound twice (from_entity IN (...) OR to_entity IN (...)),
+    // so use half the chunk size to stay within the parameter limit
+    const halfChunk = Math.floor(CHUNK_SIZE / 2);
+    const results: Relation[] = [];
+
+    for (let i = 0; i < entityNames.length; i += halfChunk) {
+      const chunk = entityNames.slice(i, i + halfChunk);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db.prepare(`
+        SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType
+        FROM relations
+        WHERE from_entity IN (${placeholders}) OR to_entity IN (${placeholders})
+      `).all(...chunk, ...chunk) as Relation[];
+      results.push(...rows);
+    }
+
+    // Deduplicate: chunked queries may return the same relation if its endpoints
+    // span different chunks (e.g., from in chunk 1, to in chunk 2)
+    const seen = new Set<string>();
+    return results.filter(r => {
+      const key = JSON.stringify([r.from, r.to, r.relationType]);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
 
   /**

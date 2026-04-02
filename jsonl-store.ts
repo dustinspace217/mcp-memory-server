@@ -4,7 +4,6 @@
 
 import { promises as fs } from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import {
   createObservation,
   type Observation,
@@ -37,13 +36,23 @@ export async function migrateJsonToJsonl(scriptDir: string, jsonlPath: string): 
     try {
       await fs.access(jsonlPath);
       // Both exist -- use the new one, no migration
-    } catch {
+    } catch (innerErr: unknown) {
+      // Only migrate if the target truly doesn't exist (ENOENT).
+      // Permission errors or I/O failures should surface, not be silently swallowed.
+      if (innerErr instanceof Error && 'code' in innerErr && (innerErr as any).code !== 'ENOENT') {
+        console.error('WARNING: Could not check .jsonl target during migration:', innerErr);
+        return;
+      }
       console.error('DETECTED: Found legacy memory.json file, migrating to memory.jsonl for JSONL format compatibility');
       await fs.rename(oldJsonPath, jsonlPath);
       console.error('COMPLETED: Successfully migrated memory.json to memory.jsonl');
     }
-  } catch {
-    // Old file doesn't exist -- nothing to migrate
+  } catch (outerErr: unknown) {
+    // Only swallow ENOENT (old file doesn't exist -- nothing to migrate).
+    // Log any other error (EACCES, EIO, etc.) so the user knows migration was blocked.
+    if (outerErr instanceof Error && 'code' in outerErr && (outerErr as any).code !== 'ENOENT') {
+      console.error('WARNING: Could not check legacy .json file during migration:', outerErr);
+    }
   }
 }
 
@@ -100,23 +109,43 @@ export class JsonlStore implements GraphStore {
       const lines = data.split("\n").filter(line => line.trim() !== "");
       const graph: KnowledgeGraph = { entities: [], relations: [] };
       for (const line of lines) {
+        // Two-level error handling: parse errors (invalid JSON) are distinct from
+        // processing errors (valid JSON but invalid entity/observation data).
+        let item: any;
         try {
-          const item = JSON.parse(line);
+          item = JSON.parse(line);
+        } catch {
+          console.error(`Skipping malformed JSONL line (invalid JSON): ${line.substring(0, 100)}${line.length > 100 ? '...' : ''}`);
+          continue;
+        }
+        try {
           if (item.type === "entity") {
+            // Validate required fields exist and are strings before pushing
+            if (typeof item.name !== 'string' || typeof item.entityType !== 'string') {
+              console.error(`Skipping entity with missing/invalid fields: ${JSON.stringify(item).substring(0, 100)}`);
+              continue;
+            }
             graph.entities.push({
               name: item.name,
               entityType: item.entityType,
               observations: (item.observations || []).map(normalizeObservation)
             });
           } else if (item.type === "relation") {
+            // Validate required fields exist and are strings before pushing
+            if (typeof item.from !== 'string' || typeof item.to !== 'string' || typeof item.relationType !== 'string') {
+              console.error(`Skipping relation with missing/invalid fields: ${JSON.stringify(item).substring(0, 100)}`);
+              continue;
+            }
             graph.relations.push({
               from: item.from,
               to: item.to,
               relationType: item.relationType
             });
           }
-        } catch (parseError) {
-          console.error(`Skipping malformed JSONL line: ${line.substring(0, 100)}${line.length > 100 ? '...' : ''}`);
+        } catch (processError) {
+          // normalizeObservation or other processing error -- entity is valid JSON
+          // but has invalid data (e.g., observation is a number instead of string/object)
+          console.error(`Skipping entry with invalid data (${item.name || item.from || 'unknown'}): ${processError}`);
         }
       }
       return graph;
