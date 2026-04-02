@@ -1,6 +1,6 @@
 {
   "name": "mcp-memory-server",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "An MCP server that provides knowledge-graph-based persistent memory using entities, relations, and observations. Forked from @modelcontextprotocol/server-memory.",
   "license": "MIT",
   "author": "dustinspace217",
