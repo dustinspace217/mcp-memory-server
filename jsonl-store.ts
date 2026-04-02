@@ -6,6 +6,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import {
   createObservation,
+  ENTITY_TIMESTAMP_SENTINEL,
   type Observation,
   type Entity,
   type Relation,
@@ -139,6 +140,9 @@ export class JsonlStore implements GraphStore {
               entityType: item.entityType,
               observations: (item.observations || []).map(normalizeObservation),
               project: typeof item.project === 'string' ? item.project : null,
+              // Fall back to sentinel for legacy JSONL files that predate Phase 4 timestamps
+              updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : ENTITY_TIMESTAMP_SENTINEL,
+              createdAt: typeof item.createdAt === 'string' ? item.createdAt : ENTITY_TIMESTAMP_SENTINEL,
             });
           } else if (item.type === "relation") {
             // Validate required fields exist and are strings before pushing
@@ -175,7 +179,8 @@ export class JsonlStore implements GraphStore {
     const lines = [
       ...graph.entities.map(e => JSON.stringify({
         type: "entity", name: e.name, entityType: e.entityType,
-        observations: e.observations, project: e.project
+        observations: e.observations, project: e.project,
+        updatedAt: e.updatedAt, createdAt: e.createdAt
       })),
       ...graph.relations.map(r => JSON.stringify({
         type: "relation", from: r.from, to: r.to, relationType: r.relationType
@@ -207,6 +212,8 @@ export class JsonlStore implements GraphStore {
     // Normalize the project ID: trim whitespace, lowercase, or null for global
     const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC') || null;
 
+    // Capture a single timestamp for all entities created in this batch
+    const now = new Date().toISOString();
     const normalized: Entity[] = entities.map(e => ({
       name: e.name,
       entityType: e.entityType,
@@ -217,6 +224,8 @@ export class JsonlStore implements GraphStore {
         })
       ).values()],
       project: normalizedProject,
+      updatedAt: now,
+      createdAt: now,
     }));
 
     // Map of entity name → owning project, used for both dedup and skip reporting
@@ -277,6 +286,10 @@ export class JsonlStore implements GraphStore {
         }
       }
       entity.observations.push(...newObservations);
+      // Bump updatedAt — entity content has changed
+      if (newObservations.length > 0) {
+        entity.updatedAt = new Date().toISOString();
+      }
       return { entityName: o.entityName, addedObservations: newObservations };
     });
     await this.saveGraph(graph);
@@ -306,6 +319,8 @@ export class JsonlStore implements GraphStore {
       if (entity) {
         const toDelete = new Set(d.contents);
         entity.observations = entity.observations.filter(o => !toDelete.has(o.content));
+        // Bump updatedAt — entity content has changed
+        entity.updatedAt = new Date().toISOString();
       }
     });
     await this.saveGraph(graph);
