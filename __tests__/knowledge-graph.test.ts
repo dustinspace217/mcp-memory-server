@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import type { GraphStore, Relation } from '../types.js';
+import type { GraphStore, Relation, PaginatedKnowledgeGraph } from '../types.js';
+import { InvalidCursorError } from '../types.js';
 import { JsonlStore, normalizeObservation } from '../jsonl-store.js';
 import { SqliteStore } from '../sqlite-store.js';
 
@@ -951,6 +952,266 @@ describe.each<[string, string, StoreFactory]>([
 			// Timestamps should survive the round-trip through disk
 			expect(graph2.entities[0].updatedAt).toBe(originalUpdatedAt);
 			expect(graph2.entities[0].createdAt).toBe(originalCreatedAt);
+		});
+	});
+
+	// ----------------------------------------------------------
+	// pagination
+	// ----------------------------------------------------------
+	describe('pagination', () => {
+		/**
+		 * Helper: create N entities with staggered timestamps.
+		 * Each entity is created in a separate call with a small delay between them,
+		 * so updatedAt values are guaranteed to differ (needed for cursor-based ordering).
+		 *
+		 * @param store - The GraphStore to create entities in
+		 * @param count - How many entities to create (named Entity-000, Entity-001, ...)
+		 * @param projectId - Optional project scope for all created entities
+		 */
+		async function createStaggeredEntities(store: GraphStore, count: number, projectId?: string): Promise<void> {
+			for (let i = 0; i < count; i++) {
+				await store.createEntities(
+					[{ name: `Entity-${String(i).padStart(3, '0')}`, entityType: 'test', observations: [`obs for ${i}`] }],
+					projectId,
+				);
+				// Small delay so updatedAt values differ — 5ms is enough for unique millisecond timestamps
+				if (i < count - 1) {
+					await new Promise(r => setTimeout(r, 5));
+				}
+			}
+		}
+
+		// Verifies that when all entities fit in a single page, nextCursor is null
+		// and totalCount matches the entity count
+		it('should return all entities with nextCursor null when count <= limit', async () => {
+			await createStaggeredEntities(store, 3);
+
+			const result = await store.readGraph(undefined, { limit: 10 });
+			expect(result.entities).toHaveLength(3);
+			expect(result.nextCursor).toBeNull();
+			expect(result.totalCount).toBe(3);
+		});
+
+		// Verifies that readGraph paginates correctly with explicit limit=40
+		// (the default page size). Creates 45 entities so it spans two pages.
+		// Note: store.readGraph() without pagination returns ALL entities (backward compat),
+		// so we pass { limit: 40 } explicitly to activate pagination.
+		it('should paginate readGraph with explicit limit', async () => {
+			// Create more entities than the default page size (40)
+			await createStaggeredEntities(store, 45);
+
+			// Pass limit=40 explicitly — readGraph() without pagination returns everything
+			const page1 = await store.readGraph(undefined, { limit: 40 });
+			expect(page1.entities).toHaveLength(40);
+			expect(page1.nextCursor).not.toBeNull();
+			expect(page1.totalCount).toBe(45);
+
+			const page2 = await store.readGraph(undefined, { cursor: page1.nextCursor!, limit: 40 });
+			expect(page2.entities).toHaveLength(5);
+			expect(page2.nextCursor).toBeNull();
+			expect(page2.totalCount).toBe(45);
+		});
+
+		// Verifies that custom limit values work correctly across multiple pages
+		it('should paginate with custom limit', async () => {
+			await createStaggeredEntities(store, 10);
+
+			// Page through 10 entities, 3 at a time
+			const page1 = await store.readGraph(undefined, { limit: 3 });
+			expect(page1.entities).toHaveLength(3);
+			expect(page1.nextCursor).not.toBeNull();
+			expect(page1.totalCount).toBe(10);
+
+			const page2 = await store.readGraph(undefined, { cursor: page1.nextCursor!, limit: 3 });
+			expect(page2.entities).toHaveLength(3);
+			expect(page2.nextCursor).not.toBeNull();
+
+			const page3 = await store.readGraph(undefined, { cursor: page2.nextCursor!, limit: 3 });
+			expect(page3.entities).toHaveLength(3);
+			expect(page3.nextCursor).not.toBeNull();
+
+			// Last page: only 1 remaining entity
+			const page4 = await store.readGraph(undefined, { cursor: page3.nextCursor!, limit: 3 });
+			expect(page4.entities).toHaveLength(1);
+			expect(page4.nextCursor).toBeNull();
+		});
+
+		// Verifies that entities are sorted by most recently updated first (DESC order)
+		it('should return entities sorted by most recently updated first', async () => {
+			await createStaggeredEntities(store, 5);
+
+			const result = await store.readGraph(undefined, { limit: 5 });
+			// Most recently created entity should be first (Entity-004, created last)
+			expect(result.entities[0].name).toBe('Entity-004');
+			// Oldest entity should be last (Entity-000, created first)
+			expect(result.entities[4].name).toBe('Entity-000');
+		});
+
+		// Verifies that paginating through the entire dataset produces no duplicates.
+		// Each entity should appear on exactly one page.
+		it('should not return duplicate entities across pages', async () => {
+			await createStaggeredEntities(store, 10);
+
+			const allNames: string[] = [];
+			let cursor: string | undefined;
+
+			// Paginate through everything with limit=3
+			for (let page = 0; page < 10; page++) {
+				const result = await store.readGraph(undefined, { cursor, limit: 3 });
+				allNames.push(...result.entities.map(e => e.name));
+				if (!result.nextCursor) break;
+				cursor = result.nextCursor;
+			}
+
+			expect(allNames).toHaveLength(10);
+			// Set dedup: if any name appears twice, the Set would be smaller
+			expect(new Set(allNames).size).toBe(10);
+		});
+
+		// Verifies that searchNodes also supports pagination (same cursor mechanism)
+		it('should paginate searchNodes', async () => {
+			await createStaggeredEntities(store, 10);
+
+			const page1 = await store.searchNodes('Entity', undefined, { limit: 3 });
+			expect(page1.entities).toHaveLength(3);
+			expect(page1.nextCursor).not.toBeNull();
+			expect(page1.totalCount).toBe(10);
+
+			const page2 = await store.searchNodes('Entity', undefined, { cursor: page1.nextCursor!, limit: 3 });
+			expect(page2.entities).toHaveLength(3);
+			expect(page2.nextCursor).not.toBeNull();
+		});
+
+		// Verifies that pagination respects project filtering —
+		// proj-a entities + global entities should be included, but not proj-b entities
+		it('should respect project filter during pagination', async () => {
+			await createStaggeredEntities(store, 5, 'proj-a');
+			// Create 3 global entities with unique names (can't reuse Entity-00N — names are globally unique)
+			await store.createEntities([
+				{ name: 'Global-1', entityType: 'test', observations: ['g1'] },
+				{ name: 'Global-2', entityType: 'test', observations: ['g2'] },
+				{ name: 'Global-3', entityType: 'test', observations: ['g3'] },
+			]);
+
+			const result = await store.readGraph('proj-a', { limit: 100 });
+			// Should include proj-a entities + global entities
+			const projANames = result.entities.filter(e => e.project === 'proj-a').map(e => e.name);
+			const globalNames = result.entities.filter(e => e.project === null).map(e => e.name);
+			expect(projANames).toHaveLength(5);
+			expect(globalNames.length).toBeGreaterThanOrEqual(3);
+		});
+
+		// Verifies that a completely garbled cursor string throws InvalidCursorError
+		it('should throw InvalidCursorError for malformed cursor', async () => {
+			await expect(
+				store.readGraph(undefined, { cursor: 'not-valid-base64!!!' })
+			).rejects.toThrow(InvalidCursorError);
+		});
+
+		// Verifies that a cursor generated by readGraph cannot be used with searchNodes —
+		// the cursor encodes the query context, so cross-method usage is rejected
+		it('should throw InvalidCursorError for cursor from different query', async () => {
+			await createStaggeredEntities(store, 5);
+
+			const page1 = await store.readGraph(undefined, { limit: 2 });
+			expect(page1.nextCursor).not.toBeNull();
+
+			// Use readGraph cursor with searchNodes — should fail because query context differs
+			await expect(
+				store.searchNodes('Entity', undefined, { cursor: page1.nextCursor! })
+			).rejects.toThrow(InvalidCursorError);
+		});
+
+		// Verifies that a cursor from one project cannot be reused with a different project —
+		// the cursor encodes the projectId, so cross-project usage is rejected
+		it('should throw InvalidCursorError for cursor from different projectId', async () => {
+			await createStaggeredEntities(store, 5, 'proj-a');
+			await store.createEntities(
+				[{ name: 'B-Entity', entityType: 'test', observations: ['b'] }],
+				'proj-b',
+			);
+
+			const page1 = await store.readGraph('proj-a', { limit: 2 });
+			expect(page1.nextCursor).not.toBeNull();
+
+			// Use proj-a cursor with proj-b — should fail because projectId differs
+			await expect(
+				store.readGraph('proj-b', { cursor: page1.nextCursor! })
+			).rejects.toThrow(InvalidCursorError);
+		});
+
+		// Verifies that requesting a limit > 100 is clamped to the max (100)
+		it('should clamp limit to max 100', async () => {
+			await createStaggeredEntities(store, 5);
+
+			// Requesting limit=200 should be clamped to 100 (but we only have 5 entities,
+			// so the result will have 5 — the point is it doesn't throw)
+			const result = await store.readGraph(undefined, { limit: 200 });
+			expect(result.entities).toHaveLength(5);
+			expect(result.nextCursor).toBeNull();
+		});
+
+		// Verifies that only relations where BOTH endpoints are in the current page
+		// are included. Cross-page relations (one endpoint per page) are excluded.
+		it('should return only relations where both endpoints are in current page', async () => {
+			// Create 4 entities with relations spanning pages
+			await store.createEntities([
+				{ name: 'A', entityType: 'test', observations: ['a'] },
+			]);
+			await new Promise(r => setTimeout(r, 10));
+			await store.createEntities([
+				{ name: 'B', entityType: 'test', observations: ['b'] },
+			]);
+			await new Promise(r => setTimeout(r, 10));
+			await store.createEntities([
+				{ name: 'C', entityType: 'test', observations: ['c'] },
+			]);
+			await new Promise(r => setTimeout(r, 10));
+			await store.createEntities([
+				{ name: 'D', entityType: 'test', observations: ['d'] },
+			]);
+
+			await store.createRelations([
+				{ from: 'A', to: 'B', relationType: 'knows' },    // Both on page 2
+				{ from: 'C', to: 'D', relationType: 'knows' },    // Both on page 1
+				{ from: 'B', to: 'D', relationType: 'cross' },    // Spans pages
+			]);
+
+			// Page 1 (limit=2): D and C (most recent first)
+			const page1 = await store.readGraph(undefined, { limit: 2 });
+			expect(page1.entities.map(e => e.name)).toEqual(['D', 'C']);
+			// Only C->D relation should appear (both endpoints on this page)
+			expect(page1.relations).toHaveLength(1);
+			expect(page1.relations[0]).toEqual(expect.objectContaining({ from: 'C', to: 'D' }));
+
+			// Page 2 (limit=2): B and A (older entities)
+			const page2 = await store.readGraph(undefined, { cursor: page1.nextCursor!, limit: 2 });
+			expect(page2.entities.map(e => e.name)).toEqual(['B', 'A']);
+			// Only A->B relation should appear (both endpoints on this page)
+			expect(page2.relations).toHaveLength(1);
+			expect(page2.relations[0]).toEqual(expect.objectContaining({ from: 'A', to: 'B' }));
+			// B->D relation is NOT on either page (endpoints span pages)
+		});
+
+		// Verifies that pagination on an empty graph returns sensible defaults
+		it('should handle empty graph with pagination', async () => {
+			const result = await store.readGraph(undefined, { limit: 10 });
+			expect(result.entities).toHaveLength(0);
+			expect(result.relations).toHaveLength(0);
+			expect(result.nextCursor).toBeNull();
+			expect(result.totalCount).toBe(0);
+		});
+
+		// Verifies that totalCount reflects the FULL result set, not just the current page,
+		// and remains consistent across pages
+		it('should return totalCount reflecting full result set', async () => {
+			await createStaggeredEntities(store, 15);
+
+			const page1 = await store.readGraph(undefined, { limit: 5 });
+			expect(page1.totalCount).toBe(15);
+
+			const page2 = await store.readGraph(undefined, { cursor: page1.nextCursor!, limit: 5 });
+			expect(page2.totalCount).toBe(15);
 		});
 	});
 
