@@ -220,9 +220,6 @@ export class SqliteStore implements GraphStore {
    * @param graph - KnowledgeGraph loaded from the JSONL file by JsonlStore.readGraph()
    */
   private migrateFromJsonl(graph: KnowledgeGraph): void {
-    // Capture the current time once for the migration batch (used as fallback for missing timestamps)
-    const now = new Date().toISOString();
-
     // Prepared statements are compiled once and reused for every row in the transaction
     const insertEntity = this.db.prepare(
       'INSERT OR IGNORE INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, ?, ?, ?)'
