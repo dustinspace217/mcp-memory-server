@@ -29,7 +29,7 @@
 **Files:**
 - Modify: `types.ts`
 
-This task adds `updatedAt` and `createdAt` to the `Entity` interface, adds the `ENTITY_TIMESTAMP_SENTINEL` constant, and updates the `createObservation` function's neighbor — the new `createEntityTimestamp` helper. No pagination types yet — just the entity-level timestamp foundation.
+This task adds `updatedAt` and `createdAt` to the `Entity` interface and adds the `ENTITY_TIMESTAMP_SENTINEL` constant. No pagination types yet — just the entity-level timestamp foundation.
 
 - [ ] **Step 1: Add sentinel constant and update Entity interface**
 
@@ -684,6 +684,8 @@ git commit -m "feat(types): add PaginationParams, PaginatedKnowledgeGraph, Inval
 - Modify: `sqlite-store.ts`
 
 This is the core task — implementing keyset pagination in the SQLite backend. Adds cursor encode/decode utilities and updates `readGraph` and `searchNodes` to accept pagination params and return paginated results.
+
+**Important:** When `pagination` is `undefined` (direct API calls, not MCP tool calls), both `readGraph` and `searchNodes` must return ALL results with `nextCursor: null` and `totalCount` = full count, per the spec. Only apply limit/cursor logic when `pagination` is explicitly provided. This ensures backward compatibility for tests and migration code that call these methods directly.
 
 - [ ] **Step 1: Add imports and constants**
 
@@ -1348,9 +1350,7 @@ describe('pagination', () => {
 
   it('should respect project filter during pagination', async () => {
     await createStaggeredEntities(store, 5, 'proj-a');
-    await createStaggeredEntities(store, 3); // 3 global entities (different names due to sequential creation)
-
-    // Actually create unique names for global entities
+    // Create 3 global entities with unique names (can't reuse Entity-00N — names are globally unique)
     await store.createEntities([
       { name: 'Global-1', entityType: 'test', observations: ['g1'] },
       { name: 'Global-2', entityType: 'test', observations: ['g2'] },
