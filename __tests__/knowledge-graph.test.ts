@@ -630,6 +630,63 @@ describe.each<[string, string, StoreFactory]>([
 			);
 		});
 
+		it('should exclude cross-project relations from searchNodes with projectId', async () => {
+			// Create entities in two projects plus a global entity
+			await store.createEntities(
+				[{ name: 'SearchP1', entityType: 'test', observations: ['searchable'] }],
+				'proj-1'
+			);
+			await store.createEntities(
+				[{ name: 'SearchP2', entityType: 'test', observations: ['searchable'] }],
+				'proj-2'
+			);
+			await store.createEntities([
+				{ name: 'SearchGlobal', entityType: 'test', observations: ['searchable'] },
+			]);
+			await store.createRelations([
+				{ from: 'SearchP1', to: 'SearchGlobal', relationType: 'uses' },
+				{ from: 'SearchP1', to: 'SearchP2', relationType: 'cross_project' },
+			]);
+
+			// searchNodes with proj-1 should return P1 + Global (both match "searchable"),
+			// and only the P1->Global relation (AND logic: both endpoints in result set)
+			const result = await store.searchNodes('searchable', 'proj-1');
+			const names = result.entities.map(e => e.name).sort();
+			expect(names).toEqual(['SearchGlobal', 'SearchP1']);
+			expect(result.relations).toHaveLength(1);
+			expect(result.relations[0]).toEqual(
+				expect.objectContaining({ from: 'SearchP1', to: 'SearchGlobal', relationType: 'uses' })
+			);
+		});
+
+		it('should exclude cross-project relations from openNodes with projectId', async () => {
+			// Create entities in two projects plus a global entity
+			await store.createEntities(
+				[{ name: 'OpenP1', entityType: 'test', observations: ['o1'] }],
+				'proj-1'
+			);
+			await store.createEntities(
+				[{ name: 'OpenP2', entityType: 'test', observations: ['o2'] }],
+				'proj-2'
+			);
+			await store.createEntities([
+				{ name: 'OpenGlobal', entityType: 'test', observations: ['og'] },
+			]);
+			await store.createRelations([
+				{ from: 'OpenP1', to: 'OpenGlobal', relationType: 'uses' },
+				{ from: 'OpenP1', to: 'OpenP2', relationType: 'cross_project' },
+			]);
+
+			// openNodes with proj-1 scope: request all 3 by name, should only get P1 + Global
+			const result = await store.openNodes(['OpenP1', 'OpenP2', 'OpenGlobal'], 'proj-1');
+			const names = result.entities.map(e => e.name).sort();
+			expect(names).toEqual(['OpenGlobal', 'OpenP1']);
+			expect(result.relations).toHaveLength(1);
+			expect(result.relations[0]).toEqual(
+				expect.objectContaining({ from: 'OpenP1', to: 'OpenGlobal', relationType: 'uses' })
+			);
+		});
+
 		it('should list distinct project names sorted alphabetically', async () => {
 			await store.createEntities(
 				[{ name: 'A', entityType: 'test', observations: ['a'] }],

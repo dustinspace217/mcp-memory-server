@@ -104,7 +104,9 @@ const RelationSchema = z.object({
 });
 
 // Optional project scope for filtering tools. Omit to operate globally.
-const ProjectIdSchema = z.string().min(1).max(500)
+// .trim() strips whitespace BEFORE .min(1) checks length, so whitespace-only
+// inputs like " " or "\t" are rejected instead of silently becoming global scope.
+const ProjectIdSchema = z.string().trim().min(1).max(500)
   .describe("Project scope for filtering. Omit for global/unscoped.")
   .optional();
 
@@ -119,8 +121,11 @@ const ProjectIdSchema = z.string().min(1).max(500)
 function normalizeProjectId(projectId?: string): string | undefined {
   if (!projectId) return undefined;
   // trim() removes surrounding whitespace; toLowerCase() ensures
-  // "MyProject" and "myproject" map to the same scope
-  const normalized = projectId.trim().toLowerCase();
+  // "MyProject" and "myproject" map to the same scope;
+  // normalize('NFC') collapses Unicode equivalents (e.g., NFD "cafe\u0301"
+  // and NFC "caf\u00e9" both become "café") so macOS (NFD) and Linux (NFC)
+  // path-derived project names map to the same scope.
+  const normalized = projectId.trim().toLowerCase().normalize('NFC');
   return normalized || undefined;
 }
 

@@ -146,11 +146,13 @@ export class SqliteStore implements GraphStore {
       `);
     }
 
-    // Create the project index if it doesn't exist yet (idempotent).
-    // For new databases, the column is in CREATE TABLE but the index still needs creating.
-    // For migrated databases, the migration block above already created it,
-    // but IF NOT EXISTS makes this a safe no-op in that case.
+    // Create indexes if they don't exist yet (idempotent).
+    // idx_entities_project: speeds up project-filtered entity queries.
+    // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
+    // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
+    // in getConnectedRelations needs its own index to avoid full table scans.
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project);');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_relations_to_entity ON relations(to_entity);');
 
     // --- Run migration if data was loaded from JSONL ---
     if (migrationData) {
@@ -197,9 +199,15 @@ export class SqliteStore implements GraphStore {
     // db.transaction() wraps everything in BEGIN/COMMIT and auto-rolls-back on throw
     const txn = this.db.transaction(() => {
       for (const entity of graph.entities) {
-        // INSERT OR IGNORE: if name already exists (duplicate in JSONL), skip silently
-        // entity.project comes from the JSONL data (null for pre-Phase-3 data)
-        insertEntity.run(entity.name, entity.entityType, entity.project ?? null);
+        // INSERT OR IGNORE: if name already exists (duplicate in JSONL), skip silently.
+        // Normalize the project value (trim + lowercase) to match the normalization
+        // applied by createEntities. Without this, mixed-case project values from JSONL
+        // (e.g., "My-Project") would be stored verbatim and become invisible to
+        // project-filtered queries that normalize to lowercase ("my-project").
+        const migratedProject = typeof entity.project === 'string'
+          ? entity.project.trim().toLowerCase() || null
+          : null;
+        insertEntity.run(entity.name, entity.entityType, migratedProject);
         const row = getEntityId.get(entity.name) as { id: number };
         for (const obs of entity.observations) {
           // obs is already a normalized Observation object (JsonlStore.readGraph() calls normalizeObservation)
@@ -249,8 +257,8 @@ export class SqliteStore implements GraphStore {
    * @returns CreateEntitiesResult with created entities and skipped duplicates
    */
   async createEntities(entities: EntityInput[], projectId?: string): Promise<CreateEntitiesResult> {
-    // Normalize the project ID: trim whitespace, lowercase, or null for global
-    const normalizedProject = projectId?.trim().toLowerCase() || null;
+    // Normalize the project ID: trim whitespace, lowercase, NFC normalize, or null for global
+    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC') || null;
 
     // Prepared statements are compiled once and reused -- faster than db.exec() per row
     const insertEntity = this.db.prepare(
@@ -528,7 +536,7 @@ export class SqliteStore implements GraphStore {
     let entityRows: { name: string; entityType: string; project: string | null }[];
 
     if (projectId) {
-      const normalizedProject = projectId.trim().toLowerCase();
+      const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
       // Return entities matching the project OR global entities (project IS NULL)
       entityRows = this.db.prepare(
         'SELECT name, entity_type AS entityType, project FROM entities WHERE project = ? OR project IS NULL'
@@ -542,18 +550,18 @@ export class SqliteStore implements GraphStore {
     const entities = this.buildEntities(entityRows);
 
     if (projectId) {
-      // When filtering by project, only include relations where both endpoints
-      // are in the filtered entity set (avoids dangling cross-project edges)
+      // When filtering by project, use getConnectedRelations to fetch only
+      // relations touching our entity set (SQL-level filtering via idx_relations_to_entity),
+      // then AND-filter to keep only relations where both endpoints are in the set
       const entityNames = new Set(entityRows.map(e => e.name));
-      const allRelations = this.db.prepare(
-        'SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType FROM relations'
-      ).all() as Relation[];
-      const filteredRelations = allRelations.filter(r =>
+      const connectedRelations = this.getConnectedRelations(entityRows.map(e => e.name));
+      const filteredRelations = connectedRelations.filter(r =>
         entityNames.has(r.from) && entityNames.has(r.to)
       );
       return { entities, relations: filteredRelations };
     }
 
+    // Unscoped: return all relations (backward compatible)
     const relations = this.db.prepare(
       'SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType FROM relations'
     ).all() as Relation[];
@@ -581,7 +589,7 @@ export class SqliteStore implements GraphStore {
     let entityRows: { name: string; entityType: string; project: string | null }[];
 
     if (projectId) {
-      const normalizedProject = projectId.trim().toLowerCase();
+      const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
       // Find entities matching the query AND belonging to the project or global
       entityRows = this.db.prepare(`
         SELECT DISTINCT e.name, e.entity_type AS entityType, e.project
@@ -636,7 +644,7 @@ export class SqliteStore implements GraphStore {
     let entityRows: { name: string; entityType: string; project: string | null }[];
 
     if (projectId) {
-      const normalizedProject = projectId.trim().toLowerCase();
+      const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
       const placeholders = names.map(() => '?').join(',');
       entityRows = this.db.prepare(
         `SELECT name, entity_type AS entityType, project FROM entities WHERE name IN (${placeholders}) AND (project = ? OR project IS NULL)`

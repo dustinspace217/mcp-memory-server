@@ -127,6 +127,13 @@ export class JsonlStore implements GraphStore {
               console.error(`Skipping entity with missing/invalid fields: ${JSON.stringify(item).substring(0, 100)}`);
               continue;
             }
+            // Warn if project is present but not a string (e.g., "project": 42).
+            // Unlike invalid name/entityType which skip the entity entirely,
+            // a non-string project silently becomes null (global). Log so the
+            // user knows their project annotation was discarded.
+            if (item.project != null && typeof item.project !== 'string') {
+              console.error(`Warning: entity "${item.name}" has non-string project value (${typeof item.project}), treating as global`);
+            }
             graph.entities.push({
               name: item.name,
               entityType: item.entityType,
@@ -198,7 +205,7 @@ export class JsonlStore implements GraphStore {
   async createEntities(entities: EntityInput[], projectId?: string): Promise<CreateEntitiesResult> {
     const graph = await this.loadGraph();
     // Normalize the project ID: trim whitespace, lowercase, or null for global
-    const normalizedProject = projectId?.trim().toLowerCase() || null;
+    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC') || null;
 
     const normalized: Entity[] = entities.map(e => ({
       name: e.name,
@@ -329,7 +336,7 @@ export class JsonlStore implements GraphStore {
     const graph = await this.loadGraph();
     if (!projectId) return graph;
 
-    const normalizedProject = projectId.trim().toLowerCase();
+    const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
     const filteredEntities = graph.entities.filter(e =>
       e.project === normalizedProject || e.project === null
     );
@@ -353,7 +360,7 @@ export class JsonlStore implements GraphStore {
   async searchNodes(query: string, projectId?: string): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
     const lowerQuery = query.toLowerCase();
-    const normalizedProject = projectId?.trim().toLowerCase();
+    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
 
     // First filter: match by name, type, or observation content
     let filteredEntities = graph.entities.filter(e =>
@@ -393,7 +400,7 @@ export class JsonlStore implements GraphStore {
   async openNodes(names: string[], projectId?: string): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
     const nameSet = new Set(names);
-    const normalizedProject = projectId?.trim().toLowerCase();
+    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
 
     // First filter: match by name
     let filteredEntities = graph.entities.filter(e => nameSet.has(e.name));

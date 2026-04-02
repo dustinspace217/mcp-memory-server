@@ -36,7 +36,7 @@ The server is split across 4 source files:
 - Implements the `GraphStore` interface
 - `project TEXT` nullable column on entities table — `NULL` means global (visible to all projects)
 - Migration via `pragma('table_info(entities)')` for existing databases that lack the `project` column
-- `idx_entities_project` index for query performance on project-filtered reads
+- `idx_entities_project` and `idx_relations_to_entity` indexes for query performance on project-filtered reads and relation lookups
 - Opens the database with WAL mode (Write-Ahead Logging) — allows reads to proceed concurrently with writes
 - `foreign_keys = ON` is set per connection — SQLite does not enable FK constraints by default, so this must be set explicitly each time the connection opens
 - Deduplication is enforced at the database level via `UNIQUE` constraints on entity names, relation triples, and (entity + observation content) pairs — `INSERT OR IGNORE` silently skips duplicate inserts
@@ -49,7 +49,7 @@ The server is split across 4 source files:
   - `.db` or `.sqlite` extension → `SqliteStore`
   - No extension / omitted → defaults to `memory.db` (SQLite)
 - Auto-migration: on first run, if a `.db` path is requested but doesn't exist yet and a `.jsonl` file is found at the same base path, the server migrates all data from JSONL into SQLite in a single transaction, then renames the original `.jsonl` to `.jsonl.bak`
-- `normalizeProjectId()`: trims whitespace, lowercases, and converts empty/undefined to undefined (global scope)
+- `normalizeProjectId()`: trims whitespace, lowercases, NFC-normalizes Unicode, and converts empty/undefined to undefined (global scope)
 - `normalizeObservation()`: validates observation shape (structural check, not unsafe cast); throws on invalid format
 - `createObservation()`: creates new observations with current UTC timestamp
 - `projectId` optional parameter on `create_entities`, `read_graph`, `search_nodes`, `open_nodes` tools — scopes operations to a project
@@ -61,6 +61,7 @@ The server is split across 4 source files:
 
 ## Known Limitations
 - **Entity names are globally unique** across all projects — permanent architectural constraint because relations use entity names as foreign keys
+- **Project filtering is advisory, not a security boundary** — it scopes queries for convenience but does not enforce access control. Entity name collisions across projects are reported (not silently dropped), and global entities (project=null) are visible to all project-scoped queries by design.
 - **JSONL backend**: no file locking for concurrent access; no FK validation that relation endpoints reference existing entities
 - **SQLite backend**: LIKE-based search is case-insensitive for ASCII only — non-ASCII Unicode characters (e.g. accented letters, CJK) may not match case-insensitively as expected
 
