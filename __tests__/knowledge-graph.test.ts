@@ -830,6 +830,131 @@ describe.each<[string, string, StoreFactory]>([
 	});
 
 	// ----------------------------------------------------------
+	// entity timestamps (updatedAt / createdAt on Entity objects)
+	// ----------------------------------------------------------
+	describe('entity timestamps', () => {
+		// Verifies that both updatedAt and createdAt are set on newly created entities,
+		// that they are valid ISO 8601 strings, and that they fall within the
+		// before/after window of the createEntities call.
+		it('should set updatedAt and createdAt on entity creation', async () => {
+			const before = new Date().toISOString();
+			await store.createEntities([
+				{ name: 'Alice', entityType: 'person', observations: ['test'] },
+			]);
+			const after = new Date().toISOString();
+
+			// Read back the graph and pull out the entity we just created
+			const graph = await store.readGraph();
+			const alice = graph.entities[0];
+
+			// Both timestamps should be ISO 8601 format
+			expect(alice.updatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+			expect(alice.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+			// updatedAt should fall within the before/after window
+			expect(alice.updatedAt >= before).toBe(true);
+			expect(alice.updatedAt <= after).toBe(true);
+
+			// On creation, createdAt and updatedAt should be identical
+			expect(alice.createdAt).toBe(alice.updatedAt);
+		});
+
+		// Verifies that adding an observation bumps updatedAt but leaves createdAt unchanged
+		it('should bump updatedAt when observations are added', async () => {
+			await store.createEntities([
+				{ name: 'Alice', entityType: 'person', observations: ['initial'] },
+			]);
+			const graph1 = await store.readGraph();
+			// Capture the original timestamps from the freshly created entity
+			const originalUpdatedAt = graph1.entities[0].updatedAt;
+			const originalCreatedAt = graph1.entities[0].createdAt;
+
+			// Small delay so timestamps differ
+			await new Promise(r => setTimeout(r, 10));
+
+			await store.addObservations([
+				{ entityName: 'Alice', contents: ['new observation'] },
+			]);
+
+			const graph2 = await store.readGraph();
+			const alice = graph2.entities[0];
+			// updatedAt should have advanced past the original value
+			expect(alice.updatedAt > originalUpdatedAt).toBe(true);
+			// createdAt should remain unchanged — it records when the entity was born
+			expect(alice.createdAt).toBe(originalCreatedAt);
+		});
+
+		// Verifies that deleting an observation bumps updatedAt
+		it('should bump updatedAt when observations are deleted', async () => {
+			await store.createEntities([
+				{ name: 'Alice', entityType: 'person', observations: ['keep', 'remove'] },
+			]);
+			const graph1 = await store.readGraph();
+			const originalUpdatedAt = graph1.entities[0].updatedAt;
+
+			// Small delay so timestamps differ
+			await new Promise(r => setTimeout(r, 10));
+
+			await store.deleteObservations([
+				{ entityName: 'Alice', contents: ['remove'] },
+			]);
+
+			const graph2 = await store.readGraph();
+			// updatedAt should be newer than the original after the observation was deleted
+			expect(graph2.entities[0].updatedAt > originalUpdatedAt).toBe(true);
+		});
+
+		// Verifies that creating relations does NOT touch entity timestamps —
+		// relations are a separate concern from the entity's own data
+		it('should NOT bump updatedAt when relations are created', async () => {
+			await store.createEntities([
+				{ name: 'Alice', entityType: 'person', observations: [] },
+				{ name: 'Bob', entityType: 'person', observations: [] },
+			]);
+			const graph1 = await store.readGraph();
+			// Grab Alice's updatedAt before adding a relation
+			const aliceUpdatedAt = graph1.entities.find(e => e.name === 'Alice')!.updatedAt;
+
+			// Small delay so any accidental timestamp bump would be detectable
+			await new Promise(r => setTimeout(r, 10));
+
+			await store.createRelations([
+				{ from: 'Alice', to: 'Bob', relationType: 'knows' },
+			]);
+
+			const graph2 = await store.readGraph();
+			// Alice's updatedAt should be identical — relations don't mutate entities
+			expect(graph2.entities.find(e => e.name === 'Alice')!.updatedAt).toBe(aliceUpdatedAt);
+		});
+
+		// Verifies that entity timestamps survive a close/reopen cycle —
+		// they are persisted to disk, not just held in memory
+		it('should persist timestamps across store restarts', async () => {
+			await store.createEntities([
+				{ name: 'Alice', entityType: 'person', observations: ['test'] },
+			]);
+			const graph1 = await store.readGraph();
+			const originalUpdatedAt = graph1.entities[0].updatedAt;
+			const originalCreatedAt = graph1.entities[0].createdAt;
+
+			// Close the current store, open a fresh instance from the same path
+			await store.close();
+			const store2 = createStore(storePath);
+			await store2.init();
+			const graph2 = await store2.readGraph();
+			await store2.close();
+
+			// Re-open so afterEach can close and clean up normally
+			store = createStore(storePath);
+			await store.init();
+
+			// Timestamps should survive the round-trip through disk
+			expect(graph2.entities[0].updatedAt).toBe(originalUpdatedAt);
+			expect(graph2.entities[0].createdAt).toBe(originalCreatedAt);
+		});
+	});
+
+	// ----------------------------------------------------------
 	// observation deduplication within createEntities
 	// ----------------------------------------------------------
 	describe('observation deduplication within createEntities', () => {
