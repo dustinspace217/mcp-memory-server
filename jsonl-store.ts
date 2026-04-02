@@ -18,46 +18,77 @@ import {
   type AddObservationResult,
 } from './types.js';
 
+/** Configuration returned by ensureMemoryFilePath() -- determines which store to use. */
+export type StoreConfig = { path: string; storeType: 'jsonl' | 'sqlite' };
+
 // Default memory file path, used when MEMORY_FILE_PATH env var is not set.
-// Points to memory.jsonl alongside the compiled script in dist/.
+// Points to memory.db alongside the compiled script in dist/.
 export const defaultMemoryPath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
-  'memory.jsonl'
+  'memory.db'
 );
 
 /**
- * Resolves the memory file path with backward-compatibility migration.
+ * Resolves the memory storage configuration from the MEMORY_FILE_PATH env var.
+ * Determines the store type from the file extension and handles legacy migrations.
  *
- * Priority:
- * 1. MEMORY_FILE_PATH env var (relative paths resolved against script dir)
- * 2. Legacy memory.json -> memory.jsonl migration
- * 3. Default memory.jsonl alongside the script
+ * Selection logic:
+ * - .jsonl extension -> JSONL store (with .json->.jsonl migration)
+ * - .db or .sqlite extension -> SQLite store
+ * - Other extension -> throws with helpful message
+ * - No env var -> defaults to memory.db (SQLite)
  *
- * @returns Absolute path to the JSONL memory file.
+ * @returns StoreConfig with the resolved path and store type
+ * @throws Error if MEMORY_FILE_PATH has an unrecognized extension
  */
-export async function ensureMemoryFilePath(): Promise<string> {
+export async function ensureMemoryFilePath(): Promise<StoreConfig> {
+  const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+
   if (process.env.MEMORY_FILE_PATH) {
-    return path.isAbsolute(process.env.MEMORY_FILE_PATH)
+    const envPath = path.isAbsolute(process.env.MEMORY_FILE_PATH)
       ? process.env.MEMORY_FILE_PATH
-      : path.join(path.dirname(fileURLToPath(import.meta.url)), process.env.MEMORY_FILE_PATH);
+      : path.join(scriptDir, process.env.MEMORY_FILE_PATH);
+
+    if (envPath.endsWith('.jsonl')) {
+      // Handle legacy .json -> .jsonl migration for JSONL users
+      await migrateJsonToJsonl(scriptDir, envPath);
+      return { path: envPath, storeType: 'jsonl' };
+    }
+    if (envPath.endsWith('.db') || envPath.endsWith('.sqlite')) {
+      return { path: envPath, storeType: 'sqlite' };
+    }
+    throw new Error(
+      `Unsupported file extension for MEMORY_FILE_PATH: "${process.env.MEMORY_FILE_PATH}". ` +
+      `Use .jsonl for JSONL storage or .db/.sqlite for SQLite storage.`
+    );
   }
 
-  const oldMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.json');
-  const newMemoryPath = defaultMemoryPath;
+  // No env var -- default to SQLite
+  return { path: defaultMemoryPath, storeType: 'sqlite' };
+}
+
+/**
+ * Handles the legacy memory.json -> memory.jsonl migration.
+ * Only runs when the target is the default memory.jsonl path alongside the script.
+ */
+async function migrateJsonToJsonl(scriptDir: string, jsonlPath: string): Promise<void> {
+  const oldJsonPath = path.join(scriptDir, 'memory.json');
+  const targetIsDefault = jsonlPath === path.join(scriptDir, 'memory.jsonl');
+
+  if (!targetIsDefault) return;
 
   try {
-    await fs.access(oldMemoryPath);
+    await fs.access(oldJsonPath);
     try {
-      await fs.access(newMemoryPath);
-      return newMemoryPath;
+      await fs.access(jsonlPath);
+      // Both exist -- use the new one, no migration
     } catch {
       console.error('DETECTED: Found legacy memory.json file, migrating to memory.jsonl for JSONL format compatibility');
-      await fs.rename(oldMemoryPath, newMemoryPath);
+      await fs.rename(oldJsonPath, jsonlPath);
       console.error('COMPLETED: Successfully migrated memory.json to memory.jsonl');
-      return newMemoryPath;
     }
   } catch {
-    return newMemoryPath;
+    // Old file doesn't exist -- nothing to migrate
   }
 }
 

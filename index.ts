@@ -8,10 +8,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import type { GraphStore } from './types.js';
 import { ensureMemoryFilePath, JsonlStore } from './jsonl-store.js';
+import { SqliteStore } from './sqlite-store.js';
 
 // Re-export types that tests and external consumers may need
 export { type Observation, type Entity, type Relation, type KnowledgeGraph } from './types.js';
 export { JsonlStore, ensureMemoryFilePath, defaultMemoryPath, normalizeObservation } from './jsonl-store.js';
+export { type StoreConfig } from './jsonl-store.js';
+export { SqliteStore } from './sqlite-store.js';
 
 // Module-level store reference -- initialized in main(), used by all tool handlers
 let store: GraphStore;
@@ -218,12 +221,18 @@ server.registerTool(
 );
 
 /**
- * Entry point. Resolves the storage path, instantiates the appropriate store,
+ * Entry point. Resolves the storage configuration, instantiates the appropriate store,
  * and starts the MCP server on stdio transport.
  */
 async function main() {
-  const memoryFilePath = await ensureMemoryFilePath();
-  store = new JsonlStore(memoryFilePath);
+  const config = await ensureMemoryFilePath();
+
+  // Instantiate the appropriate store based on file extension
+  if (config.storeType === 'sqlite') {
+    store = new SqliteStore(config.path);
+  } else {
+    store = new JsonlStore(config.path);
+  }
   await store.init();
 
   const transport = new StdioServerTransport();
