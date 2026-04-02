@@ -46,7 +46,7 @@ describe.each<[string, string, StoreFactory]>([
 	// ----------------------------------------------------------
 	describe('createEntities', () => {
 		it('should create new entities', async () => {
-			const newEntities = await store.createEntities([
+			const { created: newEntities } = await store.createEntities([
 				{ name: 'Alice', entityType: 'person', observations: ['works at Acme Corp'] },
 				{ name: 'Bob', entityType: 'person', observations: ['likes programming'] },
 			]);
@@ -65,7 +65,7 @@ describe.each<[string, string, StoreFactory]>([
 			await store.createEntities([
 				{ name: 'Alice', entityType: 'person', observations: ['works at Acme Corp'] },
 			]);
-			const newEntities = await store.createEntities([
+			const { created: newEntities } = await store.createEntities([
 				{ name: 'Alice', entityType: 'person', observations: ['works at Acme Corp'] },
 			]);
 
@@ -76,7 +76,7 @@ describe.each<[string, string, StoreFactory]>([
 		});
 
 		it('should handle empty entity arrays', async () => {
-			const newEntities = await store.createEntities([]);
+			const { created: newEntities } = await store.createEntities([]);
 			expect(newEntities).toHaveLength(0);
 		});
 	});
@@ -462,6 +462,274 @@ describe.each<[string, string, StoreFactory]>([
 	});
 
 	// ----------------------------------------------------------
+	// project filtering
+	// ----------------------------------------------------------
+	describe('project filtering', () => {
+		it('should tag entities with projectId on create', async () => {
+			const result = await store.createEntities(
+				[{ name: 'ProjectEntity', entityType: 'test', observations: ['obs1'] }],
+				'my-project'
+			);
+			expect(result.created).toHaveLength(1);
+			expect(result.created[0].project).toBe('my-project');
+			expect(result.skipped).toHaveLength(0);
+		});
+
+		it('should set project to null when projectId omitted', async () => {
+			const result = await store.createEntities([
+				{ name: 'GlobalEntity', entityType: 'test', observations: ['obs1'] },
+			]);
+			expect(result.created).toHaveLength(1);
+			expect(result.created[0].project).toBeNull();
+		});
+
+		it('should normalize projectId to lowercase and trimmed', async () => {
+			const result = await store.createEntities(
+				[{ name: 'NormEntity', entityType: 'test', observations: ['obs1'] }],
+				'  My-Project  '
+			);
+			expect(result.created[0].project).toBe('my-project');
+		});
+
+		it('should report skipped entities with existing project info', async () => {
+			await store.createEntities(
+				[{ name: 'Shared', entityType: 'test', observations: ['obs1'] }],
+				'project-a'
+			);
+			const result = await store.createEntities(
+				[{ name: 'Shared', entityType: 'test', observations: ['obs2'] }],
+				'project-b'
+			);
+			expect(result.created).toHaveLength(0);
+			expect(result.skipped).toHaveLength(1);
+			expect(result.skipped[0]).toEqual({ name: 'Shared', existingProject: 'project-a' });
+		});
+
+		it('should filter readGraph by project + globals', async () => {
+			await store.createEntities(
+				[{ name: 'A', entityType: 'test', observations: ['a'] }],
+				'proj-1'
+			);
+			await store.createEntities(
+				[{ name: 'B', entityType: 'test', observations: ['b'] }],
+				'proj-2'
+			);
+			await store.createEntities([
+				{ name: 'G', entityType: 'test', observations: ['global'] },
+			]);
+
+			const filtered = await store.readGraph('proj-1');
+			const names = filtered.entities.map(e => e.name).sort();
+			expect(names).toEqual(['A', 'G']);
+		});
+
+		it('should return entire graph when readGraph has no projectId', async () => {
+			await store.createEntities(
+				[{ name: 'A', entityType: 'test', observations: ['a'] }],
+				'proj-1'
+			);
+			await store.createEntities(
+				[{ name: 'B', entityType: 'test', observations: ['b'] }],
+				'proj-2'
+			);
+			await store.createEntities([
+				{ name: 'G', entityType: 'test', observations: ['global'] },
+			]);
+
+			const all = await store.readGraph();
+			expect(all.entities).toHaveLength(3);
+		});
+
+		it('should filter searchNodes by project + globals', async () => {
+			await store.createEntities(
+				[{ name: 'Alpha', entityType: 'test', observations: ['shared keyword'] }],
+				'proj-1'
+			);
+			await store.createEntities(
+				[{ name: 'Beta', entityType: 'test', observations: ['shared keyword'] }],
+				'proj-2'
+			);
+			await store.createEntities([
+				{ name: 'Gamma', entityType: 'test', observations: ['shared keyword'] },
+			]);
+
+			const result = await store.searchNodes('shared', 'proj-1');
+			const names = result.entities.map(e => e.name).sort();
+			expect(names).toEqual(['Alpha', 'Gamma']);
+		});
+
+		it('should search entire graph when searchNodes has no projectId', async () => {
+			await store.createEntities(
+				[{ name: 'Alpha', entityType: 'test', observations: ['keyword'] }],
+				'proj-1'
+			);
+			await store.createEntities(
+				[{ name: 'Beta', entityType: 'test', observations: ['keyword'] }],
+				'proj-2'
+			);
+
+			const result = await store.searchNodes('keyword');
+			expect(result.entities).toHaveLength(2);
+		});
+
+		it('should filter openNodes by project + globals', async () => {
+			await store.createEntities(
+				[{ name: 'X', entityType: 'test', observations: ['x'] }],
+				'proj-1'
+			);
+			await store.createEntities(
+				[{ name: 'Y', entityType: 'test', observations: ['y'] }],
+				'proj-2'
+			);
+			await store.createEntities([
+				{ name: 'Z', entityType: 'test', observations: ['z'] },
+			]);
+
+			const result = await store.openNodes(['X', 'Y', 'Z'], 'proj-1');
+			const names = result.entities.map(e => e.name).sort();
+			expect(names).toEqual(['X', 'Z']);
+		});
+
+		it('should return all requested entities when openNodes has no projectId', async () => {
+			await store.createEntities(
+				[{ name: 'X', entityType: 'test', observations: ['x'] }],
+				'proj-1'
+			);
+			await store.createEntities(
+				[{ name: 'Y', entityType: 'test', observations: ['y'] }],
+				'proj-2'
+			);
+
+			const result = await store.openNodes(['X', 'Y']);
+			expect(result.entities).toHaveLength(2);
+		});
+
+		it('should only include relations where both endpoints are in the result set', async () => {
+			await store.createEntities(
+				[{ name: 'P1', entityType: 'test', observations: ['p1'] }],
+				'proj-1'
+			);
+			await store.createEntities(
+				[{ name: 'P2', entityType: 'test', observations: ['p2'] }],
+				'proj-2'
+			);
+			await store.createEntities([
+				{ name: 'Global', entityType: 'test', observations: ['g'] },
+			]);
+			await store.createRelations([
+				{ from: 'P1', to: 'Global', relationType: 'uses' },
+				{ from: 'P1', to: 'P2', relationType: 'cross_project' },
+				{ from: 'P2', to: 'Global', relationType: 'also_uses' },
+			]);
+
+			const result = await store.readGraph('proj-1');
+			expect(result.entities.map(e => e.name).sort()).toEqual(['Global', 'P1']);
+			expect(result.relations).toHaveLength(1);
+			expect(result.relations[0]).toEqual(
+				expect.objectContaining({ from: 'P1', to: 'Global', relationType: 'uses' })
+			);
+		});
+
+		it('should exclude cross-project relations from searchNodes with projectId', async () => {
+			// Create entities in two projects plus a global entity
+			await store.createEntities(
+				[{ name: 'SearchP1', entityType: 'test', observations: ['searchable'] }],
+				'proj-1'
+			);
+			await store.createEntities(
+				[{ name: 'SearchP2', entityType: 'test', observations: ['searchable'] }],
+				'proj-2'
+			);
+			await store.createEntities([
+				{ name: 'SearchGlobal', entityType: 'test', observations: ['searchable'] },
+			]);
+			await store.createRelations([
+				{ from: 'SearchP1', to: 'SearchGlobal', relationType: 'uses' },
+				{ from: 'SearchP1', to: 'SearchP2', relationType: 'cross_project' },
+			]);
+
+			// searchNodes with proj-1 should return P1 + Global (both match "searchable"),
+			// and only the P1->Global relation (AND logic: both endpoints in result set)
+			const result = await store.searchNodes('searchable', 'proj-1');
+			const names = result.entities.map(e => e.name).sort();
+			expect(names).toEqual(['SearchGlobal', 'SearchP1']);
+			expect(result.relations).toHaveLength(1);
+			expect(result.relations[0]).toEqual(
+				expect.objectContaining({ from: 'SearchP1', to: 'SearchGlobal', relationType: 'uses' })
+			);
+		});
+
+		it('should exclude cross-project relations from openNodes with projectId', async () => {
+			// Create entities in two projects plus a global entity
+			await store.createEntities(
+				[{ name: 'OpenP1', entityType: 'test', observations: ['o1'] }],
+				'proj-1'
+			);
+			await store.createEntities(
+				[{ name: 'OpenP2', entityType: 'test', observations: ['o2'] }],
+				'proj-2'
+			);
+			await store.createEntities([
+				{ name: 'OpenGlobal', entityType: 'test', observations: ['og'] },
+			]);
+			await store.createRelations([
+				{ from: 'OpenP1', to: 'OpenGlobal', relationType: 'uses' },
+				{ from: 'OpenP1', to: 'OpenP2', relationType: 'cross_project' },
+			]);
+
+			// openNodes with proj-1 scope: request all 3 by name, should only get P1 + Global
+			const result = await store.openNodes(['OpenP1', 'OpenP2', 'OpenGlobal'], 'proj-1');
+			const names = result.entities.map(e => e.name).sort();
+			expect(names).toEqual(['OpenGlobal', 'OpenP1']);
+			expect(result.relations).toHaveLength(1);
+			expect(result.relations[0]).toEqual(
+				expect.objectContaining({ from: 'OpenP1', to: 'OpenGlobal', relationType: 'uses' })
+			);
+		});
+
+		it('should list distinct project names sorted alphabetically', async () => {
+			await store.createEntities(
+				[{ name: 'A', entityType: 'test', observations: ['a'] }],
+				'zebra'
+			);
+			await store.createEntities(
+				[{ name: 'B', entityType: 'test', observations: ['b'] }],
+				'alpha'
+			);
+			await store.createEntities([
+				{ name: 'C', entityType: 'test', observations: ['c'] },
+			]);
+
+			const projects = await store.listProjects();
+			expect(projects).toEqual(['alpha', 'zebra']);
+		});
+
+		it('should return empty array from listProjects on empty database', async () => {
+			const projects = await store.listProjects();
+			expect(projects).toEqual([]);
+		});
+
+		it('should persist project field across store restarts', async () => {
+			await store.createEntities(
+				[{ name: 'Persistent', entityType: 'test', observations: ['data'] }],
+				'my-project'
+			);
+
+			await store.close();
+			const store2 = createStore(storePath);
+			await store2.init();
+			const graph = await store2.readGraph();
+			await store2.close();
+
+			// Re-open so afterEach can close and clean up normally
+			store = createStore(storePath);
+			await store.init();
+
+			expect(graph.entities[0].project).toBe('my-project');
+		});
+	});
+
+	// ----------------------------------------------------------
 	// observation timestamps (shared subset)
 	// ----------------------------------------------------------
 	describe('observation timestamps', () => {
@@ -567,7 +835,7 @@ describe.each<[string, string, StoreFactory]>([
 	describe('observation deduplication within createEntities', () => {
 		it('should deduplicate observations within a single entity', async () => {
 			// Previously this bug allowed ['a', 'a'] to create two identical observations
-			const entities = await store.createEntities([
+			const { created: entities } = await store.createEntities([
 				{ name: 'Alice', entityType: 'person', observations: ['same', 'same', 'different'] },
 			]);
 
@@ -606,13 +874,13 @@ describe.each<[string, string, StoreFactory]>([
 	describe('within-batch deduplication', () => {
 		it('should deduplicate entities within the same createEntities call', async () => {
 			// Two entities with the same name in one batch — only the first should be created
-			const result = await store.createEntities([
+			const { created } = await store.createEntities([
 				{ name: 'Alice', entityType: 'person', observations: ['first'] },
 				{ name: 'Alice', entityType: 'robot', observations: ['second'] },
 			]);
 
-			expect(result).toHaveLength(1);
-			expect(result[0].entityType).toBe('person');
+			expect(created).toHaveLength(1);
+			expect(created[0].entityType).toBe('person');
 
 			const graph = await store.readGraph();
 			expect(graph.entities).toHaveLength(1);
@@ -1152,11 +1420,11 @@ describe('SqliteStore-specific', () => {
 			await store.createEntities([
 				{ name: 'Alice', entityType: 'person', observations: ['first'] },
 			]);
-			const result = await store.createEntities([
+			const { created } = await store.createEntities([
 				{ name: 'Alice', entityType: 'robot', observations: ['second'] },
 			]);
 
-			expect(result).toHaveLength(0);
+			expect(created).toHaveLength(0);
 			const graph = await store.readGraph();
 			expect(graph.entities).toHaveLength(1);
 			expect(graph.entities[0].entityType).toBe('person');
@@ -1172,6 +1440,70 @@ describe('SqliteStore-specific', () => {
 
 			expect(result[0].addedObservations).toHaveLength(1);
 			expect(result[0].addedObservations[0].content).toBe('new one');
+		});
+	});
+
+	describe('project column migration', () => {
+		it('should migrate existing database by adding project column', async () => {
+			const migrationPath = path.join(testDir, `test-migration-project-${Date.now()}.db`);
+
+			// Create a pre-Phase-3 database manually (no project column).
+			// Imports better-sqlite3 directly to build a schema without the project column,
+			// simulating a database created before Phase 3 was implemented.
+			const Database = (await import('better-sqlite3')).default;
+			const rawDb = new Database(migrationPath);
+			rawDb.pragma('journal_mode = WAL');
+			rawDb.pragma('foreign_keys = ON');
+			rawDb.exec(`
+				CREATE TABLE IF NOT EXISTS entities (
+					id          INTEGER PRIMARY KEY AUTOINCREMENT,
+					name        TEXT NOT NULL UNIQUE,
+					entity_type TEXT NOT NULL
+				);
+				CREATE TABLE IF NOT EXISTS observations (
+					id          INTEGER PRIMARY KEY AUTOINCREMENT,
+					entity_id   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+					content     TEXT NOT NULL,
+					created_at  TEXT NOT NULL,
+					UNIQUE(entity_id, content)
+				);
+				CREATE TABLE IF NOT EXISTS relations (
+					id            INTEGER PRIMARY KEY AUTOINCREMENT,
+					from_entity   TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+					to_entity     TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+					relation_type TEXT NOT NULL,
+					UNIQUE(from_entity, to_entity, relation_type)
+				);
+			`);
+			// Insert a legacy entity without a project column
+			rawDb.prepare('INSERT INTO entities (name, entity_type) VALUES (?, ?)').run('OldEntity', 'test');
+			const entityId = (rawDb.prepare('SELECT id FROM entities WHERE name = ?').get('OldEntity') as { id: number }).id;
+			rawDb.prepare('INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)').run(entityId, 'old data', new Date().toISOString());
+			rawDb.close();
+
+			// Re-open with SqliteStore -- init() should detect missing project column and add it
+			const store2 = new SqliteStore(migrationPath);
+			await store2.init();
+
+			// Old entity should have null project after migration
+			const graph = await store2.readGraph();
+			expect(graph.entities[0].project).toBeNull();
+
+			// Verify new entities can be created with a project
+			await store2.createEntities(
+				[{ name: 'NewEntity', entityType: 'test', observations: ['new data'] }],
+				'test-project'
+			);
+			// readGraph with project filter returns project entities + global (null project) entities
+			const graph2 = await store2.readGraph('test-project');
+			const names = graph2.entities.map(e => e.name).sort();
+			expect(names).toEqual(['NewEntity', 'OldEntity']); // OldEntity is global, included
+
+			await store2.close();
+			// Clean up all SQLite sidecar files
+			for (const suffix of ['', '-wal', '-shm']) {
+				try { await fs.unlink(migrationPath + suffix); } catch { /* ignore */ }
+			}
 		});
 	});
 });

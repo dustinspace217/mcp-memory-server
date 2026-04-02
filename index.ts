@@ -67,7 +67,7 @@ export async function ensureMemoryFilePath(): Promise<StoreConfig> {
 }
 
 // Re-export types that tests and external consumers may need
-export { type Observation, type Entity, type Relation, type KnowledgeGraph } from './types.js';
+export { type Observation, type Entity, type Relation, type KnowledgeGraph, type CreateEntitiesResult, type SkippedEntity } from './types.js';
 export { JsonlStore, normalizeObservation } from './jsonl-store.js';
 export { SqliteStore } from './sqlite-store.js';
 
@@ -94,6 +94,7 @@ const EntityOutputSchema = z.object({
   name: z.string().describe("The name of the entity"),
   entityType: z.string().describe("The type of the entity"),
   observations: z.array(ObservationSchema).describe("An array of observations with content and timestamps"),
+  project: z.string().nullable().describe("Project this entity belongs to, or null for global"),
 });
 
 const RelationSchema = z.object({
@@ -102,9 +103,41 @@ const RelationSchema = z.object({
   relationType: z.string().min(1).max(500).describe("The type of the relation")
 });
 
+// Optional project scope for filtering tools. Omit to operate globally.
+// .trim() strips whitespace BEFORE .min(1) checks length, so whitespace-only
+// inputs like " " or "\t" are rejected instead of silently becoming global scope.
+const ProjectIdSchema = z.string().trim().min(1).max(500)
+  .describe("Project scope for filtering. Omit for global/unscoped.")
+  .optional();
+
+/**
+ * Normalizes a projectId input: trims whitespace, lowercases, and converts
+ * empty/undefined to undefined (so the store treats it as global).
+ * Called in tool handlers before passing to store methods.
+ *
+ * @param projectId - Raw projectId string from tool input, may be undefined
+ * @returns Cleaned lowercase string, or undefined if input was empty/missing
+ */
+function normalizeProjectId(projectId?: string): string | undefined {
+  if (!projectId) return undefined;
+  // trim() removes surrounding whitespace; toLowerCase() ensures
+  // "MyProject" and "myproject" map to the same scope;
+  // normalize('NFC') collapses Unicode equivalents (e.g., NFD "cafe\u0301"
+  // and NFC "caf\u00e9" both become "café") so macOS (NFD) and Linux (NFC)
+  // path-derived project names map to the same scope.
+  const normalized = projectId.trim().toLowerCase().normalize('NFC');
+  return normalized || undefined;
+}
+
+// Schema for entities that were skipped during create_entities (name collision)
+const SkippedEntitySchema = z.object({
+  name: z.string(),
+  existingProject: z.string().nullable(),
+});
+
 const server = new McpServer({
   name: "memory-server",
-  version: "0.8.0",
+  version: "0.9.0",
 });
 
 server.registerTool(
@@ -112,14 +145,21 @@ server.registerTool(
   {
     title: "Create Entities",
     description: "Create multiple new entities in the knowledge graph",
-    inputSchema: { entities: z.array(EntityInputSchema).max(100) },
-    outputSchema: { entities: z.array(EntityOutputSchema) }
+    inputSchema: {
+      entities: z.array(EntityInputSchema).max(100),
+      projectId: ProjectIdSchema,
+    },
+    outputSchema: {
+      created: z.array(EntityOutputSchema),
+      skipped: z.array(SkippedEntitySchema),
+    }
   },
-  async ({ entities }) => {
-    const result = await store.createEntities(entities);
+  async ({ entities, projectId }) => {
+    // normalizeProjectId lowercases and trims; undefined = global scope
+    const result = await store.createEntities(entities, normalizeProjectId(projectId));
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      structuredContent: { entities: result }
+      structuredContent: { created: result.created, skipped: result.skipped }
     };
   }
 );
@@ -229,11 +269,11 @@ server.registerTool(
   {
     title: "Read Graph",
     description: "Read the entire knowledge graph",
-    inputSchema: {},
+    inputSchema: { projectId: ProjectIdSchema },
     outputSchema: { entities: z.array(EntityOutputSchema), relations: z.array(RelationSchema) }
   },
-  async () => {
-    const graph = await store.readGraph();
+  async ({ projectId }) => {
+    const graph = await store.readGraph(normalizeProjectId(projectId));
     return {
       content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
       structuredContent: { ...graph }
@@ -246,11 +286,14 @@ server.registerTool(
   {
     title: "Search Nodes",
     description: "Search for nodes in the knowledge graph based on a query",
-    inputSchema: { query: z.string().min(1).max(5000).describe("The search query to match against entity names, types, and observation content") },
+    inputSchema: {
+      query: z.string().min(1).max(5000).describe("The search query to match against entity names, types, and observation content"),
+      projectId: ProjectIdSchema,
+    },
     outputSchema: { entities: z.array(EntityOutputSchema), relations: z.array(RelationSchema) }
   },
-  async ({ query }) => {
-    const graph = await store.searchNodes(query);
+  async ({ query, projectId }) => {
+    const graph = await store.searchNodes(query, normalizeProjectId(projectId));
     return {
       content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
       structuredContent: { ...graph }
@@ -263,14 +306,35 @@ server.registerTool(
   {
     title: "Open Nodes",
     description: "Open specific nodes in the knowledge graph by their names",
-    inputSchema: { names: z.array(z.string().min(1).max(500)).max(100).describe("An array of entity names to retrieve") },
+    inputSchema: {
+      names: z.array(z.string().min(1).max(500)).max(100).describe("An array of entity names to retrieve"),
+      projectId: ProjectIdSchema,
+    },
     outputSchema: { entities: z.array(EntityOutputSchema), relations: z.array(RelationSchema) }
   },
-  async ({ names }) => {
-    const graph = await store.openNodes(names);
+  async ({ names, projectId }) => {
+    const graph = await store.openNodes(names, normalizeProjectId(projectId));
     return {
       content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
       structuredContent: { ...graph }
+    };
+  }
+);
+
+server.registerTool(
+  "list_projects",
+  {
+    title: "List Projects",
+    description: "List all project names in the knowledge graph",
+    inputSchema: {},
+    outputSchema: { projects: z.array(z.string()) }
+  },
+  async () => {
+    // Returns all distinct non-null project names from the store
+    const projects = await store.listProjects();
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(projects, null, 2) }],
+      structuredContent: { projects }
     };
   }
 );
