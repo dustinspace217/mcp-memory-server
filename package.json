@@ -1,6 +1,6 @@
 {
   "name": "mcp-memory-server",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "An MCP server that provides knowledge-graph-based persistent memory using entities, relations, and observations. Forked from @modelcontextprotocol/server-memory.",
   "license": "MIT",
   "author": "dustinspace217",
@@ -20,9 +20,11 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^12.8.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.13.10",
     "typescript": "^5.8.2",
     "vitest": "^3.0.9"
