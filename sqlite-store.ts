@@ -16,6 +16,18 @@ import {
   type DeleteObservationInput,
   type AddObservationResult,
 } from './types.js';
+import { JsonlStore } from './jsonl-store.js';
+
+/**
+ * Checks if a file exists at the given path.
+ * Uses fs.access() which resolves if the file is reachable and rejects otherwise.
+ *
+ * @param filePath - Absolute path to check
+ * @returns true if the file is accessible, false otherwise
+ */
+async function fileExists(filePath: string): Promise<boolean> {
+  try { await fs.access(filePath); return true; } catch { return false; }
+}
 
 /**
  * Escapes LIKE special characters so they match as literal substrings.
@@ -50,8 +62,32 @@ export class SqliteStore implements GraphStore {
    *
    * WAL (Write-Ahead Logging) mode allows concurrent readers without blocking writers.
    * foreign_keys must be enabled per-connection (SQLite doesn't persist this setting).
+   *
+   * If the .db file doesn't exist yet but a .jsonl file is found at the same path
+   * (with extension swapped), the JSONL data is migrated into SQLite in a single
+   * transaction and the JSONL file is renamed to .jsonl.bak.
    */
   async init(): Promise<void> {
+    // --- Check for JSONL migration BEFORE opening the DB ---
+    // (Opening the DB creates the file, which would defeat the "db doesn't exist" check)
+    let migrationData: KnowledgeGraph | null = null;
+    const dbAlreadyExists = await fileExists(this.dbPath);
+
+    if (!dbAlreadyExists) {
+      // Look for a JSONL file at the same path but with .jsonl extension instead of .db/.sqlite
+      const jsonlPath = this.dbPath.replace(/\.(db|sqlite)$/, '.jsonl');
+      if (jsonlPath !== this.dbPath && await fileExists(jsonlPath)) {
+        console.error(`DETECTED: Found ${jsonlPath}, will migrate to SQLite`);
+        // JsonlStore.init() is a no-op, but we call it for interface consistency
+        const jsonlStore = new JsonlStore(jsonlPath);
+        await jsonlStore.init();
+        migrationData = await jsonlStore.readGraph();
+        await jsonlStore.close();
+      }
+    }
+
+    // --- Open database and create schema ---
+    // new Database() creates the file if it doesn't exist (this is why we check first)
     this.db = new Database(this.dbPath);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
@@ -64,7 +100,6 @@ export class SqliteStore implements GraphStore {
         name        TEXT NOT NULL UNIQUE,
         entity_type TEXT NOT NULL
       );
-
       CREATE TABLE IF NOT EXISTS observations (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         entity_id   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
@@ -72,7 +107,6 @@ export class SqliteStore implements GraphStore {
         created_at  TEXT NOT NULL,
         UNIQUE(entity_id, content)
       );
-
       CREATE TABLE IF NOT EXISTS relations (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         from_entity   TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
@@ -81,6 +115,71 @@ export class SqliteStore implements GraphStore {
         UNIQUE(from_entity, to_entity, relation_type)
       );
     `);
+
+    // --- Run migration if data was loaded from JSONL ---
+    if (migrationData) {
+      const jsonlPath = this.dbPath.replace(/\.(db|sqlite)$/, '.jsonl');
+      this.migrateFromJsonl(migrationData);
+      // Rename the JSONL file to .bak so it won't be re-migrated on next startup
+      try {
+        await fs.rename(jsonlPath, jsonlPath + '.bak');
+      } catch (renameError) {
+        console.error(`WARNING: Migration succeeded but could not rename ${jsonlPath} to .bak:`, renameError);
+      }
+      console.error(
+        `COMPLETED: Migrated ${migrationData.entities.length} entities and ` +
+        `${migrationData.relations.length} relations to SQLite. Backup at ${jsonlPath}.bak`
+      );
+    }
+  }
+
+  /**
+   * Imports a KnowledgeGraph (read from JSONL) into the SQLite database.
+   * Runs in a single transaction -- rolls back on any error.
+   * Uses INSERT OR IGNORE to tolerate duplicates in corrupted JSONL data.
+   * Dangling relations (referencing non-existent entities) are silently skipped
+   * because the FK constraint prevents insertion.
+   *
+   * @param graph - KnowledgeGraph loaded from the JSONL file by JsonlStore.readGraph()
+   */
+  private migrateFromJsonl(graph: KnowledgeGraph): void {
+    // Prepared statements are compiled once and reused for every row in the transaction
+    const insertEntity = this.db.prepare(
+      'INSERT OR IGNORE INTO entities (name, entity_type) VALUES (?, ?)'
+    );
+    // Used to look up the auto-assigned id after inserting an entity
+    const getEntityId = this.db.prepare(
+      'SELECT id FROM entities WHERE name = ?'
+    );
+    const insertObs = this.db.prepare(
+      'INSERT OR IGNORE INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)'
+    );
+    const insertRel = this.db.prepare(
+      'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type) VALUES (?, ?, ?)'
+    );
+
+    // db.transaction() wraps everything in BEGIN/COMMIT and auto-rolls-back on throw
+    const txn = this.db.transaction(() => {
+      for (const entity of graph.entities) {
+        // INSERT OR IGNORE: if name already exists (duplicate in JSONL), skip silently
+        insertEntity.run(entity.name, entity.entityType);
+        const row = getEntityId.get(entity.name) as { id: number };
+        for (const obs of entity.observations) {
+          // obs is already a normalized Observation object (JsonlStore.readGraph() calls normalizeObservation)
+          insertObs.run(row.id, obs.content, obs.createdAt);
+        }
+      }
+      for (const rel of graph.relations) {
+        try {
+          // INSERT OR IGNORE handles duplicate relations; the try/catch handles FK violations
+          // (relation referencing an entity name that doesn't exist in this DB)
+          insertRel.run(rel.from, rel.to, rel.relationType);
+        } catch {
+          // FK violation -- one or both endpoint entities don't exist. Skip silently.
+        }
+      }
+    });
+    txn();
   }
 
   /** Closes the database connection. Call when done to release the file lock. */
