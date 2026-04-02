@@ -48,7 +48,7 @@ Project names are normalized before reaching the store:
 - `trim()` — strip leading/trailing whitespace
 - `toLowerCase()` — case-insensitive matching
 
-Applied in the MCP tool handlers (index.ts), so both backends receive clean input. Empty string after trim is treated as `null` (global).
+Applied in the MCP tool handlers (index.ts), so both backends receive clean input. The Zod schema enforces `.min(1)`, so empty strings are rejected at the validation layer before reaching the handler.
 
 ---
 
@@ -57,10 +57,17 @@ Applied in the MCP tool handlers (index.ts), so both backends receive clean inpu
 ### Modified Methods
 
 ```typescript
-createEntities(entities: EntityInput[], projectId?: string): Promise<Readonly<Entity[]>>;
+createEntities(entities: EntityInput[], projectId?: string): Promise<Readonly<CreateEntitiesResult>>;
 readGraph(projectId?: string): Promise<Readonly<KnowledgeGraph>>;
 searchNodes(query: string, projectId?: string): Promise<Readonly<KnowledgeGraph>>;
 openNodes(names: string[], projectId?: string): Promise<Readonly<KnowledgeGraph>>;
+```
+
+Where `CreateEntitiesResult` is:
+
+```typescript
+type SkippedEntity = { name: string; existingProject: string | null };
+type CreateEntitiesResult = { created: Entity[]; skipped: SkippedEntity[] };
 ```
 
 ### New Method
@@ -90,9 +97,9 @@ These operate by exact entity name (globally unique) and don't need project scop
 | Operation | Behavior |
 |-----------|----------|
 | `create_entities` | New entities tagged with this project |
-| `read_graph` | Returns entities where `project = :id OR project IS NULL`, plus relations with at least one endpoint in that set |
-| `search_nodes` | Filters search results to entities in this project + globals, plus connected relations |
-| `open_nodes` | Returns requested entities only if they belong to this project or are global, plus connected relations |
+| `read_graph` | Returns entities where `project = :id OR project IS NULL`, plus relations where **both** endpoints are in that set |
+| `search_nodes` | Filters search results to entities in this project + globals, plus relations where **both** endpoints are in the result set |
+| `open_nodes` | Returns requested entities only if they belong to this project or are global, plus relations where **both** endpoints are in the result set |
 
 ### Without `projectId` (omitted or null)
 
@@ -190,6 +197,12 @@ lowercased. Example: working in ~/Claude/mcp-memory-server/ -> projectId
 "mcp-memory-server". If unsure, call list_projects first to see existing
 project names. Omit projectId for memories that aren't project-specific
 (user preferences, system setup, workflow rules).
+
+Entity names are globally unique across all projects. Use descriptive,
+project-specific names to avoid collisions. Prefer "PostgreSQL config for
+webapp" over generic names like "Database" or "Config". If create_entities
+reports a skipped entity due to a name collision, create a new entity with
+a more specific name.
 ```
 
 ### Per-project CLAUDE.md
@@ -205,16 +218,18 @@ projectId for memory server: `<project-directory-name>`
 
 ## Entity Type Changes
 
-The `Entity` interface gains an optional `project` field:
+The `Entity` interface gains a required `project` field:
 
 ```typescript
 export interface Entity {
   name: string;
   entityType: string;
   observations: Observation[];
-  project?: string | null;  // null or undefined = global
+  project: string | null;  // null = global, never undefined
 }
 ```
+
+The field is **not optional** — stores must always set it explicitly to either a project name string or `null`. This ensures consistent wire format: `JSON.stringify` always includes `"project": null` or `"project": "name"`, never omitting the field. The Zod output schema `z.string().nullable()` matches this exactly.
 
 `EntityInput` does NOT gain a project field. The `projectId` is passed as a separate parameter to `createEntities()`, not per-entity. This keeps the API clean — all entities in a single `create_entities` call share the same project scope. The `Entity` output type has `project` because it reflects what's stored.
 
@@ -235,8 +250,9 @@ New test cases added to the existing parameterized suite (`describe.each` across
 - `list_projects` returns distinct project names, sorted, excludes null
 - `list_projects` on empty database returns empty array
 - Normalization: uppercase/whitespace projectId is lowercased/trimmed
-- Empty string projectId after trim is treated as global (null)
-- Relations are included when at least one endpoint is in the filtered entity set
+- Relations are included only when both endpoints are in the filtered entity set
+- Cross-project relations are excluded from project-scoped queries (no dangling edges)
+- `createEntities` with cross-project name collision returns skipped array with existing project info
 - Existing tests pass unchanged (backward compatibility)
 
 SQLite-specific:
@@ -245,9 +261,30 @@ SQLite-specific:
 
 ---
 
+## Collision Handling
+
+Entity names are globally unique across all projects. This is a **permanent architectural constraint** — relations use entity names as foreign keys, so relaxing this would require changing the relation schema.
+
+When `createEntities` is called with a `projectId` and an entity name already exists in a **different** project, the entity is skipped (not created). To help the caller understand why, `createEntities` returns a `skipped` array alongside the created entities:
+
+```typescript
+// Return type for createEntities
+{
+  created: Entity[];           // entities that were actually created
+  skipped: SkippedEntity[];    // entities that were skipped due to name collision
+}
+
+type SkippedEntity = {
+  name: string;                // the entity name that collided
+  existingProject: string | null;  // which project owns the existing entity
+};
+```
+
+This gives the LLM enough information to create a differently-named entity instead of silently losing data. When there are no collisions, `skipped` is an empty array.
+
 ## Known Limitations
 
-- Entity names remain globally unique across all projects. Two projects cannot have entities with the same name. This is consistent with the existing UNIQUE constraint and avoids ambiguity in relation endpoints.
+- Entity names are globally unique — two projects cannot have entities with the same name. See "Collision Handling" above.
 - No tool for changing an entity's project after creation. If needed, delete and recreate. This avoids partial-update complexity.
 - JSONL backend: no index on project — filtering is a linear scan (consistent with all other JSONL operations).
 
