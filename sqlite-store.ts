@@ -18,6 +18,9 @@ import {
   type AddObservationResult,
   type SkippedEntity,
   type CreateEntitiesResult,
+  type PaginationParams,
+  type PaginatedKnowledgeGraph,
+  InvalidCursorError,
 } from './types.js';
 import { JsonlStore } from './jsonl-store.js';
 
@@ -57,6 +60,81 @@ function escapeLike(query: string): string {
 // Max parameters per SQL IN clause. SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999.
 // We use 900 to leave headroom for other parameters in the same query.
 const CHUNK_SIZE = 900;
+
+/** Default number of entities per page when limit is not specified. */
+const DEFAULT_PAGE_SIZE = 40;
+
+/** Maximum allowed page size to prevent excessive responses. */
+const MAX_PAGE_SIZE = 100;
+
+/**
+ * Internal cursor payload -- encoded as base64 JSON in the opaque cursor string.
+ * u: updatedAt of last entity on page (sort key)
+ * i: SQLite entity id (tiebreaker for stable ordering)
+ * n: entity name (tiebreaker for JSONL backend -- unused by SQLite but preserved for compatibility)
+ * q: query fingerprint (prevents using a cursor from one query on a different query)
+ */
+interface CursorPayload {
+  u: string;   // updatedAt timestamp of the last entity on the page
+  i: number;   // SQLite entity id for tiebreaking when timestamps are equal
+  n?: string;  // entity name -- unused by SQLite, included for JSONL compat
+  q: string;   // query fingerprint -- must match for cursor reuse
+}
+
+/**
+ * Encodes a cursor payload as a base64 JSON string.
+ * The cursor is opaque to callers -- they pass it back verbatim on the next request.
+ *
+ * @param payload - Internal cursor data with sort position and query fingerprint
+ * @returns Base64-encoded string that the caller treats as an opaque token
+ */
+function encodeCursor(payload: CursorPayload): string {
+  // Buffer.from().toString('base64') is Node's standard base64 encoding
+  return Buffer.from(JSON.stringify(payload)).toString('base64');
+}
+
+/**
+ * Decodes and validates a base64 cursor string.
+ * Checks structural validity (required fields and types) and query fingerprint match.
+ * Throws InvalidCursorError on any problem -- never silently falls back to page 1.
+ *
+ * @param cursor - Base64-encoded cursor string from the client
+ * @param expectedFingerprint - The query fingerprint for the current request
+ * @returns Validated CursorPayload with sort position info
+ * @throws InvalidCursorError if cursor is malformed or doesn't match the current query
+ */
+function decodeCursor(cursor: string, expectedFingerprint: string): CursorPayload {
+  try {
+    // Decode base64 -> UTF-8 -> JSON parse
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
+    // Validate required fields have correct types
+    if (typeof parsed.u !== 'string' || typeof parsed.i !== 'number' || typeof parsed.q !== 'string') {
+      throw new InvalidCursorError('Cursor has invalid structure');
+    }
+    // Ensure the cursor was created for this exact query (prevents cross-query reuse)
+    if (parsed.q !== expectedFingerprint) {
+      throw new InvalidCursorError('Cursor does not match current query');
+    }
+    return parsed;
+  } catch (err) {
+    // Re-throw our own error type; wrap everything else as malformed
+    if (err instanceof InvalidCursorError) throw err;
+    throw new InvalidCursorError('Cursor is malformed');
+  }
+}
+
+/**
+ * Clamps a user-provided limit to the valid range [1, MAX_PAGE_SIZE],
+ * defaulting to DEFAULT_PAGE_SIZE when not provided.
+ *
+ * @param limit - User-provided limit, may be undefined
+ * @returns Clamped page size between 1 and MAX_PAGE_SIZE
+ */
+function clampLimit(limit?: number): number {
+  if (limit === undefined) return DEFAULT_PAGE_SIZE;
+  // Math.max/min ensures the value stays within [1, MAX_PAGE_SIZE]
+  return Math.max(1, Math.min(limit, MAX_PAGE_SIZE));
+}
 
 /**
  * SQLite-backed knowledge graph store. Uses WAL mode for concurrent read performance
@@ -588,108 +666,247 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
-   * Returns the knowledge graph, optionally filtered by project.
-   * When projectId is provided, returns entities belonging to that project
-   * plus global entities (project IS NULL). Relations are included only
-   * when both endpoints are in the filtered entity set.
-   * When projectId is omitted, returns the entire unfiltered graph.
+   * Returns the knowledge graph, optionally filtered by project, with cursor-based pagination.
+   * Entities are sorted by most recently updated first (updated_at DESC, id DESC).
+   * When pagination is omitted (undefined), returns ALL matching entities -- this preserves
+   * backward compatibility for tests and migration code that call readGraph() directly.
+   * When pagination is provided, applies keyset pagination with limit+1 fetch to detect next page.
    *
    * @param projectId - Optional project name to filter by; normalized to lowercase/trimmed
+   * @param pagination - Optional cursor and limit for paginated results; omit for all results
+   * @returns PaginatedKnowledgeGraph with entities, relations, nextCursor, and totalCount
    */
-  async readGraph(projectId?: string): Promise<KnowledgeGraph> {
-    let entityRows: { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
+  async readGraph(projectId?: string, pagination?: PaginationParams): Promise<PaginatedKnowledgeGraph> {
+    const fingerprint = `readGraph:${projectId ?? ''}`;
 
-    if (projectId) {
-      const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
-      // Return entities matching the project OR global entities (project IS NULL)
-      entityRows = this.db.prepare(
-        'SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities WHERE project = ? OR project IS NULL'
-      ).all(normalizedProject) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
-    } else {
-      entityRows = this.db.prepare(
-        'SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities'
-      ).all() as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
+    // When pagination is undefined, return all results (backward compat).
+    // When provided, clamp the limit to valid range and optionally decode cursor.
+    const isPaginated = pagination !== undefined;
+    const limit = isPaginated ? clampLimit(pagination.limit) : undefined;
+
+    let cursor: CursorPayload | undefined;
+    if (pagination?.cursor) {
+      cursor = decodeCursor(pagination.cursor, fingerprint);
     }
 
-    const entities = this.buildEntities(entityRows);
+    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
 
-    if (projectId) {
-      // When filtering by project, use getConnectedRelations to fetch only
-      // relations touching our entity set (SQL-level filtering via idx_relations_to_entity),
-      // then AND-filter to keep only relations where both endpoints are in the set
-      const entityNames = new Set(entityRows.map(e => e.name));
-      const connectedRelations = this.getConnectedRelations(entityRows.map(e => e.name));
+    // Build the WHERE clause dynamically based on project filter and cursor position.
+    // Conditions array collects SQL fragments; params array collects bound values.
+    const conditions: string[] = [];
+    const params: (string | number)[] = [];
+
+    if (normalizedProject) {
+      // Include entities belonging to this project OR global entities (project IS NULL)
+      conditions.push('(project = ? OR project IS NULL)');
+      params.push(normalizedProject);
+    }
+
+    if (cursor) {
+      // Keyset condition: fetch entities "after" the cursor position in DESC order.
+      // An entity comes after the cursor if its updated_at is earlier (less than),
+      // or if updated_at is the same but its id is smaller (tiebreaker).
+      conditions.push('(updated_at < ? OR (updated_at = ? AND id < ?))');
+      params.push(cursor.u, cursor.u, cursor.i);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    // When paginated, fetch limit+1 rows to detect if there's a next page without a separate COUNT query.
+    // When not paginated, omit LIMIT entirely to return all rows.
+    const limitClause = limit !== undefined ? `LIMIT ?` : '';
+    const queryParams = limit !== undefined ? [...params, limit + 1] : params;
+
+    const entityRows = this.db.prepare(`
+      SELECT name, entity_type AS entityType, project, updated_at, created_at, id
+      FROM entities
+      ${whereClause}
+      ORDER BY updated_at DESC, id DESC
+      ${limitClause}
+    `).all(...queryParams) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string; id: number }[];
+
+    // Determine if there's a next page (only possible when paginated)
+    let hasMore = false;
+    let pageRows: typeof entityRows;
+    if (limit !== undefined) {
+      // If we got more rows than the limit, there's another page
+      hasMore = entityRows.length > limit;
+      pageRows = hasMore ? entityRows.slice(0, limit) : entityRows;
+    } else {
+      // Not paginated -- all rows are the page
+      pageRows = entityRows;
+    }
+
+    // Build the next cursor from the last entity on this page
+    let nextCursor: string | null = null;
+    if (hasMore && pageRows.length > 0) {
+      const last = pageRows[pageRows.length - 1];
+      nextCursor = encodeCursor({ u: last.updated_at, i: last.id, n: last.name, q: fingerprint });
+    }
+
+    // Count total matching entities (same WHERE conditions but without cursor/limit).
+    // This tells the caller how many entities match overall, not just this page.
+    const countConditions: string[] = [];
+    const countParams: (string | number)[] = [];
+    if (normalizedProject) {
+      countConditions.push('(project = ? OR project IS NULL)');
+      countParams.push(normalizedProject);
+    }
+    const countWhere = countConditions.length > 0 ? `WHERE ${countConditions.join(' AND ')}` : '';
+    const totalCount = (this.db.prepare(
+      `SELECT COUNT(*) AS cnt FROM entities ${countWhere}`
+    ).get(...countParams) as { cnt: number }).cnt;
+
+    // Build full Entity objects with observations from the page rows
+    const entities = this.buildEntities(pageRows);
+
+    // Relations: when paginated or project-filtered, only include relations where
+    // both endpoints are in the current page's entity set.
+    // When not paginated and not project-filtered, return all relations (backward compat).
+    if (isPaginated || projectId) {
+      const entityNames = new Set(pageRows.map(e => e.name));
+      const connectedRelations = this.getConnectedRelations(pageRows.map(e => e.name));
       const filteredRelations = connectedRelations.filter(r =>
         entityNames.has(r.from) && entityNames.has(r.to)
       );
-      return { entities, relations: filteredRelations };
+      return { entities, relations: filteredRelations, nextCursor, totalCount };
     }
 
-    // Unscoped: return all relations (backward compatible)
+    // Unscoped + unpaginated: return all relations (backward compatible with original behavior)
     const relations = this.db.prepare(
       'SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType FROM relations'
     ).all() as Relation[];
 
-    return { entities, relations };
+    return { entities, relations, nextCursor, totalCount };
   }
 
   /**
    * Searches entities by case-insensitive substring match against name, entityType,
-   * or observation content. Uses LIKE with escaped wildcards.
-   * When projectId is provided, results are restricted to entities belonging to
-   * the project or global entities (project IS NULL).
+   * or observation content. Results are paginated by most recently updated first.
+   * When pagination is omitted (undefined), returns ALL matching entities -- backward compat.
    *
    * SQLite's LIKE is case-insensitive for ASCII characters (A-Z) by default.
    * For full Unicode case folding, FTS5 with ICU would be needed.
    *
-   * @param query - The search string, matched as a case-insensitive substring
+   * Uses a subquery pattern to find matching entity IDs first (via LEFT JOIN + DISTINCT),
+   * then applies keyset pagination on the outer query. This avoids the
+   * DISTINCT + ORDER BY interaction issue that would occur with a flat query.
+   *
+   * @param query - Case-insensitive substring to search for
    * @param projectId - Optional project name; only returns entities in this project or global
-   * @returns Matching entities + relations where both endpoints are in the result set
+   * @param pagination - Optional cursor and limit for paginated results; omit for all results
+   * @returns PaginatedKnowledgeGraph with matching entities, relations, nextCursor, and totalCount
    */
-  async searchNodes(query: string, projectId?: string): Promise<KnowledgeGraph> {
-    const escaped = escapeLike(query);
-    const pattern = `%${escaped}%`;
+  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams): Promise<PaginatedKnowledgeGraph> {
+    const fingerprint = `searchNodes:${projectId ?? ''}:${query}`;
 
-    let entityRows: { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
+    // When pagination is undefined, return all results (backward compat).
+    const isPaginated = pagination !== undefined;
+    const limit = isPaginated ? clampLimit(pagination.limit) : undefined;
 
-    if (projectId) {
-      const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
-      // Find entities matching the query AND belonging to the project or global
-      entityRows = this.db.prepare(`
-        SELECT DISTINCT e.name, e.entity_type AS entityType, e.project, e.updated_at, e.created_at
-        FROM entities e
-        LEFT JOIN observations o ON o.entity_id = e.id
-        WHERE (e.name LIKE ? ESCAPE '\\'
-           OR e.entity_type LIKE ? ESCAPE '\\'
-           OR o.content LIKE ? ESCAPE '\\')
-          AND (e.project = ? OR e.project IS NULL)
-      `).all(pattern, pattern, pattern, normalizedProject) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
-    } else {
-      // No project filter -- search across all entities
-      entityRows = this.db.prepare(`
-        SELECT DISTINCT e.name, e.entity_type AS entityType, e.project, e.updated_at, e.created_at
-        FROM entities e
-        LEFT JOIN observations o ON o.entity_id = e.id
-        WHERE e.name LIKE ? ESCAPE '\\'
-           OR e.entity_type LIKE ? ESCAPE '\\'
-           OR o.content LIKE ? ESCAPE '\\'
-      `).all(pattern, pattern, pattern) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
+    let cursor: CursorPayload | undefined;
+    if (pagination?.cursor) {
+      cursor = decodeCursor(pagination.cursor, fingerprint);
     }
 
-    const entities = this.buildEntities(entityRows);
-    // When project-filtered, use AND logic for relations (both endpoints in result set);
-    // when unfiltered, use OR logic (at least one endpoint matches) for backward compat
-    const entityNames = new Set(entityRows.map(e => e.name));
-    if (projectId) {
-      const allRelations = this.getConnectedRelations(entityRows.map(e => e.name));
+    // Escape LIKE wildcards so user input like "100%" matches literally
+    const escaped = escapeLike(query);
+    const pattern = `%${escaped}%`;
+    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
+
+    // Build WHERE conditions for the outer query on the entities table.
+    // The search matching is done via a subquery that finds entity IDs matching
+    // name/type/observation content, keeping DISTINCT inside the subquery.
+    const conditions: string[] = [];
+    const params: (string | number)[] = [];
+
+    // Subquery: find entity IDs that match the search term.
+    // The LEFT JOIN on observations allows matching against observation content.
+    // DISTINCT ensures each entity ID appears once even if multiple observations match.
+    let subquery = `
+      SELECT DISTINCT e2.id FROM entities e2
+      LEFT JOIN observations o ON o.entity_id = e2.id
+      WHERE (e2.name LIKE ? ESCAPE '\\' OR e2.entity_type LIKE ? ESCAPE '\\' OR o.content LIKE ? ESCAPE '\\')
+    `;
+    // Subquery params: the three LIKE patterns
+    params.push(pattern, pattern, pattern);
+
+    if (normalizedProject) {
+      subquery += ' AND (e2.project = ? OR e2.project IS NULL)';
+      params.push(normalizedProject);
+    }
+
+    // The outer query selects from entities WHERE id is in the subquery result set
+    conditions.push(`id IN (${subquery})`);
+
+    // Cursor condition for keyset pagination (applied to outer query)
+    if (cursor) {
+      conditions.push('(updated_at < ? OR (updated_at = ? AND id < ?))');
+      params.push(cursor.u, cursor.u, cursor.i);
+    }
+
+    const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+    // When paginated, fetch limit+1 to detect next page; otherwise fetch all
+    const limitClause = limit !== undefined ? `LIMIT ?` : '';
+    const queryParams = limit !== undefined ? [...params, limit + 1] : params;
+
+    const entityRows = this.db.prepare(`
+      SELECT name, entity_type AS entityType, project, updated_at, created_at, id
+      FROM entities
+      ${whereClause}
+      ORDER BY updated_at DESC, id DESC
+      ${limitClause}
+    `).all(...queryParams) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string; id: number }[];
+
+    // Determine if there's a next page
+    let hasMore = false;
+    let pageRows: typeof entityRows;
+    if (limit !== undefined) {
+      hasMore = entityRows.length > limit;
+      pageRows = hasMore ? entityRows.slice(0, limit) : entityRows;
+    } else {
+      pageRows = entityRows;
+    }
+
+    // Build next cursor from the last entity on this page
+    let nextCursor: string | null = null;
+    if (hasMore && pageRows.length > 0) {
+      const last = pageRows[pageRows.length - 1];
+      nextCursor = encodeCursor({ u: last.updated_at, i: last.id, n: last.name, q: fingerprint });
+    }
+
+    // Count total matching entities (same search/project conditions, no cursor/limit).
+    // Uses COUNT(DISTINCT id) because the LEFT JOIN can produce duplicates.
+    const countParams: (string | number)[] = [pattern, pattern, pattern];
+    let countSql = `
+      SELECT COUNT(DISTINCT e2.id) AS cnt FROM entities e2
+      LEFT JOIN observations o ON o.entity_id = e2.id
+      WHERE (e2.name LIKE ? ESCAPE '\\' OR e2.entity_type LIKE ? ESCAPE '\\' OR o.content LIKE ? ESCAPE '\\')
+    `;
+    if (normalizedProject) {
+      countSql += ' AND (e2.project = ? OR e2.project IS NULL)';
+      countParams.push(normalizedProject);
+    }
+    const totalCount = (this.db.prepare(countSql).get(...countParams) as { cnt: number }).cnt;
+
+    // Build full Entity objects with observations
+    const entities = this.buildEntities(pageRows);
+
+    // Relations: when paginated or project-filtered, both endpoints must be in the page.
+    // When not paginated and not project-filtered, use OR logic (backward compat).
+    const entityNames = new Set(pageRows.map(e => e.name));
+    if (isPaginated || projectId) {
+      const allRelations = this.getConnectedRelations(pageRows.map(e => e.name));
       const filteredRelations = allRelations.filter(r =>
         entityNames.has(r.from) && entityNames.has(r.to)
       );
-      return { entities, relations: filteredRelations };
+      return { entities, relations: filteredRelations, nextCursor, totalCount };
     }
 
-    const relations = this.getConnectedRelations(entityRows.map(e => e.name));
-    return { entities, relations };
+    // Unscoped + unpaginated: OR logic for relations (at least one endpoint matches)
+    const relations = this.getConnectedRelations(pageRows.map(e => e.name));
+    return { entities, relations, nextCursor, totalCount };
   }
 
   /**
