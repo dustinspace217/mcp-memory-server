@@ -135,13 +135,22 @@ export class SqliteStore implements GraphStore {
       );
     `);
 
-    // Migration: add project column if upgrading from an older schema.
-    // SQLite's ALTER TABLE ADD COLUMN is safe with IF NOT EXISTS via a try/catch.
-    try {
-      this.db.exec('ALTER TABLE entities ADD COLUMN project TEXT');
-    } catch {
-      // Column already exists -- safe to ignore "duplicate column name" error
+    // Migrate: add project column if upgrading from pre-Phase-3 schema.
+    // Uses pragma table_info to check if the column exists (spec-prescribed approach).
+    const columns = this.db.pragma('table_info(entities)') as { name: string }[];
+    const hasProject = columns.some(c => c.name === 'project');
+    if (!hasProject) {
+      this.db.exec(`
+        ALTER TABLE entities ADD COLUMN project TEXT;
+        CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project);
+      `);
     }
+
+    // Create the project index if it doesn't exist yet (idempotent).
+    // For new databases, the column is in CREATE TABLE but the index still needs creating.
+    // For migrated databases, the migration block above already created it,
+    // but IF NOT EXISTS makes this a safe no-op in that case.
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project);');
 
     // --- Run migration if data was loaded from JSONL ---
     if (migrationData) {
@@ -172,7 +181,7 @@ export class SqliteStore implements GraphStore {
   private migrateFromJsonl(graph: KnowledgeGraph): void {
     // Prepared statements are compiled once and reused for every row in the transaction
     const insertEntity = this.db.prepare(
-      'INSERT OR IGNORE INTO entities (name, entity_type) VALUES (?, ?)'
+      'INSERT OR IGNORE INTO entities (name, entity_type, project) VALUES (?, ?, ?)'
     );
     // Used to look up the auto-assigned id after inserting an entity
     const getEntityId = this.db.prepare(
@@ -189,7 +198,8 @@ export class SqliteStore implements GraphStore {
     const txn = this.db.transaction(() => {
       for (const entity of graph.entities) {
         // INSERT OR IGNORE: if name already exists (duplicate in JSONL), skip silently
-        insertEntity.run(entity.name, entity.entityType);
+        // entity.project comes from the JSONL data (null for pre-Phase-3 data)
+        insertEntity.run(entity.name, entity.entityType, entity.project ?? null);
         const row = getEntityId.get(entity.name) as { id: number };
         for (const obs of entity.observations) {
           // obs is already a normalized Observation object (JsonlStore.readGraph() calls normalizeObservation)

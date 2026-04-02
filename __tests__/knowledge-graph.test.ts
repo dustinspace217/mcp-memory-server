@@ -1385,4 +1385,68 @@ describe('SqliteStore-specific', () => {
 			expect(result[0].addedObservations[0].content).toBe('new one');
 		});
 	});
+
+	describe('project column migration', () => {
+		it('should migrate existing database by adding project column', async () => {
+			const migrationPath = path.join(testDir, `test-migration-project-${Date.now()}.db`);
+
+			// Create a pre-Phase-3 database manually (no project column).
+			// Imports better-sqlite3 directly to build a schema without the project column,
+			// simulating a database created before Phase 3 was implemented.
+			const Database = (await import('better-sqlite3')).default;
+			const rawDb = new Database(migrationPath);
+			rawDb.pragma('journal_mode = WAL');
+			rawDb.pragma('foreign_keys = ON');
+			rawDb.exec(`
+				CREATE TABLE IF NOT EXISTS entities (
+					id          INTEGER PRIMARY KEY AUTOINCREMENT,
+					name        TEXT NOT NULL UNIQUE,
+					entity_type TEXT NOT NULL
+				);
+				CREATE TABLE IF NOT EXISTS observations (
+					id          INTEGER PRIMARY KEY AUTOINCREMENT,
+					entity_id   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+					content     TEXT NOT NULL,
+					created_at  TEXT NOT NULL,
+					UNIQUE(entity_id, content)
+				);
+				CREATE TABLE IF NOT EXISTS relations (
+					id            INTEGER PRIMARY KEY AUTOINCREMENT,
+					from_entity   TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+					to_entity     TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+					relation_type TEXT NOT NULL,
+					UNIQUE(from_entity, to_entity, relation_type)
+				);
+			`);
+			// Insert a legacy entity without a project column
+			rawDb.prepare('INSERT INTO entities (name, entity_type) VALUES (?, ?)').run('OldEntity', 'test');
+			const entityId = (rawDb.prepare('SELECT id FROM entities WHERE name = ?').get('OldEntity') as { id: number }).id;
+			rawDb.prepare('INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)').run(entityId, 'old data', new Date().toISOString());
+			rawDb.close();
+
+			// Re-open with SqliteStore -- init() should detect missing project column and add it
+			const store2 = new SqliteStore(migrationPath);
+			await store2.init();
+
+			// Old entity should have null project after migration
+			const graph = await store2.readGraph();
+			expect(graph.entities[0].project).toBeNull();
+
+			// Verify new entities can be created with a project
+			await store2.createEntities(
+				[{ name: 'NewEntity', entityType: 'test', observations: ['new data'] }],
+				'test-project'
+			);
+			// readGraph with project filter returns project entities + global (null project) entities
+			const graph2 = await store2.readGraph('test-project');
+			const names = graph2.entities.map(e => e.name).sort();
+			expect(names).toEqual(['NewEntity', 'OldEntity']); // OldEntity is global, included
+
+			await store2.close();
+			// Clean up all SQLite sidecar files
+			for (const suffix of ['', '-wal', '-shm']) {
+				try { await fs.unlink(migrationPath + suffix); } catch { /* ignore */ }
+			}
+		});
+	});
 });
