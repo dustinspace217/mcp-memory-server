@@ -6,6 +6,7 @@ import Database from 'better-sqlite3';
 import { promises as fs } from 'fs';
 import {
   createObservation,
+  ENTITY_TIMESTAMP_SENTINEL,
   type Observation,
   type Entity,
   type Relation,
@@ -146,6 +147,38 @@ export class SqliteStore implements GraphStore {
       `);
     }
 
+    // Migrate: add updated_at and created_at columns if upgrading from pre-Phase-4 schema.
+    // These timestamps track when the entity itself was last modified and when it was first created.
+    // Uses the same pragma table_info check pattern as the project column migration above.
+    const hasUpdatedAt = columns.some(c => c.name === 'updated_at');
+    if (!hasUpdatedAt) {
+      this.db.exec(`
+        ALTER TABLE entities ADD COLUMN updated_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}';
+        ALTER TABLE entities ADD COLUMN created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}';
+      `);
+      // Backfill updated_at from the most recent observation timestamp.
+      // Entities with no valid observation timestamps keep the sentinel value.
+      this.db.exec(`
+        UPDATE entities SET updated_at = (
+          SELECT MAX(created_at) FROM observations
+          WHERE entity_id = entities.id AND created_at != 'unknown'
+        )
+        WHERE updated_at = '${ENTITY_TIMESTAMP_SENTINEL}' AND EXISTS (
+          SELECT 1 FROM observations WHERE entity_id = entities.id AND created_at != 'unknown'
+        );
+      `);
+      // Also backfill created_at from the earliest observation timestamp
+      this.db.exec(`
+        UPDATE entities SET created_at = (
+          SELECT MIN(created_at) FROM observations
+          WHERE entity_id = entities.id AND created_at != 'unknown'
+        )
+        WHERE created_at = '${ENTITY_TIMESTAMP_SENTINEL}' AND EXISTS (
+          SELECT 1 FROM observations WHERE entity_id = entities.id AND created_at != 'unknown'
+        );
+      `);
+    }
+
     // Create indexes if they don't exist yet (idempotent).
     // idx_entities_project: speeds up project-filtered entity queries.
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
@@ -153,6 +186,12 @@ export class SqliteStore implements GraphStore {
     // in getConnectedRelations needs its own index to avoid full table scans.
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project);');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_relations_to_entity ON relations(to_entity);');
+
+    // Pagination indexes for keyset queries on (updated_at DESC, id DESC).
+    // The composite index with project as leftmost column supports project-scoped reads.
+    // The standalone index supports unscoped reads.
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_project_updated ON entities(project, updated_at DESC, id DESC);');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_updated ON entities(updated_at DESC, id DESC);');
 
     // --- Run migration if data was loaded from JSONL ---
     if (migrationData) {
@@ -181,9 +220,12 @@ export class SqliteStore implements GraphStore {
    * @param graph - KnowledgeGraph loaded from the JSONL file by JsonlStore.readGraph()
    */
   private migrateFromJsonl(graph: KnowledgeGraph): void {
+    // Capture the current time once for the migration batch (used as fallback for missing timestamps)
+    const now = new Date().toISOString();
+
     // Prepared statements are compiled once and reused for every row in the transaction
     const insertEntity = this.db.prepare(
-      'INSERT OR IGNORE INTO entities (name, entity_type, project) VALUES (?, ?, ?)'
+      'INSERT OR IGNORE INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, ?, ?, ?)'
     );
     // Used to look up the auto-assigned id after inserting an entity
     const getEntityId = this.db.prepare(
@@ -208,7 +250,11 @@ export class SqliteStore implements GraphStore {
         const migratedProject = typeof entity.project === 'string'
           ? entity.project.trim().toLowerCase().normalize('NFC') || null
           : null;
-        insertEntity.run(entity.name, entity.entityType, migratedProject);
+        // Use the entity's timestamps if available (from JSONL files written after Phase 4),
+        // otherwise fall back to the sentinel value for legacy data
+        const entityUpdatedAt = entity.updatedAt || ENTITY_TIMESTAMP_SENTINEL;
+        const entityCreatedAt = entity.createdAt || ENTITY_TIMESTAMP_SENTINEL;
+        insertEntity.run(entity.name, entity.entityType, migratedProject, entityUpdatedAt, entityCreatedAt);
         const row = getEntityId.get(entity.name) as { id: number };
         for (const obs of entity.observations) {
           // obs is already a normalized Observation object (JsonlStore.readGraph() calls normalizeObservation)
@@ -261,9 +307,12 @@ export class SqliteStore implements GraphStore {
     // Normalize the project ID: trim whitespace, lowercase, NFC normalize, or null for global
     const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC') || null;
 
+    // Capture the current time once for all entities in this batch (consistent timestamps)
+    const now = new Date().toISOString();
+
     // Prepared statements are compiled once and reused -- faster than db.exec() per row
     const insertEntity = this.db.prepare(
-      'INSERT OR IGNORE INTO entities (name, entity_type, project) VALUES (?, ?, ?)'
+      'INSERT OR IGNORE INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, ?, ?, ?)'
     );
     const getEntityId = this.db.prepare(
       'SELECT id FROM entities WHERE name = ?'
@@ -284,7 +333,7 @@ export class SqliteStore implements GraphStore {
     const txn = this.db.transaction(() => {
       for (const e of entities) {
         // INSERT OR IGNORE returns changes=0 if the name already exists (UNIQUE constraint)
-        const info = insertEntity.run(e.name, e.entityType, normalizedProject);
+        const info = insertEntity.run(e.name, e.entityType, normalizedProject, now, now);
         if (info.changes === 0) {
           // Entity already exists -- report it as skipped with its existing project
           const existing = getExistingProject.get(e.name) as { project: string | null } | undefined;
@@ -307,7 +356,7 @@ export class SqliteStore implements GraphStore {
           }
         }
 
-        created.push({ name: e.name, entityType: e.entityType, observations, project: normalizedProject });
+        created.push({ name: e.name, entityType: e.entityType, observations, project: normalizedProject, updatedAt: now, createdAt: now });
       }
     });
     txn();
@@ -358,6 +407,10 @@ export class SqliteStore implements GraphStore {
     const insertObs = this.db.prepare(
       'INSERT OR IGNORE INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)'
     );
+    // Prepared statement to bump updated_at when observations are added to an entity
+    const updateTimestamp = this.db.prepare(
+      'UPDATE entities SET updated_at = ? WHERE id = ?'
+    );
 
     const results: AddObservationResult[] = [];
 
@@ -375,6 +428,11 @@ export class SqliteStore implements GraphStore {
           if (info.changes > 0) {
             addedObservations.push(obs);
           }
+        }
+
+        // Bump the entity's updated_at if any observations were actually added
+        if (addedObservations.length > 0) {
+          updateTimestamp.run(new Date().toISOString(), row.id);
         }
 
         results.push({ entityName: o.entityName, addedObservations });
@@ -413,6 +471,10 @@ export class SqliteStore implements GraphStore {
     const delObs = this.db.prepare(
       'DELETE FROM observations WHERE entity_id = ? AND content = ?'
     );
+    // Prepared statement to bump updated_at when observations are removed from an entity
+    const updateTimestamp = this.db.prepare(
+      'UPDATE entities SET updated_at = ? WHERE id = ?'
+    );
 
     const txn = this.db.transaction(() => {
       for (const d of deletions) {
@@ -421,6 +483,8 @@ export class SqliteStore implements GraphStore {
         for (const content of d.contents) {
           delObs.run(row.id, content);
         }
+        // Bump updated_at — the entity's content has changed
+        updateTimestamp.run(new Date().toISOString(), row.id);
       }
     });
     txn();
@@ -453,7 +517,7 @@ export class SqliteStore implements GraphStore {
    * @param entityRows - Array of { name, entityType, project } from an entities query
    * @returns Entity array with observations attached
    */
-  private buildEntities(entityRows: { name: string; entityType: string; project: string | null }[]): Entity[] {
+  private buildEntities(entityRows: { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[]): Entity[] {
     if (entityRows.length === 0) return [];
 
     const names = entityRows.map(e => e.name);
@@ -483,6 +547,8 @@ export class SqliteStore implements GraphStore {
       entityType: e.entityType,
       observations: obsMap.get(e.name) || [],
       project: e.project,
+      updatedAt: e.updated_at,
+      createdAt: e.created_at,
     }));
   }
 
@@ -534,18 +600,18 @@ export class SqliteStore implements GraphStore {
    * @param projectId - Optional project name to filter by; normalized to lowercase/trimmed
    */
   async readGraph(projectId?: string): Promise<KnowledgeGraph> {
-    let entityRows: { name: string; entityType: string; project: string | null }[];
+    let entityRows: { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
 
     if (projectId) {
       const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
       // Return entities matching the project OR global entities (project IS NULL)
       entityRows = this.db.prepare(
-        'SELECT name, entity_type AS entityType, project FROM entities WHERE project = ? OR project IS NULL'
-      ).all(normalizedProject) as { name: string; entityType: string; project: string | null }[];
+        'SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities WHERE project = ? OR project IS NULL'
+      ).all(normalizedProject) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
     } else {
       entityRows = this.db.prepare(
-        'SELECT name, entity_type AS entityType, project FROM entities'
-      ).all() as { name: string; entityType: string; project: string | null }[];
+        'SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities'
+      ).all() as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
     }
 
     const entities = this.buildEntities(entityRows);
@@ -587,30 +653,30 @@ export class SqliteStore implements GraphStore {
     const escaped = escapeLike(query);
     const pattern = `%${escaped}%`;
 
-    let entityRows: { name: string; entityType: string; project: string | null }[];
+    let entityRows: { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
 
     if (projectId) {
       const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
       // Find entities matching the query AND belonging to the project or global
       entityRows = this.db.prepare(`
-        SELECT DISTINCT e.name, e.entity_type AS entityType, e.project
+        SELECT DISTINCT e.name, e.entity_type AS entityType, e.project, e.updated_at, e.created_at
         FROM entities e
         LEFT JOIN observations o ON o.entity_id = e.id
         WHERE (e.name LIKE ? ESCAPE '\\'
            OR e.entity_type LIKE ? ESCAPE '\\'
            OR o.content LIKE ? ESCAPE '\\')
           AND (e.project = ? OR e.project IS NULL)
-      `).all(pattern, pattern, pattern, normalizedProject) as { name: string; entityType: string; project: string | null }[];
+      `).all(pattern, pattern, pattern, normalizedProject) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
     } else {
       // No project filter -- search across all entities
       entityRows = this.db.prepare(`
-        SELECT DISTINCT e.name, e.entity_type AS entityType, e.project
+        SELECT DISTINCT e.name, e.entity_type AS entityType, e.project, e.updated_at, e.created_at
         FROM entities e
         LEFT JOIN observations o ON o.entity_id = e.id
         WHERE e.name LIKE ? ESCAPE '\\'
            OR e.entity_type LIKE ? ESCAPE '\\'
            OR o.content LIKE ? ESCAPE '\\'
-      `).all(pattern, pattern, pattern) as { name: string; entityType: string; project: string | null }[];
+      `).all(pattern, pattern, pattern) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
     }
 
     const entities = this.buildEntities(entityRows);
@@ -642,19 +708,19 @@ export class SqliteStore implements GraphStore {
   async openNodes(names: string[], projectId?: string): Promise<KnowledgeGraph> {
     if (names.length === 0) return { entities: [], relations: [] };
 
-    let entityRows: { name: string; entityType: string; project: string | null }[];
+    let entityRows: { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
 
     if (projectId) {
       const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
       const placeholders = names.map(() => '?').join(',');
       entityRows = this.db.prepare(
-        `SELECT name, entity_type AS entityType, project FROM entities WHERE name IN (${placeholders}) AND (project = ? OR project IS NULL)`
-      ).all(...names, normalizedProject) as { name: string; entityType: string; project: string | null }[];
+        `SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities WHERE name IN (${placeholders}) AND (project = ? OR project IS NULL)`
+      ).all(...names, normalizedProject) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
     } else {
       const placeholders = names.map(() => '?').join(',');
       entityRows = this.db.prepare(
-        `SELECT name, entity_type AS entityType, project FROM entities WHERE name IN (${placeholders})`
-      ).all(...names) as { name: string; entityType: string; project: string | null }[];
+        `SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities WHERE name IN (${placeholders})`
+      ).all(...names) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
     }
 
     const entities = this.buildEntities(entityRows);
