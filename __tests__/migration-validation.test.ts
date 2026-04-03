@@ -180,12 +180,11 @@ describe('Migration safety validation', () => {
     await sqliteStore.close();
   });
 
-  // BUG FOUND: Pre-Phase-4 JSONL entities don't get timestamp backfill during
-  // JSONL→SQLite migration. The Phase 4 backfill only runs on existing pre-Phase-4
-  // SQLite databases, not during JSONL migration (because CREATE TABLE already
-  // includes the columns, so the hasUpdatedAt check passes and backfill is skipped).
-  // See QA plan for proposed fix.
-  it('should handle pre-Phase-4 JSONL (no updatedAt/createdAt on entities) — documents current behavior', async () => {
+  // FIX VERIFIED (#46): Pre-Phase-4 JSONL entities now get timestamp backfill
+  // during JSONL→SQLite migration. The post-migration backfill SQL computes
+  // updatedAt = MAX(observation.createdAt) and createdAt = MIN(observation.createdAt)
+  // for entities that still have sentinel values after migrateFromJsonl().
+  it('should backfill timestamps from observations for pre-Phase-4 JSONL entities (#46 fix)', async () => {
     const id = Date.now();
     jsonlPath = path.join(testDir, `test-no-timestamps-migrate-${id}.jsonl`);
     dbPath = path.join(testDir, `test-no-timestamps-migrate-${id}.db`);
@@ -199,7 +198,7 @@ describe('Migration safety validation', () => {
         { content: 'late obs', createdAt: '2025-06-15T00:00:00.000Z' },
       ],
       project: null,
-      // No updatedAt or createdAt
+      // No updatedAt or createdAt — simulates pre-Phase-4 JSONL
     });
     await fs.writeFile(jsonlPath, line + '\n');
 
@@ -210,17 +209,11 @@ describe('Migration safety validation', () => {
     expect(graph.entities).toHaveLength(1);
     const entity = graph.entities[0];
 
-    // KNOWN BUG: updatedAt and createdAt remain as sentinel instead of being
-    // backfilled from observation timestamps during JSONL→SQLite migration.
-    // The Phase 4 backfill (UPDATE entities SET updated_at = ...) only runs when
-    // upgrading an existing pre-Phase-4 SQLite database, NOT during JSONL migration,
-    // because the table is created with the columns already present.
-    //
-    // IDEAL behavior: updatedAt = '2025-06-15T00:00:00.000Z' (MAX observation)
-    //                 createdAt = '2025-03-01T00:00:00.000Z' (MIN observation)
-    // ACTUAL behavior: both remain as sentinel
-    expect(entity.updatedAt).toBe(ENTITY_TIMESTAMP_SENTINEL);
-    expect(entity.createdAt).toBe(ENTITY_TIMESTAMP_SENTINEL);
+    // Post-migration backfill should compute timestamps from observations:
+    // updatedAt = MAX(observation.createdAt) = '2025-06-15T00:00:00.000Z'
+    // createdAt = MIN(observation.createdAt) = '2025-03-01T00:00:00.000Z'
+    expect(entity.updatedAt).toBe('2025-06-15T00:00:00.000Z');
+    expect(entity.createdAt).toBe('2025-03-01T00:00:00.000Z');
 
     await sqliteStore.close();
   });
@@ -342,7 +335,7 @@ describe('Migration safety validation', () => {
     await sqliteStore.close();
   });
 
-  it('should handle crash-recovery: .db exists but .jsonl not renamed', async () => {
+  it('should NOT re-migrate when .db has data and .jsonl is recreated', async () => {
     const id = Date.now();
     jsonlPath = path.join(testDir, `test-crash-recovery-${id}.jsonl`);
     dbPath = path.join(testDir, `test-crash-recovery-${id}.db`);
@@ -360,12 +353,12 @@ describe('Migration safety validation', () => {
     await sqliteStore1.init();
     await sqliteStore1.close();
 
-    // Simulate crash recovery: recreate the .jsonl file (as if .bak rename failed)
+    // Simulate scenario: recreate the .jsonl file (as if .bak rename failed)
     await fs.writeFile(jsonlPath, JSON.stringify({
       type: 'entity', name: 'ShouldNotMigrate', entityType: 'test', observations: [],
     }) + '\n');
 
-    // Second init should NOT re-migrate because .db already exists
+    // Second init should NOT re-migrate because .db already has data
     const sqliteStore2 = new SqliteStore(dbPath);
     await sqliteStore2.init();
     const graph = await sqliteStore2.readGraph();
@@ -373,5 +366,73 @@ describe('Migration safety validation', () => {
 
     expect(graph.entities.find(e => e.name === 'ShouldNotMigrate')).toBeUndefined();
     expect(graph.entities.find(e => e.name === 'Alice')).toBeDefined();
+  });
+
+  // FIX VERIFIED (#47): If .db exists but is empty (schema-only, zero entities)
+  // AND a .jsonl file exists, the previous migration crashed between new Database()
+  // (which creates the file) and migrateFromJsonl() completing. The fix detects
+  // this state and re-attempts migration.
+  it('should recover from interrupted migration: empty .db with .jsonl present (#47 fix)', async () => {
+    const id = Date.now();
+    jsonlPath = path.join(testDir, `test-empty-db-recovery-${id}.jsonl`);
+    dbPath = path.join(testDir, `test-empty-db-recovery-${id}.db`);
+
+    // Seed JSONL with real data
+    const jsonlStore = new JsonlStore(jsonlPath);
+    await jsonlStore.init();
+    await jsonlStore.createEntities([
+      { name: 'Recovered', entityType: 'test', observations: ['important data'] },
+    ]);
+    await jsonlStore.close();
+
+    // Simulate crash: create an empty .db file with schema but no data.
+    // This is what happens if the process dies after new Database() + CREATE TABLE
+    // but before migrateFromJsonl() completes.
+    // We import better-sqlite3 directly to create the empty schema.
+    const Database = (await import('better-sqlite3')).default;
+    const emptyDb = new Database(dbPath);
+    emptyDb.pragma('journal_mode = WAL');
+    emptyDb.exec(`
+      CREATE TABLE IF NOT EXISTS entities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        entity_type TEXT NOT NULL,
+        project TEXT,
+        updated_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+        created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}'
+      );
+      CREATE TABLE IF NOT EXISTS observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(entity_id, content)
+      );
+      CREATE TABLE IF NOT EXISTS relations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_entity TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+        to_entity TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+        relation_type TEXT NOT NULL,
+        UNIQUE(from_entity, to_entity, relation_type)
+      );
+    `);
+    emptyDb.close();
+
+    // Now init should detect empty .db + existing .jsonl and re-migrate
+    const sqliteStore = new SqliteStore(dbPath);
+    await sqliteStore.init();
+    const graph = await sqliteStore.readGraph();
+
+    // Data should be recovered from the JSONL file
+    expect(graph.entities).toHaveLength(1);
+    expect(graph.entities[0].name).toBe('Recovered');
+    expect(graph.entities[0].observations).toHaveLength(1);
+    expect(graph.entities[0].observations[0].content).toBe('important data');
+
+    // .jsonl should be renamed to .bak after successful recovery
+    const bakExists = await fs.access(jsonlPath + '.bak').then(() => true).catch(() => false);
+    expect(bakExists).toBe(true);
+
+    await sqliteStore.close();
   });
 });

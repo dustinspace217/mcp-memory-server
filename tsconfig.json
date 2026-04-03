@@ -16,6 +16,7 @@
   "include": [
     "index.ts",
     "types.ts",
+    "cursor.ts",
     "jsonl-store.ts",
     "sqlite-store.ts"
   ],

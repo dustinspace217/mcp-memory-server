@@ -211,10 +211,60 @@ export class SqliteStore implements GraphStore {
     // it's redundant and wastes disk space + INSERT/UPDATE overhead.
     this.db.exec('DROP INDEX IF EXISTS idx_entities_project;');
 
+    // --- Crash recovery (#47): detect interrupted migration ---
+    // If the database file already existed but has zero entities, AND a sibling .jsonl
+    // file is present, a previous migration crashed between `new Database()` (which creates
+    // the file) and the end of migrateFromJsonl(). Re-load JSONL data and retry migration.
+    // migrateFromJsonl uses INSERT OR IGNORE, so partial data from the crashed attempt
+    // is safely handled (duplicates are skipped).
+    if (!migrationData && dbAlreadyExists) {
+      const entityCount = (this.db.prepare('SELECT COUNT(*) AS cnt FROM entities').get() as { cnt: number }).cnt;
+      if (entityCount === 0) {
+        const jsonlPath = this.dbPath.replace(/\.(db|sqlite)$/, '.jsonl');
+        if (jsonlPath !== this.dbPath && await fileExists(jsonlPath)) {
+          console.error(`DETECTED: Empty database with ${jsonlPath} present — recovering from interrupted migration`);
+          const jsonlStore = new JsonlStore(jsonlPath);
+          await jsonlStore.init();
+          migrationData = await jsonlStore.readGraph();
+          await jsonlStore.close();
+        }
+      }
+    }
+
     // --- Run migration if data was loaded from JSONL ---
     if (migrationData) {
       const jsonlPath = this.dbPath.replace(/\.(db|sqlite)$/, '.jsonl');
       this.migrateFromJsonl(migrationData);
+
+      // Backfill timestamps for entities still at the sentinel value after migration (#46).
+      // Pre-Phase-4 JSONL files have no updatedAt/createdAt on entities, so migrateFromJsonl()
+      // stores ENTITY_TIMESTAMP_SENTINEL. The Phase-4 schema migration backfill (above) only
+      // runs when adding the columns to an EXISTING database — for FRESH databases the columns
+      // already exist in CREATE TABLE, so that backfill is skipped. This post-migration backfill
+      // closes the gap. Idempotent: the WHERE clause only touches entities with sentinel values.
+      // Wrapped in a transaction so a crash between the two UPDATEs can't leave updated_at
+      // backfilled but created_at still at sentinel (matches the schema-migration pattern above).
+      this.db.transaction(() => {
+        this.db.exec(`
+          UPDATE entities SET updated_at = (
+            SELECT MAX(created_at) FROM observations
+            WHERE entity_id = entities.id AND created_at != 'unknown'
+          )
+          WHERE updated_at = '${ENTITY_TIMESTAMP_SENTINEL}' AND EXISTS (
+            SELECT 1 FROM observations WHERE entity_id = entities.id AND created_at != 'unknown'
+          );
+        `);
+        this.db.exec(`
+          UPDATE entities SET created_at = (
+            SELECT MIN(created_at) FROM observations
+            WHERE entity_id = entities.id AND created_at != 'unknown'
+          )
+          WHERE created_at = '${ENTITY_TIMESTAMP_SENTINEL}' AND EXISTS (
+            SELECT 1 FROM observations WHERE entity_id = entities.id AND created_at != 'unknown'
+          );
+        `);
+      })();
+
       // Rename the JSONL file to .bak so it won't be re-migrated on next startup
       try {
         await fs.rename(jsonlPath, jsonlPath + '.bak');
@@ -762,30 +812,28 @@ export class SqliteStore implements GraphStore {
     const pattern = `%${escaped}%`;
     const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
 
-    // Build WHERE conditions for the outer query on the entities table.
-    // The search matching is done via a subquery that finds entity IDs matching
-    // name/type/observation content, keeping DISTINCT inside the subquery.
-    const conditions: string[] = [];
-    const params: (string | number)[] = [];
-
-    // Subquery: find entity IDs that match the search term.
-    // The LEFT JOIN on observations allows matching against observation content.
-    // DISTINCT ensures each entity ID appears once even if multiple observations match.
-    let subquery = `
-      SELECT DISTINCT e2.id FROM entities e2
-      LEFT JOIN observations o ON o.entity_id = e2.id
-      WHERE (e2.name LIKE ? ESCAPE '\\' OR e2.entity_type LIKE ? ESCAPE '\\' OR o.content LIKE ? ESCAPE '\\')
+    // Use a CTE (Common Table Expression) to compute the set of matching entity IDs
+    // once, then reuse it for both pagination and total count. This avoids running the
+    // expensive LEFT JOIN + 3 LIKE patterns twice (was issue #50).
+    // SQLite materializes CTEs referenced multiple times, so matched_ids is computed once.
+    const cteParams: (string | number)[] = [pattern, pattern, pattern];
+    let cteSql = `
+      WITH matched_ids AS (
+        SELECT DISTINCT e2.id FROM entities e2
+        LEFT JOIN observations o ON o.entity_id = e2.id
+        WHERE (e2.name LIKE ? ESCAPE '\\' OR e2.entity_type LIKE ? ESCAPE '\\' OR o.content LIKE ? ESCAPE '\\')
     `;
-    // Subquery params: the three LIKE patterns
-    params.push(pattern, pattern, pattern);
 
     if (normalizedProject) {
-      subquery += ' AND (e2.project = ? OR e2.project IS NULL)';
-      params.push(normalizedProject);
+      cteSql += ' AND (e2.project = ? OR e2.project IS NULL)';
+      cteParams.push(normalizedProject);
     }
+    cteSql += ')';
 
-    // The outer query selects from entities WHERE id is in the subquery result set
-    conditions.push(`id IN (${subquery})`);
+    // Build WHERE conditions for the outer query on the entities table.
+    // id IN (matched_ids) restricts to search matches; cursor condition paginates.
+    const conditions: string[] = ['id IN (SELECT id FROM matched_ids)'];
+    const params: (string | number)[] = [...cteParams];
 
     // Cursor condition for keyset pagination (applied to outer query)
     if (cursor) {
@@ -799,13 +847,22 @@ export class SqliteStore implements GraphStore {
     const limitClause = limit !== undefined ? `LIMIT ?` : '';
     const queryParams = limit !== undefined ? [...params, limit + 1] : params;
 
+    // The scalar subquery (SELECT COUNT(*) FROM matched_ids) is embedded in the SELECT
+    // list so the total count comes back with each row at zero extra cost — the CTE
+    // is already materialized. When unpaginated, we skip the count (use array length).
+    const countColumn = isPaginated
+      ? ', (SELECT COUNT(*) FROM matched_ids) AS total_count'
+      : '';
+
     const entityRows = this.db.prepare(`
+      ${cteSql}
       SELECT name, entity_type AS entityType, project, updated_at, created_at, id
+        ${countColumn}
       FROM entities
       ${whereClause}
       ORDER BY updated_at DESC, id DESC
       ${limitClause}
-    `).all(...queryParams) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string; id: number }[];
+    `).all(...queryParams) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string; id: number; total_count?: number }[];
 
     // Determine if there's a next page
     let hasMore = false;
@@ -824,24 +881,12 @@ export class SqliteStore implements GraphStore {
       nextCursor = encodeCursor({ u: last.updated_at, i: last.id, n: last.name, q: fingerprint });
     }
 
-    // Count total matching entities. When unpaginated, skip the expensive COUNT query
-    // (which requires a LEFT JOIN + 3 LIKE patterns) and use the array length directly.
-    let totalCount: number;
-    if (isPaginated) {
-      const countParams: (string | number)[] = [pattern, pattern, pattern];
-      let countSql = `
-        SELECT COUNT(DISTINCT e2.id) AS cnt FROM entities e2
-        LEFT JOIN observations o ON o.entity_id = e2.id
-        WHERE (e2.name LIKE ? ESCAPE '\\' OR e2.entity_type LIKE ? ESCAPE '\\' OR o.content LIKE ? ESCAPE '\\')
-      `;
-      if (normalizedProject) {
-        countSql += ' AND (e2.project = ? OR e2.project IS NULL)';
-        countParams.push(normalizedProject);
-      }
-      totalCount = (this.db.prepare(countSql).get(...countParams) as { cnt: number }).cnt;
-    } else {
-      totalCount = pageRows.length;
-    }
+    // Total count: when paginated, extract from the first row's total_count column
+    // (embedded via the CTE scalar subquery). When unpaginated, use array length.
+    // If no rows matched, total_count is absent so fall back to 0.
+    const totalCount = isPaginated
+      ? (pageRows.length > 0 ? pageRows[0].total_count! : 0)
+      : pageRows.length;
 
     // Build full Entity objects with observations
     const entities = this.buildEntities(pageRows);
