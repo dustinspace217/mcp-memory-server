@@ -90,7 +90,8 @@ export function decodeCursor(cursor: string, expectedFingerprint: string): Curso
  * @returns Clamped page size between 1 and MAX_PAGE_SIZE
  */
 export function clampLimit(limit?: number): number {
-  if (limit === undefined) return DEFAULT_PAGE_SIZE;
+  // Handle undefined, NaN, Infinity, and other non-finite values
+  if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_PAGE_SIZE;
   // Math.max/min ensures the value stays within [1, MAX_PAGE_SIZE]
   return Math.max(1, Math.min(limit, MAX_PAGE_SIZE));
 }

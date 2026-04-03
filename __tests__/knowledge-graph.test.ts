@@ -1321,18 +1321,19 @@ describe.each<[string, string, StoreFactory]>([
 			// Create entities visible to both "queries" (global entities)
 			await createStaggeredEntities(store, 5);
 
-			// Get a cursor from searchNodes with projectId="a" and query="b"
-			const result1 = await store.searchNodes('b', 'a', { limit: 2 });
+			// Get a cursor from searchNodes with projectId="a" and query="test"
+			// (matches entityType "test" on all 5 entities, producing a cursor)
+			const result1 = await store.searchNodes('test', 'a', { limit: 2 });
 
-			// If we got a cursor, try using it with projectId="" and query="a\0b"
-			// (or any other combination that would collide with old ':' delimiter).
-			// The cursor should be rejected because fingerprints are distinct.
-			if (result1.nextCursor) {
-				// Using the cursor with different projectId/query should throw
-				await expect(
-					store.searchNodes('a', 'b', { cursor: result1.nextCursor, limit: 2 })
-				).rejects.toThrow(InvalidCursorError);
-			}
+			// We must get a cursor (5 entities match, limit=2 → more pages)
+			expect(result1.nextCursor).not.toBeNull();
+
+			// Using the cursor with swapped projectId/query should throw
+			// because the fingerprint encodes the exact projectId+query combo.
+			// With the old ':' delimiter this could collide; null-byte separator prevents it.
+			await expect(
+				store.searchNodes('a', 'test', { cursor: result1.nextCursor!, limit: 2 })
+			).rejects.toThrow(InvalidCursorError);
 		});
 
 		// Verifies that cursor field validation rejects invalid 'i' values.
