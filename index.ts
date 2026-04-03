@@ -148,7 +148,7 @@ const PaginatedOutputSchema = {
 
 const server = new McpServer({
   name: "memory-server",
-  version: "0.10.0",
+  version: "0.10.1",
 });
 
 server.registerTool(
@@ -282,7 +282,7 @@ server.registerTool(
     description: "Read the knowledge graph. Returns entities sorted by most recently updated, paginated. Use the returned nextCursor to fetch subsequent pages. Omit cursor for the first page.",
     inputSchema: {
       projectId: ProjectIdSchema,
-      cursor: z.string().optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page."),
+      cursor: z.string().max(10000).optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page."),
       limit: z.number().int().min(1).max(100).optional().default(40).describe("Max entities per page (default 40, max 100)"),
     },
     outputSchema: PaginatedOutputSchema,
@@ -306,7 +306,7 @@ server.registerTool(
     inputSchema: {
       query: z.string().min(1).max(5000).describe("The search query to match against entity names, types, and observation content"),
       projectId: ProjectIdSchema,
-      cursor: z.string().optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page."),
+      cursor: z.string().max(10000).optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page."),
       limit: z.number().int().min(1).max(100).optional().default(40).describe("Max entities per page (default 40, max 100)"),
     },
     outputSchema: PaginatedOutputSchema,

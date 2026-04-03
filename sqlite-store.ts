@@ -20,9 +20,16 @@ import {
   type CreateEntitiesResult,
   type PaginationParams,
   type PaginatedKnowledgeGraph,
-  InvalidCursorError,
 } from './types.js';
 import { JsonlStore } from './jsonl-store.js';
+import {
+  type CursorPayload,
+  encodeCursor,
+  decodeCursor,
+  clampLimit,
+  readGraphFingerprint,
+  searchNodesFingerprint,
+} from './cursor.js';
 
 /**
  * Checks if a file exists at the given path.
@@ -60,81 +67,6 @@ function escapeLike(query: string): string {
 // Max parameters per SQL IN clause. SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999.
 // We use 900 to leave headroom for other parameters in the same query.
 const CHUNK_SIZE = 900;
-
-/** Default number of entities per page when limit is not specified. */
-const DEFAULT_PAGE_SIZE = 40;
-
-/** Maximum allowed page size to prevent excessive responses. */
-const MAX_PAGE_SIZE = 100;
-
-/**
- * Internal cursor payload -- encoded as base64 JSON in the opaque cursor string.
- * u: updatedAt of last entity on page (sort key)
- * i: SQLite entity id (tiebreaker for stable ordering)
- * n: entity name (tiebreaker for JSONL backend -- unused by SQLite but preserved for compatibility)
- * q: query fingerprint (prevents using a cursor from one query on a different query)
- */
-interface CursorPayload {
-  u: string;   // updatedAt timestamp of the last entity on the page
-  i: number;   // SQLite entity id for tiebreaking when timestamps are equal
-  n?: string;  // entity name -- unused by SQLite, included for JSONL compat
-  q: string;   // query fingerprint -- must match for cursor reuse
-}
-
-/**
- * Encodes a cursor payload as a base64 JSON string.
- * The cursor is opaque to callers -- they pass it back verbatim on the next request.
- *
- * @param payload - Internal cursor data with sort position and query fingerprint
- * @returns Base64-encoded string that the caller treats as an opaque token
- */
-function encodeCursor(payload: CursorPayload): string {
-  // Buffer.from().toString('base64') is Node's standard base64 encoding
-  return Buffer.from(JSON.stringify(payload)).toString('base64');
-}
-
-/**
- * Decodes and validates a base64 cursor string.
- * Checks structural validity (required fields and types) and query fingerprint match.
- * Throws InvalidCursorError on any problem -- never silently falls back to page 1.
- *
- * @param cursor - Base64-encoded cursor string from the client
- * @param expectedFingerprint - The query fingerprint for the current request
- * @returns Validated CursorPayload with sort position info
- * @throws InvalidCursorError if cursor is malformed or doesn't match the current query
- */
-function decodeCursor(cursor: string, expectedFingerprint: string): CursorPayload {
-  try {
-    // Decode base64 -> UTF-8 -> JSON parse
-    const parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
-    // Validate required fields have correct types
-    if (typeof parsed.u !== 'string' || typeof parsed.i !== 'number' || typeof parsed.q !== 'string') {
-      throw new InvalidCursorError('Cursor has invalid structure');
-    }
-    // Ensure the cursor was created for this exact query (prevents cross-query reuse)
-    if (parsed.q !== expectedFingerprint) {
-      throw new InvalidCursorError('Cursor does not match current query');
-    }
-    return parsed;
-  } catch (err) {
-    // Re-throw our own error type; wrap everything else as malformed
-    if (err instanceof InvalidCursorError) throw err;
-    throw new InvalidCursorError('Cursor is malformed');
-  }
-}
-
-/**
- * Clamps a user-provided limit to the valid range [1, MAX_PAGE_SIZE],
- * defaulting to DEFAULT_PAGE_SIZE when not provided.
- *
- * @param limit - User-provided limit, may be undefined
- * @returns Clamped page size between 1 and MAX_PAGE_SIZE
- */
-function clampLimit(limit?: number): number {
-  if (limit === undefined) return DEFAULT_PAGE_SIZE;
-  // Math.max/min ensures the value stays within [1, MAX_PAGE_SIZE]
-  return Math.max(1, Math.min(limit, MAX_PAGE_SIZE));
-}
 
 /**
  * SQLite-backed knowledge graph store. Uses WAL mode for concurrent read performance
@@ -228,41 +160,43 @@ export class SqliteStore implements GraphStore {
     // Migrate: add updated_at and created_at columns if upgrading from pre-Phase-4 schema.
     // These timestamps track when the entity itself was last modified and when it was first created.
     // Uses the same pragma table_info check pattern as the project column migration above.
+    // Wrapped in an explicit transaction so a crash between ALTER and backfill doesn't leave
+    // entities with permanent sentinel timestamps (which sort last in DESC order, effectively invisible).
     const hasUpdatedAt = columns.some(c => c.name === 'updated_at');
     if (!hasUpdatedAt) {
-      this.db.exec(`
-        ALTER TABLE entities ADD COLUMN updated_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}';
-        ALTER TABLE entities ADD COLUMN created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}';
-      `);
-      // Backfill updated_at from the most recent observation timestamp.
-      // Entities with no valid observation timestamps keep the sentinel value.
-      this.db.exec(`
-        UPDATE entities SET updated_at = (
-          SELECT MAX(created_at) FROM observations
-          WHERE entity_id = entities.id AND created_at != 'unknown'
-        )
-        WHERE updated_at = '${ENTITY_TIMESTAMP_SENTINEL}' AND EXISTS (
-          SELECT 1 FROM observations WHERE entity_id = entities.id AND created_at != 'unknown'
-        );
-      `);
-      // Also backfill created_at from the earliest observation timestamp
-      this.db.exec(`
-        UPDATE entities SET created_at = (
-          SELECT MIN(created_at) FROM observations
-          WHERE entity_id = entities.id AND created_at != 'unknown'
-        )
-        WHERE created_at = '${ENTITY_TIMESTAMP_SENTINEL}' AND EXISTS (
-          SELECT 1 FROM observations WHERE entity_id = entities.id AND created_at != 'unknown'
-        );
-      `);
+      this.db.transaction(() => {
+        this.db.exec(`
+          ALTER TABLE entities ADD COLUMN updated_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}';
+          ALTER TABLE entities ADD COLUMN created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}';
+        `);
+        // Backfill updated_at from the most recent observation timestamp.
+        // Entities with no valid observation timestamps keep the sentinel value.
+        this.db.exec(`
+          UPDATE entities SET updated_at = (
+            SELECT MAX(created_at) FROM observations
+            WHERE entity_id = entities.id AND created_at != 'unknown'
+          )
+          WHERE updated_at = '${ENTITY_TIMESTAMP_SENTINEL}' AND EXISTS (
+            SELECT 1 FROM observations WHERE entity_id = entities.id AND created_at != 'unknown'
+          );
+        `);
+        // Also backfill created_at from the earliest observation timestamp
+        this.db.exec(`
+          UPDATE entities SET created_at = (
+            SELECT MIN(created_at) FROM observations
+            WHERE entity_id = entities.id AND created_at != 'unknown'
+          )
+          WHERE created_at = '${ENTITY_TIMESTAMP_SENTINEL}' AND EXISTS (
+            SELECT 1 FROM observations WHERE entity_id = entities.id AND created_at != 'unknown'
+          );
+        `);
+      })();
     }
 
     // Create indexes if they don't exist yet (idempotent).
-    // idx_entities_project: speeds up project-filtered entity queries.
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
     // in getConnectedRelations needs its own index to avoid full table scans.
-    this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project);');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_relations_to_entity ON relations(to_entity);');
 
     // Pagination indexes for keyset queries on (updated_at DESC, id DESC).
@@ -270,6 +204,12 @@ export class SqliteStore implements GraphStore {
     // The standalone index supports unscoped reads.
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_project_updated ON entities(project, updated_at DESC, id DESC);');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_updated ON entities(updated_at DESC, id DESC);');
+
+    // Drop the single-column idx_entities_project — it's now covered by the composite
+    // idx_entities_project_updated which has project as its leftmost column.
+    // The single-column index was created during Phase 3 migration; once the composite exists,
+    // it's redundant and wastes disk space + INSERT/UPDATE overhead.
+    this.db.exec('DROP INDEX IF EXISTS idx_entities_project;');
 
     // --- Run migration if data was loaded from JSONL ---
     if (migrationData) {
@@ -496,9 +436,12 @@ export class SqliteStore implements GraphStore {
           throw new Error(`Entity with name ${o.entityName} not found`);
         }
 
+        // Capture a single timestamp for all observations in this entity's batch
+        // so observation.createdAt and entity.updated_at are consistent
+        const now = new Date().toISOString();
         const addedObservations: Observation[] = [];
         for (const content of o.contents) {
-          const obs = createObservation(content);
+          const obs = { content, createdAt: now };
           const info = insertObs.run(row.id, obs.content, obs.createdAt);
           if (info.changes > 0) {
             addedObservations.push(obs);
@@ -507,7 +450,7 @@ export class SqliteStore implements GraphStore {
 
         // Bump the entity's updated_at if any observations were actually added
         if (addedObservations.length > 0) {
-          updateTimestamp.run(new Date().toISOString(), row.id);
+          updateTimestamp.run(now, row.id);
         }
 
         results.push({ entityName: o.entityName, addedObservations });
@@ -677,7 +620,7 @@ export class SqliteStore implements GraphStore {
    * @returns PaginatedKnowledgeGraph with entities, relations, nextCursor, and totalCount
    */
   async readGraph(projectId?: string, pagination?: PaginationParams): Promise<PaginatedKnowledgeGraph> {
-    const fingerprint = `readGraph:${projectId ?? ''}`;
+    const fingerprint = readGraphFingerprint(projectId);
 
     // When pagination is undefined, return all results (backward compat).
     // When provided, clamp the limit to valid range and optionally decode cursor.
@@ -803,7 +746,7 @@ export class SqliteStore implements GraphStore {
    * @returns PaginatedKnowledgeGraph with matching entities, relations, nextCursor, and totalCount
    */
   async searchNodes(query: string, projectId?: string, pagination?: PaginationParams): Promise<PaginatedKnowledgeGraph> {
-    const fingerprint = `searchNodes:${projectId ?? ''}:${query}`;
+    const fingerprint = searchNodesFingerprint(projectId, query);
 
     // When pagination is undefined, return all results (backward compat).
     const isPaginated = pagination !== undefined;
@@ -932,19 +875,27 @@ export class SqliteStore implements GraphStore {
   async openNodes(names: string[], projectId?: string): Promise<KnowledgeGraph> {
     if (names.length === 0) return { entities: [], relations: [] };
 
-    let entityRows: { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
+    // Chunk the IN clause to stay under SQLite's SQLITE_MAX_VARIABLE_NUMBER limit (999).
+    // Safe via MCP (Zod .max(100) on names array) but needed for direct callers with 900+ names.
+    type EntityRow = { name: string; entityType: string; project: string | null; updated_at: string; created_at: string };
+    let entityRows: EntityRow[] = [];
+    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
 
-    if (projectId) {
-      const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
-      const placeholders = names.map(() => '?').join(',');
-      entityRows = this.db.prepare(
-        `SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities WHERE name IN (${placeholders}) AND (project = ? OR project IS NULL)`
-      ).all(...names, normalizedProject) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
-    } else {
-      const placeholders = names.map(() => '?').join(',');
-      entityRows = this.db.prepare(
-        `SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities WHERE name IN (${placeholders})`
-      ).all(...names) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[];
+    for (let i = 0; i < names.length; i += CHUNK_SIZE) {
+      const chunk = names.slice(i, i + CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+
+      if (normalizedProject) {
+        const rows = this.db.prepare(
+          `SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities WHERE name IN (${placeholders}) AND (project = ? OR project IS NULL)`
+        ).all(...chunk, normalizedProject) as EntityRow[];
+        entityRows.push(...rows);
+      } else {
+        const rows = this.db.prepare(
+          `SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities WHERE name IN (${placeholders})`
+        ).all(...chunk) as EntityRow[];
+        entityRows.push(...rows);
+      }
     }
 
     const entities = this.buildEntities(entityRows);

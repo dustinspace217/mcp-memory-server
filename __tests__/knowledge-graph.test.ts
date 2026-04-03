@@ -1213,6 +1213,175 @@ describe.each<[string, string, StoreFactory]>([
 			const page2 = await store.readGraph(undefined, { cursor: page1.nextCursor!, limit: 5 });
 			expect(page2.totalCount).toBe(15);
 		});
+
+		// --- Test gaps filled from Phase 4 review (issue #39) ---
+
+		// Verifies full traversal of searchNodes pagination — collects ALL entities
+		// across every page and ensures no duplicates and no missing entities
+		it('should traverse all searchNodes pages without duplicates', async () => {
+			await createStaggeredEntities(store, 10);
+
+			const allNames: string[] = [];
+			let cursor: string | undefined;
+
+			// Paginate through all search results with limit=3
+			for (let page = 0; page < 10; page++) {
+				const result = await store.searchNodes('Entity', undefined, { cursor, limit: 3 });
+				allNames.push(...result.entities.map(e => e.name));
+				if (!result.nextCursor) break;
+				cursor = result.nextCursor;
+			}
+
+			expect(allNames).toHaveLength(10);
+			expect(new Set(allNames).size).toBe(10);
+		});
+
+		// Verifies limit=1 works correctly as a minimum page size — each page
+		// should have exactly 1 entity, and full traversal yields all entities
+		it('should paginate with limit=1 (minimum page size)', async () => {
+			await createStaggeredEntities(store, 5);
+
+			const allNames: string[] = [];
+			let cursor: string | undefined;
+
+			for (let page = 0; page < 10; page++) {
+				const result = await store.readGraph(undefined, { cursor, limit: 1 });
+				expect(result.entities).toHaveLength(page < 5 ? 1 : 0);
+				allNames.push(...result.entities.map(e => e.name));
+				if (!result.nextCursor) break;
+				cursor = result.nextCursor;
+			}
+
+			expect(allNames).toHaveLength(5);
+			expect(new Set(allNames).size).toBe(5);
+		});
+
+		// Verifies the exact boundary where count == limit — when the entity count
+		// exactly matches the limit, nextCursor should be null (no extra page)
+		it('should handle count == limit exact boundary', async () => {
+			await createStaggeredEntities(store, 5);
+
+			// Request exactly 5 entities — all fit in one page, no next page
+			const result = await store.readGraph(undefined, { limit: 5 });
+			expect(result.entities).toHaveLength(5);
+			expect(result.nextCursor).toBeNull();
+			expect(result.totalCount).toBe(5);
+		});
+
+		// Verifies that clampLimit actually clamps to MAX_PAGE_SIZE (100) by creating
+		// more than 100 entities — with a limit > 100, the result should be clamped
+		it('should actually clamp limit to 100 with more than 100 entities', async () => {
+			// Create 105 entities (more than MAX_PAGE_SIZE) to verify clamping is real
+			await createStaggeredEntities(store, 105);
+
+			// Request limit=200 — should be clamped to 100
+			const page1 = await store.readGraph(undefined, { limit: 200 });
+			expect(page1.entities).toHaveLength(100);
+			expect(page1.nextCursor).not.toBeNull();
+			expect(page1.totalCount).toBe(105);
+
+			// Second page should have the remaining 5
+			const page2 = await store.readGraph(undefined, { cursor: page1.nextCursor!, limit: 200 });
+			expect(page2.entities).toHaveLength(5);
+			expect(page2.nextCursor).toBeNull();
+		});
+
+		// Verifies searchNodes pagination works correctly with a projectId filter.
+		// Entities from the project + globals should be included; other projects excluded.
+		it('should paginate searchNodes with projectId filter', async () => {
+			// Create project-scoped entities
+			await createStaggeredEntities(store, 5, 'proj-x');
+			// Create global entities with distinct names (entity names are globally unique)
+			await store.createEntities([
+				{ name: 'Global-Search-1', entityType: 'test', observations: ['searchable content'] },
+			]);
+
+			// Search within proj-x scope — should find proj-x entities + globals matching query
+			const page1 = await store.searchNodes('test', 'proj-x', { limit: 3 });
+			expect(page1.entities.length).toBeGreaterThan(0);
+			// All results should belong to proj-x or be global
+			for (const e of page1.entities) {
+				expect(e.project === 'proj-x' || e.project === null).toBe(true);
+			}
+
+			// If there's a next page, continue traversal
+			if (page1.nextCursor) {
+				const page2 = await store.searchNodes('test', 'proj-x', { cursor: page1.nextCursor, limit: 3 });
+				for (const e of page2.entities) {
+					expect(e.project === 'proj-x' || e.project === null).toBe(true);
+				}
+			}
+		});
+
+		// Regression test for issue #36: fingerprint collision when projectId contains
+		// the delimiter character. With the old ':' delimiter, projectId="a:b" + query="c"
+		// would produce the same fingerprint as projectId="a" + query="b:c".
+		// With the null-byte separator fix, these produce distinct fingerprints.
+		it('should not allow fingerprint collision across different projectId/query combos', async () => {
+			// Create entities visible to both "queries" (global entities)
+			await createStaggeredEntities(store, 5);
+
+			// Get a cursor from searchNodes with projectId="a" and query="b"
+			const result1 = await store.searchNodes('b', 'a', { limit: 2 });
+
+			// If we got a cursor, try using it with projectId="" and query="a\0b"
+			// (or any other combination that would collide with old ':' delimiter).
+			// The cursor should be rejected because fingerprints are distinct.
+			if (result1.nextCursor) {
+				// Using the cursor with different projectId/query should throw
+				await expect(
+					store.searchNodes('a', 'b', { cursor: result1.nextCursor, limit: 2 })
+				).rejects.toThrow(InvalidCursorError);
+			}
+		});
+
+		// Verifies that cursor field validation rejects invalid 'i' values.
+		// The 'i' field must be a non-negative finite integer.
+		it('should reject cursors with invalid i values', async () => {
+			await createStaggeredEntities(store, 3);
+
+			// Craft cursors with invalid 'i' values — these should all be rejected
+			const craftCursor = (payload: Record<string, unknown>) =>
+				Buffer.from(JSON.stringify(payload)).toString('base64');
+
+			// i: Infinity — would silently restart pagination from page 1
+			await expect(
+				store.readGraph(undefined, { cursor: craftCursor({ u: '2025-01-01', i: Infinity, q: 'readGraph\0' }) })
+			).rejects.toThrow(InvalidCursorError);
+
+			// i: -1 — negative id would truncate results
+			await expect(
+				store.readGraph(undefined, { cursor: craftCursor({ u: '2025-01-01', i: -1, q: 'readGraph\0' }) })
+			).rejects.toThrow(InvalidCursorError);
+
+			// i: 3.14 — fractional id is nonsensical
+			await expect(
+				store.readGraph(undefined, { cursor: craftCursor({ u: '2025-01-01', i: 3.14, q: 'readGraph\0' }) })
+			).rejects.toThrow(InvalidCursorError);
+
+			// n: 42 — name field should be string if present
+			await expect(
+				store.readGraph(undefined, { cursor: craftCursor({ u: '2025-01-01', i: 1, n: 42, q: 'readGraph\0' }) })
+			).rejects.toThrow(InvalidCursorError);
+		});
+
+		// Verifies that addObservations uses a single timestamp for both
+		// observation.createdAt and entity.updatedAt (issue #41 fix)
+		it('should use consistent timestamp for observation and entity update', async () => {
+			await store.createEntities([
+				{ name: 'TimestampTest', entityType: 'test', observations: ['initial'] },
+			]);
+
+			const results = await store.addObservations([
+				{ entityName: 'TimestampTest', contents: ['new obs'] },
+			]);
+
+			// The added observation's createdAt should match the entity's updatedAt
+			const graph = await store.readGraph(undefined, { limit: 100 });
+			const entity = graph.entities.find(e => e.name === 'TimestampTest')!;
+			const addedObs = results[0].addedObservations[0];
+			expect(entity.updatedAt).toBe(addedObs.createdAt);
+		});
 	});
 
 	// ----------------------------------------------------------

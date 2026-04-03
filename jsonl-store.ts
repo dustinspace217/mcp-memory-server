@@ -22,78 +22,14 @@ import {
   type PaginatedKnowledgeGraph,
   InvalidCursorError,
 } from './types.js';
-
-// --- Pagination constants and cursor utilities ---
-// These are duplicated from sqlite-store.ts intentionally (small, avoids shared module)
-
-/** Default number of entities per page when no limit is specified */
-const DEFAULT_PAGE_SIZE = 40;
-
-/** Maximum allowed page size — protects against unbounded responses */
-const MAX_PAGE_SIZE = 100;
-
-/**
- * Internal structure of a cursor. Encodes position within a sorted result set.
- * u = updatedAt timestamp of the last entity on the previous page
- * i = integer id (always 0 for JSONL — no integer ids; uses name as tiebreaker)
- * n = entity name, used as tiebreaker when multiple entities share the same updatedAt
- * q = query fingerprint, ensures a cursor from one query can't be reused with a different query
- */
-interface CursorPayload {
-  u: string;
-  i: number;
-  n?: string;
-  q: string;
-}
-
-/**
- * Encodes a CursorPayload as a base64 string for use as an opaque cursor.
- *
- * @param payload - The cursor data to encode
- * @returns Base64-encoded JSON string
- */
-function encodeCursor(payload: CursorPayload): string {
-  return Buffer.from(JSON.stringify(payload)).toString('base64');
-}
-
-/**
- * Decodes a base64 cursor string back into a CursorPayload.
- * Validates structure and checks that the query fingerprint matches.
- * Throws InvalidCursorError on any problem — never silently falls back to page 1.
- *
- * @param cursor - Base64-encoded cursor string from the client
- * @param expectedFingerprint - Query fingerprint to validate against (must match cursor.q)
- * @returns Decoded CursorPayload
- * @throws InvalidCursorError if cursor is malformed or doesn't match the current query
- */
-function decodeCursor(cursor: string, expectedFingerprint: string): CursorPayload {
-  try {
-    const parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
-    if (typeof parsed.u !== 'string' || typeof parsed.i !== 'number' || typeof parsed.q !== 'string') {
-      throw new InvalidCursorError('Cursor has invalid structure');
-    }
-    if (parsed.q !== expectedFingerprint) {
-      throw new InvalidCursorError('Cursor does not match current query');
-    }
-    return parsed;
-  } catch (err) {
-    if (err instanceof InvalidCursorError) throw err;
-    throw new InvalidCursorError('Cursor is malformed');
-  }
-}
-
-/**
- * Clamps a user-provided limit to the valid range [1, MAX_PAGE_SIZE],
- * defaulting to DEFAULT_PAGE_SIZE when not provided.
- *
- * @param limit - Optional user-provided page size
- * @returns Clamped page size between 1 and MAX_PAGE_SIZE
- */
-function clampLimit(limit?: number): number {
-  if (limit === undefined) return DEFAULT_PAGE_SIZE;
-  // Math.max/min ensures the value stays within [1, MAX_PAGE_SIZE]
-  return Math.max(1, Math.min(limit, MAX_PAGE_SIZE));
-}
+import {
+  type CursorPayload,
+  encodeCursor,
+  decodeCursor,
+  clampLimit,
+  readGraphFingerprint,
+  searchNodesFingerprint,
+} from './cursor.js';
 
 /**
  * Handles the legacy memory.json -> memory.jsonl migration.
@@ -448,18 +384,21 @@ export class JsonlStore implements GraphStore {
       if (!entity) {
         throw new Error(`Entity with name ${o.entityName} not found`);
       }
+      // Capture a single timestamp for all observations in this entity's batch
+      // so observation.createdAt and entity.updatedAt are consistent
+      const now = new Date().toISOString();
       const existingContents = new Set(entity.observations.map(obs => obs.content));
       const newObservations: Observation[] = [];
       for (const content of o.contents) {
         if (!existingContents.has(content)) {
           existingContents.add(content);
-          newObservations.push(createObservation(content));
+          newObservations.push({ content, createdAt: now });
         }
       }
       entity.observations.push(...newObservations);
       // Bump updatedAt — entity content has changed
       if (newObservations.length > 0) {
-        entity.updatedAt = new Date().toISOString();
+        entity.updatedAt = now;
       }
       return { entityName: o.entityName, addedObservations: newObservations };
     });
@@ -525,7 +464,7 @@ export class JsonlStore implements GraphStore {
   async readGraph(projectId?: string, pagination?: PaginationParams): Promise<PaginatedKnowledgeGraph> {
     const graph = await this.loadGraph();
     // Fingerprint encodes the query parameters so cursors can't be reused across different queries
-    const fingerprint = `readGraph:${projectId ?? ''}`;
+    const fingerprint = readGraphFingerprint(projectId);
 
     if (!projectId && !pagination) {
       // Fast path: no filtering, no pagination — return everything unsorted
@@ -566,7 +505,7 @@ export class JsonlStore implements GraphStore {
     const lowerQuery = query.toLowerCase();
     const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
     // Fingerprint includes both projectId and query so cursors can't cross-pollinate
-    const fingerprint = `searchNodes:${projectId ?? ''}:${query}`;
+    const fingerprint = searchNodesFingerprint(projectId, query);
 
     // First filter: match by name, type, or observation content
     let filteredEntities = graph.entities.filter(e =>
