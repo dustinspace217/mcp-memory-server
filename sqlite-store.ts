@@ -375,8 +375,13 @@ export class SqliteStore implements GraphStore {
         // Start loading the embedding model in the background.
         // When ready, run the universal embedding sweep to generate embeddings
         // for any active observations that don't have one yet.
+        // The sweep is async — .catch() prevents unhandled promise rejection
+        // from crashing Node.js if the sweep hits a DB error (SQLITE_BUSY, disk full, etc.)
         this.embeddingPipeline.startLoading(() => {
-          this.runEmbeddingSweep();
+          this.runEmbeddingSweep().catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`Embedding sweep failed: ${msg}`);
+          });
         });
 
       } catch (err: unknown) {
@@ -559,20 +564,31 @@ export class SqliteStore implements GraphStore {
       // Insert embeddings into vec_observations.
       // observation_id is stored as TEXT (String(id)) because vec0 v0.1.9
       // doesn't support explicit INTEGER PRIMARY KEY values on insert.
+      // DELETE-before-INSERT prevents duplicates if syncEmbedding() from a
+      // concurrent MCP request already embedded this observation between
+      // our query and this insert (race window during await embedBatch).
       if (results.length > 0 && this.db) {
+        const del = this.db.prepare('DELETE FROM vec_observations WHERE observation_id = ?');
         const insert = this.db.prepare(
           'INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)'
         );
-        const txn = this.db.transaction(() => {
-          for (const { id, embedding } of results) {
-            insert.run(
-              Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
-              String(id)
-            );
-          }
-        });
-        txn();
-        totalEmbedded += results.length;
+        try {
+          const txn = this.db.transaction(() => {
+            for (const { id, embedding } of results) {
+              del.run(String(id));
+              insert.run(
+                Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+                String(id)
+              );
+            }
+          });
+          txn();
+          totalEmbedded += results.length;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Embedding sweep batch insert failed: ${msg}`);
+          break; // stop the sweep on DB error (disk full, SQLITE_BUSY, etc.)
+        }
       }
 
       // Yield the event loop so the server can handle MCP requests between batches
@@ -655,8 +671,9 @@ export class SqliteStore implements GraphStore {
     });
     txn();
 
-    // Generate embeddings for new observations (async, best-effort).
-    // If the model isn't ready, the sweep will catch these later.
+    // Fire-and-forget embedding generation for new observations (best-effort).
+    // Not awaited — the MCP response returns immediately after the sync transaction.
+    // If the model isn't ready, syncEmbedding returns instantly and the sweep catches these later.
     for (const entity of created) {
       const entityRow = this.db.prepare('SELECT id FROM entities WHERE name = ?').get(entity.name) as { id: number };
       for (const obs of entity.observations) {
@@ -664,7 +681,8 @@ export class SqliteStore implements GraphStore {
           `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
         ).get(entityRow.id, obs.content) as { id: number } | undefined;
         if (obsRow) {
-          await this.syncEmbedding(obsRow.id, obs.content, 'upsert');
+          // syncEmbedding never rejects (internal try-catch), safe to not await
+          this.syncEmbedding(obsRow.id, obs.content, 'upsert');
         }
       }
     }
@@ -751,7 +769,8 @@ export class SqliteStore implements GraphStore {
     });
     txn();
 
-    // Generate embeddings for newly added observations (async, best-effort)
+    // Fire-and-forget embedding generation for newly added observations (best-effort).
+    // Not awaited — the MCP response returns immediately after the sync transaction.
     for (const result of results) {
       const entityRow = this.db.prepare('SELECT id FROM entities WHERE name = ?').get(result.entityName) as { id: number } | undefined;
       if (!entityRow) continue;
@@ -760,7 +779,8 @@ export class SqliteStore implements GraphStore {
           `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
         ).get(entityRow.id, obs.content) as { id: number } | undefined;
         if (obsRow) {
-          await this.syncEmbedding(obsRow.id, obs.content, 'upsert');
+          // syncEmbedding never rejects (internal try-catch), safe to not await
+          this.syncEmbedding(obsRow.id, obs.content, 'upsert');
         }
       }
     }
@@ -796,9 +816,9 @@ export class SqliteStore implements GraphStore {
     });
     txn();
 
-    // Clean up vec_observations for CASCADE-deleted observations
+    // Clean up vec_observations for CASCADE-deleted observations (fire-and-forget)
     for (const obsId of obsIdsToDelete) {
-      await this.syncEmbedding(obsId, '', 'delete');
+      this.syncEmbedding(obsId, '', 'delete');
     }
   }
 
@@ -824,6 +844,7 @@ export class SqliteStore implements GraphStore {
       for (const d of deletions) {
         const row = findEntity.get(d.entityName) as { id: number } | undefined;
         if (!row) continue;
+        let anyDeleted = false;
         for (const content of d.contents) {
           // Look up the observation ID before deleting (needed for vec cleanup)
           if (this.vecTableExists) {
@@ -832,17 +853,23 @@ export class SqliteStore implements GraphStore {
             ).get(row.id, content) as { id: number } | undefined;
             if (obsRow) deletedObsIds.push(obsRow.id);
           }
-          delObs.run(row.id, content);
+          const result = delObs.run(row.id, content);
+          if (result.changes > 0) anyDeleted = true;
         }
-        // Bump updated_at — the entity's content has changed
-        updateTimestamp.run(new Date().toISOString(), row.id);
+        // Only bump updated_at if observations were actually deleted —
+        // avoids spurious timestamp advances on no-op deletions (e.g., misspelled content)
+        if (anyDeleted) {
+          updateTimestamp.run(new Date().toISOString(), row.id);
+        }
       }
     });
     txn();
 
-    // Clean up vec_observations for deleted observations
+    // Clean up vec_observations for deleted observations (fire-and-forget).
+    // Delete path in syncEmbedding is synchronous internally, but we still
+    // don't need to await — it never rejects.
     for (const obsId of deletedObsIds) {
-      await this.syncEmbedding(obsId, '', 'delete');
+      this.syncEmbedding(obsId, '', 'delete');
     }
   }
 
@@ -932,8 +959,8 @@ export class SqliteStore implements GraphStore {
     });
     txn();
 
-    // Generate embeddings for the new observations (async, after transaction).
-    // Uses the same findEntity prepared statement from above since it's still in scope.
+    // Fire-and-forget embedding generation for replacement observations (best-effort).
+    // Not awaited — the MCP response returns immediately after the sync transaction.
     for (const s of supersessions) {
       const entityRow = findEntity.get(s.entityName) as { id: number } | undefined;
       if (!entityRow) continue;
@@ -941,7 +968,8 @@ export class SqliteStore implements GraphStore {
         `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
       ).get(entityRow.id, s.newContent) as { id: number } | undefined;
       if (newObsRow) {
-        await this.syncEmbedding(newObsRow.id, s.newContent, 'upsert');
+        // syncEmbedding never rejects (internal try-catch), safe to not await
+        this.syncEmbedding(newObsRow.id, s.newContent, 'upsert');
       }
     }
   }

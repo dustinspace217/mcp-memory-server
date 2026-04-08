@@ -78,9 +78,13 @@ export class EmbeddingPipeline {
       console.error('Embedding model: ready');
 
       if (onReady) onReady();
-    }).catch((err: Error) => {
-      this._state = { status: 'failed', error: err, failedAt: new Date().toISOString() };
-      console.error(`Embedding model: failed to load: ${err.message}`);
+    }).catch((err: unknown) => {
+      // .catch() receives unknown at runtime — the Error annotation was incorrect.
+      // Dynamic import() or pipeline() rejections are typically Errors, but
+      // this handles any rejection value safely.
+      const error = err instanceof Error ? err : new Error(String(err));
+      this._state = { status: 'failed', error, failedAt: new Date().toISOString() };
+      console.error(`Embedding model: failed to load: ${error.message}`);
       console.error('Vector search disabled. LIKE search remains functional.');
     });
   }
@@ -141,6 +145,10 @@ export class EmbeddingPipeline {
     const results: Array<{ id: number; embedding: Float32Array }> = [];
 
     for (const { id, content } of texts) {
+      // If the circuit breaker tripped mid-batch, stop iterating —
+      // embed() would return null for every remaining item anyway
+      if (this._state.status !== 'ready') break;
+
       const embedding = await this.embed(content);
       if (embedding) {
         results.push({ id, embedding });
