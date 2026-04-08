@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import type { GraphStore, Relation } from '../types.js';
+import type { GraphStore, Relation, SupersedeInput } from '../types.js';
 import { InvalidCursorError } from '../types.js';
 import { JsonlStore, normalizeObservation } from '../jsonl-store.js';
 import { SqliteStore } from '../sqlite-store.js';
@@ -275,6 +275,140 @@ describe.each<[string, string, StoreFactory]>([
 			const graph = await store.readGraph();
 			expect(graph.relations).toHaveLength(1);
 			expect(graph.relations[0].relationType).toBe('works_with');
+		});
+	});
+
+	// ----------------------------------------------------------
+	// supersedeObservations
+	// ----------------------------------------------------------
+	describe('supersedeObservations', () => {
+		it('should throw in JSONL backend', async function() {
+			if (ext !== 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Entity1', entityType: 'test', observations: ['old fact'] },
+			]);
+			await expect(store.supersedeObservations([
+				{ entityName: 'Entity1', oldContent: 'old fact', newContent: 'new fact' },
+			])).rejects.toThrow('migrate to SQLite');
+		});
+
+		it('should replace an observation atomically', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Entity1', entityType: 'test', observations: ['status: 262 tests'] },
+			]);
+			await store.supersedeObservations([
+				{ entityName: 'Entity1', oldContent: 'status: 262 tests', newContent: 'status: 290 tests' },
+			]);
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'Entity1')!;
+			expect(entity.observations).toHaveLength(1);
+			expect(entity.observations[0].content).toBe('status: 290 tests');
+		});
+
+		it('should throw when oldContent is not found', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Entity1', entityType: 'test', observations: ['existing'] },
+			]);
+			await expect(store.supersedeObservations([
+				{ entityName: 'Entity1', oldContent: 'nonexistent', newContent: 'new' },
+			])).rejects.toThrow();
+		});
+
+		it('should throw when entity is not found', async function() {
+			if (ext === 'jsonl') return;
+			await expect(store.supersedeObservations([
+				{ entityName: 'Nonexistent', oldContent: 'nope', newContent: 'nope2' },
+			])).rejects.toThrow('not found');
+		});
+
+		it('should be idempotent when newContent already exists as active', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Entity1', entityType: 'test', observations: ['old fact', 'new fact'] },
+			]);
+			await store.supersedeObservations([
+				{ entityName: 'Entity1', oldContent: 'old fact', newContent: 'new fact' },
+			]);
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'Entity1')!;
+			expect(entity.observations).toHaveLength(1);
+			expect(entity.observations[0].content).toBe('new fact');
+		});
+
+		it('should update entity updatedAt timestamp', async function() {
+			if (ext === 'jsonl') return;
+			const { created } = await store.createEntities([
+				{ name: 'Entity1', entityType: 'test', observations: ['old'] },
+			]);
+			const originalUpdatedAt = created[0].updatedAt;
+			await new Promise(r => setTimeout(r, 10));
+			await store.supersedeObservations([
+				{ entityName: 'Entity1', oldContent: 'old', newContent: 'new' },
+			]);
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'Entity1')!;
+			expect(entity.updatedAt > originalUpdatedAt).toBe(true);
+		});
+
+		it('should make superseded observations invisible to searchNodes', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Entity1', entityType: 'test', observations: ['unique_old_marker_xyz'] },
+			]);
+			await store.supersedeObservations([
+				{ entityName: 'Entity1', oldContent: 'unique_old_marker_xyz', newContent: 'replacement' },
+			]);
+			const results = await store.searchNodes('unique_old_marker_xyz');
+			expect(results.entities).toHaveLength(0);
+		});
+
+		it('should make superseded observations invisible to openNodes', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Entity1', entityType: 'test', observations: ['old_obs', 'stays'] },
+			]);
+			await store.supersedeObservations([
+				{ entityName: 'Entity1', oldContent: 'old_obs', newContent: 'new_obs' },
+			]);
+			const graph = await store.openNodes(['Entity1']);
+			const entity = graph.entities[0];
+			const contents = entity.observations.map(o => o.content);
+			expect(contents).toContain('stays');
+			expect(contents).toContain('new_obs');
+			expect(contents).not.toContain('old_obs');
+		});
+
+		it('should handle batch supersessions atomically', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Entity1', entityType: 'test', observations: ['fact A'] },
+				{ name: 'Entity2', entityType: 'test', observations: ['fact B'] },
+			]);
+			await store.supersedeObservations([
+				{ entityName: 'Entity1', oldContent: 'fact A', newContent: 'fact A updated' },
+				{ entityName: 'Entity2', oldContent: 'fact B', newContent: 'fact B updated' },
+			]);
+			const graph = await store.readGraph();
+			const e1 = graph.entities.find(e => e.name === 'Entity1')!;
+			const e2 = graph.entities.find(e => e.name === 'Entity2')!;
+			expect(e1.observations[0].content).toBe('fact A updated');
+			expect(e2.observations[0].content).toBe('fact B updated');
+		});
+
+		it('should roll back all changes if any supersession fails', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Entity1', entityType: 'test', observations: ['valid old'] },
+			]);
+			await expect(store.supersedeObservations([
+				{ entityName: 'Entity1', oldContent: 'valid old', newContent: 'valid new' },
+				{ entityName: 'Nonexistent', oldContent: 'nope', newContent: 'nope2' },
+			])).rejects.toThrow();
+			const graph = await store.readGraph();
+			const e1 = graph.entities.find(e => e.name === 'Entity1')!;
+			expect(e1.observations[0].content).toBe('valid old');
 		});
 	});
 

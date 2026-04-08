@@ -20,6 +20,7 @@ import {
   type CreateEntitiesResult,
   type PaginationParams,
   type PaginatedKnowledgeGraph,
+  type SupersedeInput,
 } from './types.js';
 import { JsonlStore } from './jsonl-store.js';
 import {
@@ -210,6 +211,40 @@ export class SqliteStore implements GraphStore {
     // The single-column index was created during Phase 3 migration; once the composite exists,
     // it's redundant and wastes disk space + INSERT/UPDATE overhead.
     this.db.exec('DROP INDEX IF EXISTS idx_entities_project;');
+
+    // Migrate: add superseded_at column to observations table.
+    // SQLite can't ALTER a UNIQUE constraint, so we rebuild the table.
+    // - superseded_at = '' means active observation (sentinel, not NULL, for UNIQUE correctness)
+    // - superseded_at = ISO timestamp means the observation was retired at that time
+    // New UNIQUE(entity_id, content, superseded_at) allows the same content to be
+    // re-asserted after supersession (different superseded_at values).
+    const obsColumns = this.db.pragma('table_info(observations)') as { name: string }[];
+    const hasSupersededAt = obsColumns.some(c => c.name === 'superseded_at');
+    if (!hasSupersededAt) {
+      this.db.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE observations_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+            content     TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            superseded_at TEXT NOT NULL DEFAULT '',
+            UNIQUE(entity_id, content, superseded_at)
+          );
+          INSERT INTO observations_new (id, entity_id, content, created_at, superseded_at)
+            SELECT id, entity_id, content, created_at, '' FROM observations;
+          DROP TABLE observations;
+          ALTER TABLE observations_new RENAME TO observations;
+        `);
+      })();
+    }
+
+    // Partial index on active observations -- used by all queries that filter
+    // by superseded_at = ''. Superseded observations don't need indexing.
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_observations_active
+      ON observations(entity_id) WHERE superseded_at = '';
+    `);
 
     // --- Crash recovery (#47): detect interrupted migration ---
     // If the database file already existed but has zero entities, AND a sibling .jsonl
@@ -537,7 +572,7 @@ export class SqliteStore implements GraphStore {
   async deleteObservations(deletions: DeleteObservationInput[]): Promise<void> {
     const findEntity = this.db.prepare('SELECT id FROM entities WHERE name = ?');
     const delObs = this.db.prepare(
-      'DELETE FROM observations WHERE entity_id = ? AND content = ?'
+      `DELETE FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
     );
     // Prepared statement to bump updated_at when observations are removed from an entity
     const updateTimestamp = this.db.prepare(
@@ -577,6 +612,69 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
+   * Atomically supersedes observations: retires the old content and inserts the new.
+   * The old observation's superseded_at is set to the current timestamp (marking it retired).
+   * A new observation row is created with the new content and superseded_at = '' (active).
+   * All operations run in a single transaction -- all succeed or all roll back.
+   *
+   * @param supersessions - Array of { entityName, oldContent, newContent }
+   * @throws Error if any entity is not found or oldContent doesn't match an active observation
+   */
+  async supersedeObservations(supersessions: SupersedeInput[]): Promise<void> {
+    // Prepared statement to find an entity's ID by name
+    const findEntity = this.db.prepare('SELECT id FROM entities WHERE name = ?');
+    // Find the active observation matching this entity + content
+    const findActiveObs = this.db.prepare(
+      `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
+    );
+    // Mark the old observation as superseded (set superseded_at to current timestamp)
+    const supersedeObs = this.db.prepare(
+      `UPDATE observations SET superseded_at = ? WHERE id = ?`
+    );
+    // Insert the replacement observation as active (superseded_at defaults to '')
+    const insertObs = this.db.prepare(
+      `INSERT OR IGNORE INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)`
+    );
+    // Bump entity's updated_at timestamp
+    const updateTimestamp = this.db.prepare(
+      'UPDATE entities SET updated_at = ? WHERE id = ?'
+    );
+
+    // better-sqlite3 transactions are synchronous -- the outer async wrapper
+    // satisfies the GraphStore interface contract
+    const txn = this.db.transaction(() => {
+      const now = new Date().toISOString();
+
+      for (const s of supersessions) {
+        // Look up the entity by name
+        const entityRow = findEntity.get(s.entityName) as { id: number } | undefined;
+        if (!entityRow) {
+          throw new Error(`Entity with name ${s.entityName} not found`);
+        }
+
+        // Find the active observation to supersede
+        const obsRow = findActiveObs.get(entityRow.id, s.oldContent) as { id: number } | undefined;
+        if (!obsRow) {
+          throw new Error(
+            `Active observation "${s.oldContent}" not found on entity "${s.entityName}"`
+          );
+        }
+
+        // Retire the old observation by setting its superseded_at timestamp
+        supersedeObs.run(now, obsRow.id);
+
+        // Insert the replacement (INSERT OR IGNORE: if newContent already exists
+        // as an active observation on this entity, skip -- idempotent)
+        insertObs.run(entityRow.id, s.newContent, now);
+
+        // Bump updated_at so the entity surfaces in recency-ordered queries
+        updateTimestamp.run(now, entityRow.id);
+      }
+    });
+    txn();
+  }
+
+  /**
    * Fetches full Entity objects for a set of entity rows, including their observations.
    * Groups observation rows by entity name and assembles complete Entity objects.
    * Uses a single query per chunk to fetch all observations (avoids N+1 queries).
@@ -601,7 +699,7 @@ export class SqliteStore implements GraphStore {
         SELECT e.name AS entityName, o.content, o.created_at AS createdAt
         FROM observations o
         JOIN entities e ON o.entity_id = e.id
-        WHERE e.name IN (${placeholders})
+        WHERE e.name IN (${placeholders}) AND o.superseded_at = ''
       `).all(...chunk) as { entityName: string; content: string; createdAt: string }[];
 
       for (const o of obsRows) {
@@ -820,7 +918,7 @@ export class SqliteStore implements GraphStore {
     let cteSql = `
       WITH matched_ids AS (
         SELECT DISTINCT e2.id FROM entities e2
-        LEFT JOIN observations o ON o.entity_id = e2.id
+        LEFT JOIN observations o ON o.entity_id = e2.id AND o.superseded_at = ''
         WHERE (e2.name LIKE ? ESCAPE '\\' OR e2.entity_type LIKE ? ESCAPE '\\' OR o.content LIKE ? ESCAPE '\\')
     `;
 
