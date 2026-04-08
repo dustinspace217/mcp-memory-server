@@ -119,6 +119,13 @@ export type CreateEntitiesResult = {
   skipped: SkippedEntity[];
 };
 
+/** Input for supersede_observations tool: replace one observation with another on an entity. */
+export interface SupersedeInput {
+  entityName: string;
+  oldContent: string;
+  newContent: string;
+}
+
 /**
  * The GraphStore interface -- the contract both JsonlStore and SqliteStore implement.
  * Methods mirror the MCP tool operations. Return types use Readonly to prevent
@@ -137,6 +144,7 @@ export interface GraphStore {
   deleteEntities(entityNames: string[]): Promise<void>;
   deleteObservations(deletions: DeleteObservationInput[]): Promise<void>;
   deleteRelations(relations: Relation[]): Promise<void>;
+  supersedeObservations(supersessions: SupersedeInput[]): Promise<void>;
   readGraph(projectId?: string, pagination?: PaginationParams): Promise<Readonly<PaginatedKnowledgeGraph>>;
   searchNodes(query: string, projectId?: string, pagination?: PaginationParams): Promise<Readonly<PaginatedKnowledgeGraph>>;
   openNodes(names: string[], projectId?: string): Promise<Readonly<KnowledgeGraph>>;
