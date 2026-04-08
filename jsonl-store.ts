@@ -20,6 +20,7 @@ import {
   type CreateEntitiesResult,
   type PaginationParams,
   type PaginatedKnowledgeGraph,
+  type SupersedeInput,
   InvalidCursorError,
 } from './types.js';
 import {
@@ -446,6 +447,17 @@ export class JsonlStore implements GraphStore {
     const keysToDelete = new Set(relations.map(r => JSON.stringify([r.from, r.to, r.relationType])));
     graph.relations = graph.relations.filter(r => !keysToDelete.has(JSON.stringify([r.from, r.to, r.relationType])));
     await this.saveGraph(graph);
+  }
+
+  /**
+   * Supersede observations is not supported in the JSONL backend.
+   * This feature requires SQLite for transactional atomicity and the
+   * superseded_at column. Users should migrate to SQLite to use this feature.
+   *
+   * @throws Error always -- JSONL backend does not support supersede
+   */
+  async supersedeObservations(_supersessions: SupersedeInput[]): Promise<void> {
+    throw new Error('supersede_observations not supported in JSONL backend: migrate to SQLite');
   }
 
   /**
