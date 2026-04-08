@@ -1254,6 +1254,79 @@ export class SqliteStore implements GraphStore {
     // Build full Entity objects with observations
     const entities = this.buildEntities(pageRows);
 
+    // --- Vector search: find additional entities LIKE missed ---
+    // If the embedding model is ready, run a KNN search for semantically
+    // similar observations. Merge results with LIKE results by entity ID.
+    // Vector results appear as supplementary matches appended to the page.
+    if (this.vecTableExists && this.embeddingPipeline.state.status === 'ready') {
+      try {
+        const queryEmbedding = await this.embeddingPipeline.embed(query);
+        if (queryEmbedding) {
+          // Request more KNN results than the page limit to account for
+          // duplicates and multiple observations per entity
+          const knnK = Math.min((limit ?? 40) * 2, 200);
+          const knnRows = this.db.prepare(`
+            SELECT observation_id, distance
+            FROM vec_observations
+            WHERE embedding MATCH ? AND k = ${knnK}
+          `).all(
+            Buffer.from(queryEmbedding.buffer, queryEmbedding.byteOffset, queryEmbedding.byteLength),
+          ) as { observation_id: string; distance: number }[];
+
+          if (knnRows.length > 0) {
+            // Map KNN observation IDs (stored as TEXT) to entity IDs,
+            // filtering for active observations + project scope
+            const obsIds = knnRows.map(r => parseInt(r.observation_id, 10));
+            const vecEntityIds = new Set<number>();
+
+            for (let i = 0; i < obsIds.length; i += CHUNK_SIZE) {
+              const chunk = obsIds.slice(i, i + CHUNK_SIZE);
+              const placeholders = chunk.map(() => '?').join(',');
+              let vecSql = `
+                SELECT DISTINCT e.id FROM observations o
+                JOIN entities e ON o.entity_id = e.id
+                WHERE o.id IN (${placeholders}) AND o.superseded_at = ''
+              `;
+              const vecParams: (string | number)[] = [...chunk];
+              if (normalizedProject) {
+                vecSql += ' AND (e.project = ? OR e.project IS NULL)';
+                vecParams.push(normalizedProject);
+              }
+              const rows = this.db.prepare(vecSql).all(...vecParams) as { id: number }[];
+              for (const r of rows) vecEntityIds.add(r.id);
+            }
+
+            // Filter out entities that LIKE already matches (on ANY page, not just current).
+            // When paginated, query the full CTE matched_ids set so we don't re-add
+            // entities that would appear on a different LIKE page.
+            const allLikeIds = isPaginated
+              ? new Set(
+                  (this.db.prepare(`${cteSql} SELECT id FROM matched_ids`).all(...cteParams) as { id: number }[])
+                    .map(r => r.id)
+                )
+              : new Set(pageRows.map(r => r.id));
+            const newIds = [...vecEntityIds].filter(id => !allLikeIds.has(id));
+
+            if (newIds.length > 0) {
+              // Fetch and build the vector-only entities
+              const ph = newIds.map(() => '?').join(',');
+              const newRows = this.db.prepare(`
+                SELECT name, entity_type AS entityType, project, updated_at, created_at, id
+                FROM entities WHERE id IN (${ph})
+                ORDER BY updated_at DESC, id DESC
+              `).all(...newIds) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string; id: number }[];
+              const vecEntities = this.buildEntities(newRows);
+              entities.push(...vecEntities);
+            }
+          }
+        }
+      } catch (err: unknown) {
+        // Vector search failed -- LIKE results are already in entities, just continue
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`Vector search augmentation failed: ${msg}`);
+      }
+    }
+
     // Relations: when paginated or project-filtered, both endpoints must be in the page.
     // When not paginated and not project-filtered, use OR logic (backward compat).
     const entityNames = new Set(pageRows.map(e => e.name));
