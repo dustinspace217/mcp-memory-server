@@ -468,6 +468,57 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
+   * Centralized helper for maintaining vec_observations in sync with observations.
+   * All mutation paths (create, add, delete, supersede) call this after their
+   * core transaction commits. Never throws -- embedding is best-effort.
+   *
+   * For 'delete': removes the embedding synchronously (can run inside or outside txn).
+   * For 'upsert': generates embedding async, then inserts. Skips if model not ready.
+   *
+   * @param observationId - The observations.id to sync
+   * @param content - The observation content text (only used for 'upsert')
+   * @param action - 'upsert' to generate+insert embedding, 'delete' to remove it
+   */
+  private async syncEmbedding(
+    observationId: number,
+    content: string,
+    action: 'upsert' | 'delete'
+  ): Promise<void> {
+    if (!this.vecTableExists) return;
+
+    if (action === 'delete') {
+      try {
+        this.db.prepare('DELETE FROM vec_observations WHERE observation_id = ?').run(String(observationId));
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`syncEmbedding delete failed for observation ${observationId}: ${msg}`);
+      }
+      return;
+    }
+
+    // 'upsert' -- need the model to be ready
+    if (this.embeddingPipeline.state.status !== 'ready') return;
+
+    const embedding = await this.embeddingPipeline.embed(content);
+    if (!embedding) return;
+
+    try {
+      // Delete any existing embedding first, then insert new one.
+      // vec0 doesn't support INSERT OR REPLACE, so we do delete+insert.
+      this.db.prepare('DELETE FROM vec_observations WHERE observation_id = ?').run(String(observationId));
+      this.db.prepare(
+        'INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)'
+      ).run(
+        Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+        String(observationId)
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`syncEmbedding upsert failed for observation ${observationId}: ${msg}`);
+    }
+  }
+
+  /**
    * Finds all active observations without embeddings and generates them.
    * Runs in batches of 100 with event loop yields between batches
    * so the server stays responsive to MCP requests during the sweep.
@@ -597,6 +648,20 @@ export class SqliteStore implements GraphStore {
     });
     txn();
 
+    // Generate embeddings for new observations (async, best-effort).
+    // If the model isn't ready, the sweep will catch these later.
+    for (const entity of created) {
+      const entityRow = this.db.prepare('SELECT id FROM entities WHERE name = ?').get(entity.name) as { id: number };
+      for (const obs of entity.observations) {
+        const obsRow = this.db.prepare(
+          `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
+        ).get(entityRow.id, obs.content) as { id: number } | undefined;
+        if (obsRow) {
+          await this.syncEmbedding(obsRow.id, obs.content, 'upsert');
+        }
+      }
+    }
+
     return { created, skipped };
   }
 
@@ -679,6 +744,20 @@ export class SqliteStore implements GraphStore {
     });
     txn();
 
+    // Generate embeddings for newly added observations (async, best-effort)
+    for (const result of results) {
+      const entityRow = this.db.prepare('SELECT id FROM entities WHERE name = ?').get(result.entityName) as { id: number } | undefined;
+      if (!entityRow) continue;
+      for (const obs of result.addedObservations) {
+        const obsRow = this.db.prepare(
+          `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
+        ).get(entityRow.id, obs.content) as { id: number } | undefined;
+        if (obsRow) {
+          await this.syncEmbedding(obsRow.id, obs.content, 'upsert');
+        }
+      }
+    }
+
     return results;
   }
 
@@ -690,6 +769,18 @@ export class SqliteStore implements GraphStore {
    * @param entityNames - Array of entity name strings to delete
    */
   async deleteEntities(entityNames: string[]): Promise<void> {
+    // Collect observation IDs before CASCADE deletes them -- vec_observations
+    // doesn't participate in CASCADE, so we must delete explicitly.
+    const obsIdsToDelete: number[] = [];
+    if (this.vecTableExists) {
+      for (const name of entityNames) {
+        const entityRow = this.db.prepare('SELECT id FROM entities WHERE name = ?').get(name) as { id: number } | undefined;
+        if (!entityRow) continue;
+        const obsRows = this.db.prepare('SELECT id FROM observations WHERE entity_id = ?').all(entityRow.id) as { id: number }[];
+        obsIdsToDelete.push(...obsRows.map(r => r.id));
+      }
+    }
+
     const del = this.db.prepare('DELETE FROM entities WHERE name = ?');
     const txn = this.db.transaction(() => {
       for (const name of entityNames) {
@@ -697,6 +788,11 @@ export class SqliteStore implements GraphStore {
       }
     });
     txn();
+
+    // Clean up vec_observations for CASCADE-deleted observations
+    for (const obsId of obsIdsToDelete) {
+      await this.syncEmbedding(obsId, '', 'delete');
+    }
   }
 
   /**
@@ -715,11 +811,20 @@ export class SqliteStore implements GraphStore {
       'UPDATE entities SET updated_at = ? WHERE id = ?'
     );
 
+    const deletedObsIds: number[] = [];
+
     const txn = this.db.transaction(() => {
       for (const d of deletions) {
         const row = findEntity.get(d.entityName) as { id: number } | undefined;
         if (!row) continue;
         for (const content of d.contents) {
+          // Look up the observation ID before deleting (needed for vec cleanup)
+          if (this.vecTableExists) {
+            const obsRow = this.db.prepare(
+              `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
+            ).get(row.id, content) as { id: number } | undefined;
+            if (obsRow) deletedObsIds.push(obsRow.id);
+          }
           delObs.run(row.id, content);
         }
         // Bump updated_at — the entity's content has changed
@@ -727,6 +832,11 @@ export class SqliteStore implements GraphStore {
       }
     });
     txn();
+
+    // Clean up vec_observations for deleted observations
+    for (const obsId of deletedObsIds) {
+      await this.syncEmbedding(obsId, '', 'delete');
+    }
   }
 
   /**
@@ -799,6 +909,12 @@ export class SqliteStore implements GraphStore {
         // Retire the old observation by setting its superseded_at timestamp
         supersedeObs.run(now, obsRow.id);
 
+        // Delete the old observation's embedding synchronously inside the transaction.
+        // vec_observations doesn't participate in CASCADE, so we clean up explicitly.
+        if (this.vecTableExists) {
+          this.db.prepare('DELETE FROM vec_observations WHERE observation_id = ?').run(String(obsRow.id));
+        }
+
         // Insert the replacement (INSERT OR IGNORE: if newContent already exists
         // as an active observation on this entity, skip -- idempotent)
         insertObs.run(entityRow.id, s.newContent, now);
@@ -808,6 +924,19 @@ export class SqliteStore implements GraphStore {
       }
     });
     txn();
+
+    // Generate embeddings for the new observations (async, after transaction).
+    // Uses the same findEntity prepared statement from above since it's still in scope.
+    for (const s of supersessions) {
+      const entityRow = findEntity.get(s.entityName) as { id: number } | undefined;
+      if (!entityRow) continue;
+      const newObsRow = this.db.prepare(
+        `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
+      ).get(entityRow.id, s.newContent) as { id: number } | undefined;
+      if (newObsRow) {
+        await this.syncEmbedding(newObsRow.id, s.newContent, 'upsert');
+      }
+    }
   }
 
   /**
