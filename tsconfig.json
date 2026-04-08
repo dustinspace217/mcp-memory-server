@@ -18,7 +18,8 @@
     "types.ts",
     "cursor.ts",
     "jsonl-store.ts",
-    "sqlite-store.ts"
+    "sqlite-store.ts",
+    "embedding.ts"
   ],
   "exclude": [
     "node_modules",
