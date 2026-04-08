@@ -3,7 +3,9 @@
 // Methods are async (returning resolved promises) to match the GraphStore interface.
 
 import Database from 'better-sqlite3';
+import * as sqliteVec from 'sqlite-vec';
 import { promises as fs } from 'fs';
+import { EmbeddingPipeline, EMBEDDING_DIM, type VectorState } from './embedding.js';
 import {
   createObservation,
   ENTITY_TIMESTAMP_SENTINEL,
@@ -79,6 +81,17 @@ export class SqliteStore implements GraphStore {
   // The '!' (definite assignment) tells TypeScript this is set in init() before use.
   // better-sqlite3's Database type -- a synchronous SQLite connection handle.
   private db!: Database.Database;
+
+  /** Embedding pipeline for vector search. Created in constructor. */
+  private embeddingPipeline = new EmbeddingPipeline();
+
+  /** Whether the vec_observations virtual table exists (sqlite-vec loaded successfully). */
+  private vecTableExists = false;
+
+  /** Exposes the current vector search state for callers to inspect. */
+  get vectorState(): VectorState {
+    return this.embeddingPipeline.state;
+  }
 
   /**
    * @param dbPath - Absolute path to the .db file. Created on first init() if missing.
@@ -311,6 +324,67 @@ export class SqliteStore implements GraphStore {
         `${migrationData.relations.length} relations to SQLite. Backup at ${jsonlPath}.bak`
       );
     }
+
+    // --- Vector search setup ---
+    // Load sqlite-vec extension and create the vec_observations virtual table.
+    // If loading fails (platform incompatibility, missing binary), degrade gracefully
+    // to LIKE-only search. The MEMORY_VECTOR_SEARCH env var can disable this entirely.
+    if (process.env.MEMORY_VECTOR_SEARCH === 'off') {
+      console.error('Vector search disabled via MEMORY_VECTOR_SEARCH=off');
+    } else {
+      try {
+        // sqliteVec.load() calls db.loadExtension() with the path to the native
+        // sqlite-vec binary shipped by the npm package
+        sqliteVec.load(this.db);
+
+        // Create the virtual table if it doesn't exist.
+        // vec0 is sqlite-vec's virtual table module for dense float vectors.
+        // IMPORTANT: vec0 v0.1.9 does NOT support explicit INTEGER PRIMARY KEY
+        // values on insert (only auto-assign). We use a TEXT auxiliary column
+        // (+observation_id) instead, which maps 1:1 with observations.id.
+        // The + prefix makes it an auxiliary column stored alongside vectors.
+        this.db.exec(`
+          CREATE VIRTUAL TABLE IF NOT EXISTS vec_observations USING vec0(
+            embedding float[${EMBEDDING_DIM}],
+            +observation_id TEXT NOT NULL
+          );
+        `);
+
+        this.vecTableExists = true;
+
+        // Startup consistency check: find orphaned embeddings (vec row but no
+        // matching active observation) and delete them. Handles CASCADE-deleted
+        // observations whose vec rows weren't cleaned up.
+        const orphanCount = (this.db.prepare(`
+          SELECT COUNT(*) AS cnt FROM vec_observations v
+          LEFT JOIN observations o ON CAST(v.observation_id AS INTEGER) = o.id
+          WHERE o.id IS NULL
+        `).get() as { cnt: number }).cnt;
+
+        if (orphanCount > 0) {
+          this.db.exec(`
+            DELETE FROM vec_observations WHERE CAST(observation_id AS INTEGER) NOT IN (
+              SELECT id FROM observations WHERE superseded_at = ''
+            )
+          `);
+          console.error(`Vector search: cleaned up ${orphanCount} orphaned embeddings`);
+        }
+
+        // Start loading the embedding model in the background.
+        // When ready, run the universal embedding sweep to generate embeddings
+        // for any active observations that don't have one yet.
+        this.embeddingPipeline.startLoading(() => {
+          this.runEmbeddingSweep();
+        });
+
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `sqlite-vec extension not available (${process.arch}/${process.platform}): ${msg}. ` +
+          `Vector search disabled. LIKE search remains functional.`
+        );
+      }
+    }
   }
 
   /**
@@ -390,6 +464,68 @@ export class SqliteStore implements GraphStore {
     if (this.db) {
       this.db.close();
       this.db = null!;
+    }
+  }
+
+  /**
+   * Finds all active observations without embeddings and generates them.
+   * Runs in batches of 100 with event loop yields between batches
+   * so the server stays responsive to MCP requests during the sweep.
+   * Called once after the embedding model finishes loading.
+   */
+  private async runEmbeddingSweep(): Promise<void> {
+    if (!this.vecTableExists || this.embeddingPipeline.state.status !== 'ready') return;
+
+    const BATCH_SIZE = 100;
+    let totalEmbedded = 0;
+
+    while (true) {
+      // If the database was closed (e.g., during shutdown), stop the sweep
+      if (!this.db) break;
+
+      // Find active observations missing from vec_observations.
+      // LEFT JOIN on the TEXT observation_id column (cast to match observations.id).
+      const batch = this.db.prepare(`
+        SELECT o.id, o.content FROM observations o
+        LEFT JOIN vec_observations v ON CAST(v.observation_id AS INTEGER) = o.id
+        WHERE v.observation_id IS NULL AND o.superseded_at = ''
+        ORDER BY o.id
+        LIMIT ?
+      `).all(BATCH_SIZE) as { id: number; content: string }[];
+
+      if (batch.length === 0) break;
+
+      // Generate embeddings for this batch
+      const results = await this.embeddingPipeline.embedBatch(batch);
+
+      // Insert embeddings into vec_observations.
+      // observation_id is stored as TEXT (String(id)) because vec0 v0.1.9
+      // doesn't support explicit INTEGER PRIMARY KEY values on insert.
+      if (results.length > 0 && this.db) {
+        const insert = this.db.prepare(
+          'INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)'
+        );
+        const txn = this.db.transaction(() => {
+          for (const { id, embedding } of results) {
+            insert.run(
+              Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+              String(id)
+            );
+          }
+        });
+        txn();
+        totalEmbedded += results.length;
+      }
+
+      // Yield the event loop so the server can handle MCP requests between batches
+      await new Promise(resolve => setImmediate(resolve));
+
+      // If the model failed during this batch, stop the sweep
+      if (this.embeddingPipeline.state.status !== 'ready') break;
+    }
+
+    if (totalEmbedded > 0) {
+      console.error(`Vector search: embedded ${totalEmbedded} observations during sweep`);
     }
   }
 
