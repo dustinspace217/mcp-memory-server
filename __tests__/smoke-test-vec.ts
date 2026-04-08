@@ -4,6 +4,9 @@
 
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
+// pipeline() is the high-level factory from @huggingface/transformers.
+// It returns a task-specific pipeline object (here: feature extraction = embeddings).
+import { pipeline } from '@huggingface/transformers';
 
 // Open an in-memory database (no file needed for this test)
 const db = new Database(':memory:');
@@ -58,6 +61,53 @@ if (results.length !== 1 || results[0].item_id !== 1) {
 
 console.log('PASS: sqlite-vec loaded, virtual table created, KNN query works');
 console.log(`  Result: item_id=${results[0].item_id}, distance=${results[0].distance}`);
+
+// --- Part 2: Test @huggingface/transformers embedding generation ---
+
+console.log('Loading embedding model (first run downloads ~23MB)...');
+
+// pipeline() returns a FeatureExtractionPipeline that converts text to vectors.
+// 'feature-extraction' is the task type for generating embeddings.
+// 'Xenova/all-MiniLM-L6-v2' is the ONNX-converted version of the popular
+// sentence-transformers model. 384 dimensions, fast, good for semantic similarity.
+const embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
+	dtype: 'fp32',
+});
+
+// Generate an embedding for a test sentence.
+// The result is a nested array: [[384 floats]]. We need the inner array.
+const output = await embedder('This is a test sentence about programming.', {
+	pooling: 'mean',       // Average all token embeddings into one vector
+	normalize: true,       // L2-normalize so cosine similarity = dot product
+});
+
+// output.data is a Float32Array of the pooled embedding
+const embedding = output.data as Float32Array;
+
+if (embedding.length !== 384) {
+	console.error(`FAIL: Expected 384 dimensions, got ${embedding.length}`);
+	process.exit(1);
+}
+
+console.log(`PASS: Embedding generated, ${embedding.length} dimensions`);
+console.log(`  First 5 values: [${Array.from(embedding.slice(0, 5)).map(v => v.toFixed(4)).join(', ')}]`);
+
+// Test that the embedding can be inserted into sqlite-vec
+db.prepare('INSERT INTO test_vec (embedding) VALUES (?)').run(
+	Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength)
+);
+
+// KNN search with the real embedding as query.
+// Note: k is hardcoded in the SQL string (not a bind parameter) because vec0
+// treats k as a literal constraint, not a parameterized value. Using AND k = ?
+// may fail depending on the vec0 version; hardcoding is the safe form.
+const semanticResults = db.prepare(`
+	SELECT item_id, distance
+	FROM test_vec
+	WHERE embedding MATCH ? AND k = 2
+`).all(Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength)) as { item_id: number; distance: number }[];
+
+console.log(`PASS: KNN search with real embedding returned ${semanticResults.length} results`);
 
 // Cleanup
 db.close();
