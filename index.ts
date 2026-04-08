@@ -148,7 +148,7 @@ const PaginatedOutputSchema = {
 
 const server = new McpServer({
   name: "memory-server",
-  version: "0.10.1",
+  version: "0.11.0",
 });
 
 server.registerTool(
@@ -271,6 +271,29 @@ server.registerTool(
     return {
       content: [{ type: "text" as const, text: "Relations deleted successfully" }],
       structuredContent: { success: true, message: "Relations deleted successfully" }
+    };
+  }
+);
+
+server.registerTool(
+  "supersede_observations",
+  {
+    title: "Supersede Observations",
+    description: "Atomically replace observations on entities. Retires the old observation and inserts the new one in a single transaction. Use this instead of delete+add when an observation's content has changed (e.g., updated status, count, or signature).",
+    inputSchema: {
+      supersessions: z.array(z.object({
+        entityName: z.string().min(1).max(500).describe("The entity whose observation to supersede"),
+        oldContent: z.string().min(1).max(5000).describe("The exact text of the active observation to retire"),
+        newContent: z.string().min(1).max(5000).describe("The replacement observation text"),
+      })).max(100),
+    },
+    outputSchema: { success: z.boolean(), message: z.string() }
+  },
+  async ({ supersessions }) => {
+    await store.supersedeObservations(supersessions);
+    return {
+      content: [{ type: "text" as const, text: "Observations superseded successfully" }],
+      structuredContent: { success: true, message: "Observations superseded successfully" }
     };
   }
 );
