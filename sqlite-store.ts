@@ -352,22 +352,24 @@ export class SqliteStore implements GraphStore {
 
         this.vecTableExists = true;
 
-        // Startup consistency check: find orphaned embeddings (vec row but no
-        // matching active observation) and delete them. Handles CASCADE-deleted
-        // observations whose vec rows weren't cleaned up.
-        const orphanCount = (this.db.prepare(`
-          SELECT COUNT(*) AS cnt FROM vec_observations v
-          LEFT JOIN observations o ON CAST(v.observation_id AS INTEGER) = o.id
-          WHERE o.id IS NULL
+        // Startup consistency check: find stale embeddings and delete them.
+        // Catches both truly orphaned vec rows (observation was CASCADE-deleted)
+        // AND embeddings for superseded observations that should no longer be searchable.
+        // Count and delete use the same NOT IN (active observations) predicate.
+        const staleCount = (this.db.prepare(`
+          SELECT COUNT(*) AS cnt FROM vec_observations
+          WHERE CAST(observation_id AS INTEGER) NOT IN (
+            SELECT id FROM observations WHERE superseded_at = ''
+          )
         `).get() as { cnt: number }).cnt;
 
-        if (orphanCount > 0) {
+        if (staleCount > 0) {
           this.db.exec(`
             DELETE FROM vec_observations WHERE CAST(observation_id AS INTEGER) NOT IN (
               SELECT id FROM observations WHERE superseded_at = ''
             )
           `);
-          console.error(`Vector search: cleaned up ${orphanCount} orphaned embeddings`);
+          console.error(`Vector search: cleaned up ${staleCount} stale/orphaned embeddings`);
         }
 
         // Start loading the embedding model in the background.
@@ -393,6 +395,11 @@ export class SqliteStore implements GraphStore {
    * Uses INSERT OR IGNORE to tolerate duplicates in corrupted JSONL data.
    * Dangling relations (referencing non-existent entities) are silently skipped
    * because the FK constraint prevents insertion.
+   *
+   * Note: does NOT call syncEmbedding() for migrated observations. This is intentional --
+   * migration runs during init() before the embedding model starts loading (startLoading()
+   * is called after migration). The universal embedding sweep catches all un-embedded
+   * observations after the model is ready, regardless of how they were created.
    *
    * @param graph - KnowledgeGraph loaded from the JSONL file by JsonlStore.readGraph()
    */
@@ -1327,11 +1334,15 @@ export class SqliteStore implements GraphStore {
       }
     }
 
-    // Relations: when paginated or project-filtered, both endpoints must be in the page.
+    // Relations: include vector-supplementary entities in the lookup set.
+    // entities[] may have more entries than pageRows if vector search found additional matches.
+    const entityNames = new Set(entities.map(e => e.name));
+    const allEntityNamesList = [...entityNames];
+
+    // When paginated or project-filtered, both endpoints must be in the result set.
     // When not paginated and not project-filtered, use OR logic (backward compat).
-    const entityNames = new Set(pageRows.map(e => e.name));
     if (isPaginated || projectId) {
-      const allRelations = this.getConnectedRelations(pageRows.map(e => e.name));
+      const allRelations = this.getConnectedRelations(allEntityNamesList);
       const filteredRelations = allRelations.filter(r =>
         entityNames.has(r.from) && entityNames.has(r.to)
       );
@@ -1339,7 +1350,7 @@ export class SqliteStore implements GraphStore {
     }
 
     // Unscoped + unpaginated: OR logic for relations (at least one endpoint matches)
-    const relations = this.getConnectedRelations(pageRows.map(e => e.name));
+    const relations = this.getConnectedRelations(allEntityNamesList);
     return { entities, relations, nextCursor, totalCount };
   }
 
