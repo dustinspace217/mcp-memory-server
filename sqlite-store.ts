@@ -134,22 +134,29 @@ export class SqliteStore implements GraphStore {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
 
-    // Create tables. IF NOT EXISTS makes this safe to call on an existing database.
-    // entities.name has a UNIQUE constraint so it can be referenced by relations.
+    // === Create tables with current (v4) schema ===
+    // IF NOT EXISTS makes this safe for existing databases. New databases get the
+    // latest schema directly; existing databases get migrated below.
+    // entities.name has a UNIQUE constraint so relations can reference it.
     // project is nullable: NULL means global (visible to all projects).
+    // updated_at/created_at track entity-level timestamps (sentinel for legacy data).
+    // observations.superseded_at: '' = active, ISO timestamp = retired.
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS entities (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         name        TEXT NOT NULL UNIQUE,
         entity_type TEXT NOT NULL,
-        project     TEXT
+        project     TEXT,
+        updated_at  TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+        created_at  TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}'
       );
       CREATE TABLE IF NOT EXISTS observations (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         entity_id   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
         content     TEXT NOT NULL,
         created_at  TEXT NOT NULL,
-        UNIQUE(entity_id, content)
+        superseded_at TEXT NOT NULL DEFAULT '',
+        UNIQUE(entity_id, content, superseded_at)
       );
       CREATE TABLE IF NOT EXISTS relations (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,31 +167,80 @@ export class SqliteStore implements GraphStore {
       );
     `);
 
-    // Migrate: add project column if upgrading from pre-Phase-3 schema.
-    // Uses pragma table_info to check if the column exists (spec-prescribed approach).
-    const columns = this.db.pragma('table_info(entities)') as { name: string }[];
-    const hasProject = columns.some(c => c.name === 'project');
-    if (!hasProject) {
+    // === Schema version tracking ===
+    // Instead of checking pragma('table_info') for each column, we track a single
+    // integer version. Makes migrations deterministic and future-proof.
+    // Version history:
+    //   1 = base schema (entities, observations, relations — no project, no timestamps)
+    //   2 = added project column to entities
+    //   3 = added updated_at, created_at to entities (with backfill from observations)
+    //   4 = added superseded_at to observations (table rebuild for UNIQUE constraint change)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_version (
+        version INTEGER NOT NULL
+      );
+    `);
+
+    // Read the current version. If the table is empty (first run or existing DB
+    // predating version tracking), detect current state from column existence.
+    let currentVersion: number;
+    const versionRow = this.db.prepare(
+      'SELECT version FROM schema_version'
+    ).get() as { version: number } | undefined;
+
+    if (versionRow) {
+      currentVersion = versionRow.version;
+    } else {
+      // Detect version from existing schema for databases that predate version tracking.
+      // pragma('table_info') returns column metadata for each table.
+      const entityCols = this.db.pragma('table_info(entities)') as { name: string }[];
+      const obsCols = this.db.pragma('table_info(observations)') as { name: string }[];
+
+      const hasProject = entityCols.some(c => c.name === 'project');
+      const hasUpdatedAt = entityCols.some(c => c.name === 'updated_at');
+      const hasSupersededAt = obsCols.some(c => c.name === 'superseded_at');
+
+      if (hasSupersededAt) {
+        currentVersion = 4;
+      } else if (hasUpdatedAt) {
+        currentVersion = 3;
+      } else if (hasProject) {
+        currentVersion = 2;
+      } else if (entityCols.length > 0) {
+        // entities table exists but has no project column — v1 schema
+        currentVersion = 1;
+      } else {
+        // Fresh database — tables were just created with the full v4 schema above
+        currentVersion = 4;
+      }
+
+      // Seed the version table so future startups skip the pragma detection
+      this.db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(currentVersion);
+    }
+
+    // === Run sequential migrations ===
+    // Each migration checks "if version < N", upgrades, and bumps the version.
+    // Only runs for databases that predate the target version.
+
+    if (currentVersion < 2) {
+      // v1 → v2: add project column to entities
       this.db.exec(`
         ALTER TABLE entities ADD COLUMN project TEXT;
         CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project);
       `);
+      this.db.prepare('UPDATE schema_version SET version = 2').run();
+      currentVersion = 2;
     }
 
-    // Migrate: add updated_at and created_at columns if upgrading from pre-Phase-4 schema.
-    // These timestamps track when the entity itself was last modified and when it was first created.
-    // Uses the same pragma table_info check pattern as the project column migration above.
-    // Wrapped in an explicit transaction so a crash between ALTER and backfill doesn't leave
-    // entities with permanent sentinel timestamps (which sort last in DESC order, effectively invisible).
-    const hasUpdatedAt = columns.some(c => c.name === 'updated_at');
-    if (!hasUpdatedAt) {
+    if (currentVersion < 3) {
+      // v2 → v3: add entity timestamps with backfill from observation data.
+      // Wrapped in an explicit transaction so a crash between ALTER and backfill
+      // doesn't leave entities with permanent sentinel timestamps.
       this.db.transaction(() => {
         this.db.exec(`
           ALTER TABLE entities ADD COLUMN updated_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}';
           ALTER TABLE entities ADD COLUMN created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}';
         `);
-        // Backfill updated_at from the most recent observation timestamp.
-        // Entities with no valid observation timestamps keep the sentinel value.
         this.db.exec(`
           UPDATE entities SET updated_at = (
             SELECT MAX(created_at) FROM observations
@@ -194,7 +250,6 @@ export class SqliteStore implements GraphStore {
             SELECT 1 FROM observations WHERE entity_id = entities.id AND created_at != 'unknown'
           );
         `);
-        // Also backfill created_at from the earliest observation timestamp
         this.db.exec(`
           UPDATE entities SET created_at = (
             SELECT MIN(created_at) FROM observations
@@ -205,35 +260,14 @@ export class SqliteStore implements GraphStore {
           );
         `);
       })();
+      this.db.prepare('UPDATE schema_version SET version = 3').run();
+      currentVersion = 3;
     }
 
-    // Create indexes if they don't exist yet (idempotent).
-    // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
-    // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
-    // in getConnectedRelations needs its own index to avoid full table scans.
-    this.db.exec('CREATE INDEX IF NOT EXISTS idx_relations_to_entity ON relations(to_entity);');
-
-    // Pagination indexes for keyset queries on (updated_at DESC, id DESC).
-    // The composite index with project as leftmost column supports project-scoped reads.
-    // The standalone index supports unscoped reads.
-    this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_project_updated ON entities(project, updated_at DESC, id DESC);');
-    this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_updated ON entities(updated_at DESC, id DESC);');
-
-    // Drop the single-column idx_entities_project — it's now covered by the composite
-    // idx_entities_project_updated which has project as its leftmost column.
-    // The single-column index was created during Phase 3 migration; once the composite exists,
-    // it's redundant and wastes disk space + INSERT/UPDATE overhead.
-    this.db.exec('DROP INDEX IF EXISTS idx_entities_project;');
-
-    // Migrate: add superseded_at column to observations table.
-    // SQLite can't ALTER a UNIQUE constraint, so we rebuild the table.
-    // - superseded_at = '' means active observation (sentinel, not NULL, for UNIQUE correctness)
-    // - superseded_at = ISO timestamp means the observation was retired at that time
-    // New UNIQUE(entity_id, content, superseded_at) allows the same content to be
-    // re-asserted after supersession (different superseded_at values).
-    const obsColumns = this.db.pragma('table_info(observations)') as { name: string }[];
-    const hasSupersededAt = obsColumns.some(c => c.name === 'superseded_at');
-    if (!hasSupersededAt) {
+    if (currentVersion < 4) {
+      // v3 → v4: add superseded_at to observations (table rebuild).
+      // SQLite can't ALTER a UNIQUE constraint, so we rebuild the table.
+      // superseded_at = '' means active; ISO timestamp means retired.
       this.db.transaction(() => {
         this.db.exec(`
           CREATE TABLE observations_new (
@@ -250,10 +284,24 @@ export class SqliteStore implements GraphStore {
           ALTER TABLE observations_new RENAME TO observations;
         `);
       })();
+      this.db.prepare('UPDATE schema_version SET version = 4').run();
+      currentVersion = 4;
     }
 
-    // Partial index on active observations -- used by all queries that filter
-    // by superseded_at = ''. Superseded observations don't need indexing.
+    // === Indexes (idempotent, run on every startup) ===
+    // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
+    // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
+    // in getConnectedRelations needs its own index to avoid full table scans.
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_relations_to_entity ON relations(to_entity);');
+
+    // Pagination indexes for keyset queries on (updated_at DESC, id DESC).
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_project_updated ON entities(project, updated_at DESC, id DESC);');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_updated ON entities(updated_at DESC, id DESC);');
+
+    // Drop the single-column idx_entities_project — covered by composite idx_entities_project_updated.
+    this.db.exec('DROP INDEX IF EXISTS idx_entities_project;');
+
+    // Partial index on active observations — used by WHERE superseded_at = '' filters.
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_observations_active
       ON observations(entity_id) WHERE superseded_at = '';

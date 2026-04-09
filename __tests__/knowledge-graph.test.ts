@@ -2068,6 +2068,22 @@ describe('SqliteStore-specific', () => {
 		}
 	});
 
+	describe('schema versioning', () => {
+		it('should track schema version in schema_version table', async () => {
+			// The store was already init'd in beforeEach — verify the version table exists.
+			// Open the same DB read-only to inspect the schema_version table directly.
+			const Database = (await import('better-sqlite3')).default;
+			const conn = new Database(storePath, { readonly: true });
+			const row = conn.prepare('SELECT version FROM schema_version').get() as { version: number } | undefined;
+			conn.close();
+
+			expect(row).toBeDefined();
+			// Fresh databases should be at version 4 (current schema).
+			// After Task 6b lands (temporal relations), this becomes 5.
+			expect(row!.version).toBeGreaterThanOrEqual(4);
+		});
+	});
+
 	describe('foreign key constraints', () => {
 		it('should reject relations referencing non-existent entities', async () => {
 			await expect(
