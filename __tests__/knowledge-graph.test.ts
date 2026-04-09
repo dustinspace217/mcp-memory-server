@@ -129,6 +129,21 @@ describe.each<[string, string, StoreFactory]>([
 			const newRelations = await store.createRelations([]);
 			expect(newRelations).toHaveLength(0);
 		});
+
+		it('should include createdAt and supersededAt on relations', async () => {
+			await store.createEntities([
+				{ name: 'A', entityType: 'test', observations: ['hello'] },
+				{ name: 'B', entityType: 'test', observations: ['world'] },
+			], undefined);
+			await store.createRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+
+			const graph = await store.readGraph();
+			expect(graph.relations).toHaveLength(1);
+			// Relations should carry temporal fields: createdAt (non-empty) and
+			// supersededAt (empty string = active, ISO timestamp = invalidated)
+			expect(graph.relations[0].createdAt).toBeDefined();
+			expect(graph.relations[0].supersededAt).toBe('');
+		});
 	});
 
 	// ----------------------------------------------------------
@@ -2104,9 +2119,8 @@ describe('SqliteStore-specific', () => {
 			conn.close();
 
 			expect(row).toBeDefined();
-			// Fresh databases should be at version 4 (current schema).
-			// After Task 6b lands (temporal relations), this becomes 5.
-			expect(row!.version).toBeGreaterThanOrEqual(4);
+			// Fresh databases should be at version 5 (current schema with temporal relations).
+			expect(row!.version).toBe(5);
 		});
 	});
 
@@ -2345,6 +2359,71 @@ describe('SqliteStore-specific', () => {
 			for (const suffix of ['', '-wal', '-shm']) {
 				try { await fs.unlink(migrationPath + suffix); } catch { /* ignore */ }
 			}
+		});
+	});
+
+	// ----------------------------------------------------------
+	// temporal relations (superseded_at pattern, mirrors observations)
+	// ----------------------------------------------------------
+	describe('temporal relations', () => {
+		it('invalidateRelations should hide relation from active queries', async () => {
+			await store.createEntities([
+				{ name: 'A', entityType: 'test', observations: ['hello'] },
+				{ name: 'B', entityType: 'test', observations: ['world'] },
+			], undefined);
+			await store.createRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+			await store.invalidateRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+
+			const graph = await store.readGraph();
+			expect(graph.relations).toHaveLength(0);
+		});
+
+		it('invalidateRelations should be idempotent', async () => {
+			await store.createEntities([
+				{ name: 'A', entityType: 'test', observations: ['hello'] },
+				{ name: 'B', entityType: 'test', observations: ['world'] },
+			], undefined);
+			await store.createRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+
+			// Calling twice should not throw or cause issues
+			await store.invalidateRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+			await store.invalidateRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+
+			const graph = await store.readGraph();
+			expect(graph.relations).toHaveLength(0);
+		});
+
+		it('should allow re-creating a relation after invalidation', async () => {
+			await store.createEntities([
+				{ name: 'A', entityType: 'test', observations: ['hello'] },
+				{ name: 'B', entityType: 'test', observations: ['world'] },
+			], undefined);
+			await store.createRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+			await store.invalidateRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+
+			// Re-creating should succeed — UNIQUE includes superseded_at, so active + invalidated
+			// rows don't collide
+			await store.createRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+			const graph = await store.readGraph();
+			expect(graph.relations).toHaveLength(1);
+			expect(graph.relations[0].supersededAt).toBe('');
+		});
+
+		it('deleteRelations should only delete active relations', async () => {
+			await store.createEntities([
+				{ name: 'A', entityType: 'test', observations: ['hello'] },
+				{ name: 'B', entityType: 'test', observations: ['world'] },
+			], undefined);
+			await store.createRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+			await store.invalidateRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+
+			// deleteRelations should not affect already-invalidated relations
+			await store.deleteRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+
+			// Re-create and verify it works (the invalidated row is preserved in history)
+			await store.createRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+			const graph = await store.readGraph();
+			expect(graph.relations).toHaveLength(1);
 		});
 	});
 });

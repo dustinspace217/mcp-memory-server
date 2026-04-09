@@ -49,7 +49,10 @@ describe('JSONL to SQLite migration', () => {
     expect(graph.entities).toHaveLength(2);
     expect(graph.entities.find(e => e.name === 'Alice')?.observations[0].content).toBe('works at Acme');
     expect(graph.relations).toHaveLength(1);
-    expect(graph.relations[0]).toEqual({ from: 'Alice', to: 'Bob', relationType: 'knows' });
+    // Migrated relations get sentinel createdAt (legacy data) and '' supersededAt (active)
+    expect(graph.relations[0]).toEqual(
+      expect.objectContaining({ from: 'Alice', to: 'Bob', relationType: 'knows' })
+    );
 
     await sqliteStore.close();
   });

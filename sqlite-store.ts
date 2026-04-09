@@ -168,7 +168,9 @@ export class SqliteStore implements GraphStore {
         from_entity   TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
         to_entity     TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
         relation_type TEXT NOT NULL,
-        UNIQUE(from_entity, to_entity, relation_type)
+        created_at    TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+        superseded_at TEXT NOT NULL DEFAULT '',
+        UNIQUE(from_entity, to_entity, relation_type, superseded_at)
       );
     `);
 
@@ -180,6 +182,7 @@ export class SqliteStore implements GraphStore {
     //   2 = added project column to entities
     //   3 = added updated_at, created_at to entities (with backfill from observations)
     //   4 = added superseded_at to observations (table rebuild for UNIQUE constraint change)
+    //   5 = added created_at, superseded_at to relations (table rebuild for temporal relations)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_version (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -201,12 +204,16 @@ export class SqliteStore implements GraphStore {
       // pragma('table_info') returns column metadata for each table.
       const entityCols = this.db.pragma('table_info(entities)') as { name: string }[];
       const obsCols = this.db.pragma('table_info(observations)') as { name: string }[];
+      const relCols = this.db.pragma('table_info(relations)') as { name: string }[];
 
       const hasProject = entityCols.some(c => c.name === 'project');
       const hasUpdatedAt = entityCols.some(c => c.name === 'updated_at');
-      const hasSupersededAt = obsCols.some(c => c.name === 'superseded_at');
+      const hasObsSupersededAt = obsCols.some(c => c.name === 'superseded_at');
+      const hasRelSupersededAt = relCols.some(c => c.name === 'superseded_at');
 
-      if (hasSupersededAt) {
+      if (hasRelSupersededAt) {
+        currentVersion = 5;
+      } else if (hasObsSupersededAt) {
         currentVersion = 4;
       } else if (hasUpdatedAt) {
         currentVersion = 3;
@@ -216,8 +223,8 @@ export class SqliteStore implements GraphStore {
         // entities table exists but has no project column — v1 schema
         currentVersion = 1;
       } else {
-        // Fresh database — tables were just created with the full v4 schema above
-        currentVersion = 4;
+        // Fresh database — tables were just created with the full v5 schema above
+        currentVersion = 5;
       }
 
       // Seed the version table so future startups skip the pragma detection.
@@ -295,11 +302,42 @@ export class SqliteStore implements GraphStore {
       currentVersion = 4;
     }
 
+    if (currentVersion < 5) {
+      // Migration 4 → 5: add temporal fields to relations (table rebuild).
+      // Mirrors the observations pattern: superseded_at = '' means active,
+      // ISO timestamp means the relation has been invalidated.
+      // created_at tracks when the relation was established.
+      // UNIQUE constraint includes superseded_at so the same triple can exist
+      // with multiple time windows (active after re-creation post-invalidation).
+      this.db.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE relations_new (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_entity   TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+            to_entity     TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+            relation_type TEXT NOT NULL,
+            created_at    TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+            superseded_at TEXT NOT NULL DEFAULT '',
+            UNIQUE(from_entity, to_entity, relation_type, superseded_at)
+          );
+          INSERT INTO relations_new (id, from_entity, to_entity, relation_type, created_at, superseded_at)
+            SELECT id, from_entity, to_entity, relation_type, '${ENTITY_TIMESTAMP_SENTINEL}', '' FROM relations;
+          DROP TABLE relations;
+          ALTER TABLE relations_new RENAME TO relations;
+        `);
+      })();
+      this.db.prepare('UPDATE schema_version SET version = 5').run();
+      currentVersion = 5;
+    }
+
     // === Indexes (idempotent, run on every startup) ===
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
     // in getConnectedRelations needs its own index to avoid full table scans.
-    this.db.exec('CREATE INDEX IF NOT EXISTS idx_relations_to_entity ON relations(to_entity);');
+    // Partial index on active relations only (superseded_at = '') since queries always filter.
+    // Drop+recreate: v5 migration changed the schema, old non-partial index is stale.
+    this.db.exec('DROP INDEX IF EXISTS idx_relations_to_entity;');
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_relations_to_entity_active ON relations(to_entity) WHERE superseded_at = '';`);
 
     // Pagination indexes for keyset queries on (updated_at DESC, id DESC).
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_project_updated ON entities(project, updated_at DESC, id DESC);');
@@ -748,31 +786,31 @@ export class SqliteStore implements GraphStore {
 
   /**
    * Creates new relations in the SQLite database.
-   * Uses INSERT OR IGNORE to skip duplicates (UNIQUE constraint on all 3 fields).
+   * Uses INSERT OR IGNORE to skip duplicates (UNIQUE constraint on from, to, type, superseded_at).
    * Foreign key constraints ensure both endpoint entities exist -- throws on violation.
+   * Sets created_at to current timestamp; superseded_at defaults to '' (active).
    *
    * @param relations - Array of { from, to, relationType }
-   * @returns Only the relations that were actually created
+   * @returns Only the relations that were actually created, with temporal fields
    * @throws SqliteError if from or to entity doesn't exist (FK constraint violation)
    */
   async createRelations(relations: RelationInput[]): Promise<Relation[]> {
+    const now = new Date().toISOString();
     const insert = this.db.prepare(
-      'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type) VALUES (?, ?, ?)'
+      'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)'
     );
 
     const results: Relation[] = [];
 
     const txn = this.db.transaction(() => {
       for (const r of relations) {
-        const info = insert.run(r.from, r.to, r.relationType);
+        const info = insert.run(r.from, r.to, r.relationType, now);
         if (info.changes > 0) {
-          // Return full Relation with temporal defaults (pre-migration sentinel values).
-          // After Task 6b adds the actual columns, these come from the DB.
           results.push({
             from: r.from,
             to: r.to,
             relationType: r.relationType,
-            createdAt: ENTITY_TIMESTAMP_SENTINEL,
+            createdAt: now,
             supersededAt: '',
           });
         }
@@ -938,14 +976,16 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
-   * Deletes specific relations by exact match on all three fields.
-   * Silently ignores non-existent relations (idempotent).
+   * Deletes active relations by exact match on all three fields.
+   * Only deletes relations where superseded_at = '' (active). Invalidated relations
+   * are preserved for history and are not affected by this operation.
+   * Silently ignores non-existent or already-invalidated relations (idempotent).
    *
    * @param relations - Array of { from, to, relationType }
    */
   async deleteRelations(relations: RelationInput[]): Promise<void> {
     const del = this.db.prepare(
-      'DELETE FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ?'
+      `DELETE FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ? AND superseded_at = ''`
     );
     const txn = this.db.transaction(() => {
       for (const r of relations) {
@@ -1083,12 +1123,13 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
-   * Fetches all relations where at least one endpoint is in the given name set.
+   * Fetches all active relations where at least one endpoint is in the given name set.
+   * Filters out invalidated relations (superseded_at != '').
    * Chunks the IN clause to stay within SQLite's parameter limit.
    * Uses CHUNK_SIZE / 2 per chunk because each name appears twice (from OR to).
    *
    * @param entityNames - Array of entity name strings
-   * @returns Relation array with from/to/relationType fields
+   * @returns Active Relation array with from/to/relationType and temporal fields
    */
   private getConnectedRelations(entityNames: string[]): Relation[] {
     if (entityNames.length === 0) return [];
@@ -1101,18 +1142,16 @@ export class SqliteStore implements GraphStore {
     for (let i = 0; i < entityNames.length; i += halfChunk) {
       const chunk = entityNames.slice(i, i + halfChunk);
       const placeholders = chunk.map(() => '?').join(',');
-      // Query selects 3 columns; temporal fields (createdAt, supersededAt) are added
-      // as defaults until Task 6b migrates the schema to include them in the table.
+      // Select temporal columns directly — schema v5 guarantees they exist.
+      // Only return active relations (superseded_at = '').
       const rows = this.db.prepare(`
-        SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType
+        SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType,
+               created_at AS createdAt, superseded_at AS supersededAt
         FROM relations
-        WHERE from_entity IN (${placeholders}) OR to_entity IN (${placeholders})
-      `).all(...chunk, ...chunk) as { from: string; to: string; relationType: string }[];
-      results.push(...rows.map(r => ({
-        ...r,
-        createdAt: ENTITY_TIMESTAMP_SENTINEL,
-        supersededAt: '',
-      })));
+        WHERE (from_entity IN (${placeholders}) OR to_entity IN (${placeholders}))
+          AND superseded_at = ''
+      `).all(...chunk, ...chunk) as Relation[];
+      results.push(...rows);
     }
 
     // Deduplicate: chunked queries may return the same relation if its endpoints
@@ -1239,9 +1278,12 @@ export class SqliteStore implements GraphStore {
       return { entities, relations: filteredRelations, nextCursor, totalCount };
     }
 
-    // Unscoped + unpaginated: return all relations (backward compatible with original behavior)
+    // Unscoped + unpaginated: return all active relations (backward compatible with original behavior).
+    // Filters out invalidated relations (superseded_at != '') and includes temporal columns.
     const relations = this.db.prepare(
-      'SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType FROM relations'
+      `SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType,
+              created_at AS createdAt, superseded_at AS supersededAt
+       FROM relations WHERE superseded_at = ''`
     ).all() as Relation[];
 
     return { entities, relations, nextCursor, totalCount };
@@ -1523,14 +1565,25 @@ export class SqliteStore implements GraphStore {
 
   /**
    * Invalidates relations by setting superseded_at to current timestamp.
-   * Stub for Task 6a — actual implementation comes in Task 6b after the
-   * superseded_at column is added to the relations table.
+   * The relation row is preserved for history — it just won't appear in active queries.
+   * Idempotent: already-invalidated relations (superseded_at != '') are unaffected
+   * because the WHERE clause only matches active rows.
    *
-   * @param _relations - Array of { from, to, relationType } to invalidate
-   * @throws Error always until Task 6b adds the column
+   * @param relations - Array of { from, to, relationType } identifying relations to invalidate
    */
-  async invalidateRelations(_relations: InvalidateRelationInput[]): Promise<void> {
-    throw new Error('invalidate_relations not yet implemented: pending schema migration (Task 6b)');
+  async invalidateRelations(relations: InvalidateRelationInput[]): Promise<void> {
+    const now = new Date().toISOString();
+    // Only update active relations (superseded_at = '') — already-invalidated are skipped
+    const invalidate = this.db.prepare(
+      `UPDATE relations SET superseded_at = ?
+       WHERE from_entity = ? AND to_entity = ? AND relation_type = ? AND superseded_at = ''`
+    );
+    const txn = this.db.transaction(() => {
+      for (const r of relations) {
+        invalidate.run(now, r.from, r.to, r.relationType);
+      }
+    });
+    txn();
   }
 
   /**
