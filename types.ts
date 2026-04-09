@@ -115,7 +115,9 @@ export interface PaginatedKnowledgeGraph extends KnowledgeGraph {
  * This is a class (not an interface) so it can be thrown and caught with instanceof.
  */
 export class InvalidCursorError extends Error {
-  // message is the human-readable reason the cursor was rejected
+  /** @param message - Human-readable reason the cursor was rejected (e.g.,
+   *  "Cursor has invalid structure", "Cursor does not match current query").
+   *  Surfaces in McpError responses so the client knows what went wrong. */
   constructor(message: string) {
     super(message);
     // Explicitly set the name so stack traces show "InvalidCursorError" instead of "Error"
@@ -195,19 +197,64 @@ export interface GraphStore {
   /** Cleanup: close DB connection. No-op for JSONL. */
   close(): Promise<void>;
 
+  /** Signals the store to stop background work (e.g., embedding sweep) and
+   *  prepare for shutdown. Call before close(). No-op for backends without
+   *  background tasks. */
+  shutdown(): void;
+
+  /** Creates new entities. Skips entities whose names already exist (UNIQUE constraint)
+   *  and reports them as skipped with their owning project for collision feedback.
+   *  @param entities - Array of EntityInput objects. Observations can be plain strings
+   *                    (auto-timestamped) or Observation objects.
+   *  @param projectId - Optional project scope. Omit or pass undefined for global scope. */
   createEntities(entities: EntityInput[], projectId?: string): Promise<Readonly<CreateEntitiesResult>>;
+  /** Creates new relations between existing entities. Deduplicates by composite key
+   *  [from, to, relationType]. In SQLite, FK constraints enforce both endpoints exist.
+   *  @param relations - Array of RelationInput (3-field). Temporal fields are system-assigned.
+   *  @returns Only the relations actually created, as full Relation objects with temporal fields */
   createRelations(relations: RelationInput[]): Promise<Readonly<Relation[]>>;
+  /** Adds observations to existing entities. Deduplicates by content string.
+   *  Throws if any entityName does not match an existing entity.
+   *  @param observations - Array of { entityName, contents: string[] }
+   *  @returns Per-entity results with added observations and optional similarExisting warnings */
   addObservations(observations: AddObservationInput[]): Promise<Readonly<AddObservationResult[]>>;
+  /** Deletes entities by name and cascade-deletes their observations and relations.
+   *  Idempotent — silently ignores names that don't match any entity. */
   deleteEntities(entityNames: string[]): Promise<void>;
+  /** Deletes specific observations by content string from the named entities.
+   *  Idempotent — silently ignores non-existent entities or observations. */
   deleteObservations(deletions: DeleteObservationInput[]): Promise<void>;
+  /** Deletes relations by exact match on all three fields (from, to, relationType).
+   *  Idempotent — silently ignores non-existent relations. */
   deleteRelations(relations: RelationInput[]): Promise<void>;
+  /** Atomically retires old observations and inserts replacements in a single transaction.
+   *  Not supported by JSONL backend (throws).
+   *  @param supersessions - Array of { entityName, oldContent, newContent }
+   *  @throws Error if entity or active observation not found, or if JSONL backend */
   supersedeObservations(supersessions: SupersedeInput[]): Promise<void>;
   /** Invalidates relations by setting superseded_at to current timestamp.
-   * Idempotent — ignores already-invalidated relations. */
-  invalidateRelations(relations: InvalidateRelationInput[]): Promise<void>;
+   * Idempotent — ignores already-invalidated relations.
+   * Returns the number of relations actually invalidated (0 if all were already inactive). */
+  invalidateRelations(relations: InvalidateRelationInput[]): Promise<number>;
+  /** Returns the knowledge graph, optionally filtered by project, with cursor-based pagination.
+   *  Entities are sorted by most recently updated first. Relations are included only when
+   *  both endpoints appear in the result set.
+   *  @param projectId - Optional project scope. When set, includes project + global entities.
+   *  @param pagination - Optional cursor and limit. Omit for all results (backward compat). */
   readGraph(projectId?: string, pagination?: PaginationParams): Promise<Readonly<PaginatedKnowledgeGraph>>;
+  /** Searches for entities matching a case-insensitive substring query against name,
+   *  entityType, or observation content. Augmented with vector similarity search when
+   *  the embedding model is ready (SQLite only). Results paginated by recency.
+   *  @param query - Case-insensitive substring to search for
+   *  @param projectId - Optional project scope
+   *  @param pagination - Optional cursor and limit */
   searchNodes(query: string, projectId?: string, pagination?: PaginationParams): Promise<Readonly<PaginatedKnowledgeGraph>>;
+  /** Retrieves specific entities by exact name match plus connected relations.
+   *  Non-existent names are silently skipped. Use this instead of readGraph when you
+   *  need full relation context for a known set of entities. */
   openNodes(names: string[], projectId?: string): Promise<Readonly<KnowledgeGraph>>;
+  /** Lists all distinct project names that have at least one entity.
+   *  Global entities (project === null) are excluded. */
   listProjects(): Promise<string[]>;
   /** Returns full timeline for an entity (all observations and relations, active + superseded). */
   entityTimeline(entityName: string, projectId?: string): Promise<EntityTimelineResult | null>;

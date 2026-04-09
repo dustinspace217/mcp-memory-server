@@ -749,4 +749,421 @@ describe('MCP Tool Handler Integration', () => {
 			expect(graph).not.toHaveProperty('totalCount');
 		});
 	});
+
+	// ----------------------------------------------------------
+	// Section 5: entity_timeline tool handler
+	// ----------------------------------------------------------
+	describe('entity_timeline tool handler', () => {
+
+		it('returns full timeline with superseded observations', async () => {
+			const projectId = normalizeProjectId('timeline-test');
+			await store.createEntities([
+				{ name: 'TimelineEntity', entityType: 'concept', observations: ['version 1'] },
+			], projectId);
+
+			await store.supersedeObservations([
+				{ entityName: 'TimelineEntity', oldContent: 'version 1', newContent: 'version 2' },
+			]);
+
+			const result = await store.entityTimeline(
+				'TimelineEntity',
+				normalizeProjectId('timeline-test')
+			);
+
+			expect(result).not.toBeNull();
+			expect(result!.name).toBe('TimelineEntity');
+			expect(result!.entityType).toBe('concept');
+			expect(result!.project).toBe('timeline-test');
+			expect(result!.observations).toHaveLength(2);
+
+			const superseded = result!.observations.find(o => o.status === 'superseded');
+			const active = result!.observations.find(o => o.status === 'active');
+
+			expect(superseded).toBeDefined();
+			expect(superseded!.content).toBe('version 1');
+			expect(superseded!.supersededAt).not.toBe('');
+			expect(superseded!.supersededAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+			expect(active).toBeDefined();
+			expect(active!.content).toBe('version 2');
+			expect(active!.supersededAt).toBe('');
+		});
+
+		it('returns null for non-existent entity', async () => {
+			const result = await store.entityTimeline(
+				'DoesNotExist',
+				normalizeProjectId('no-project')
+			);
+			expect(result).toBeNull();
+		});
+
+		it('includes temporal relations in timeline (active + superseded)', async () => {
+			await store.createEntities([
+				{ name: 'TimeA', entityType: 'test', observations: ['a'] },
+				{ name: 'TimeB', entityType: 'test', observations: ['b'] },
+			]);
+			await store.createRelations([
+				{ from: 'TimeA', to: 'TimeB', relationType: 'links_to' },
+			]);
+			await store.invalidateRelations([
+				{ from: 'TimeA', to: 'TimeB', relationType: 'links_to' },
+			]);
+			await store.createRelations([
+				{ from: 'TimeA', to: 'TimeB', relationType: 'links_to' },
+			]);
+
+			const timeline = await store.entityTimeline('TimeA');
+			expect(timeline).not.toBeNull();
+			expect(timeline!.relations).toHaveLength(2);
+
+			const supersededRelations = timeline!.relations.filter(r => r.status === 'superseded');
+			const activeRelations = timeline!.relations.filter(r => r.status === 'active');
+			expect(supersededRelations).toHaveLength(1);
+			expect(activeRelations).toHaveLength(1);
+		});
+
+		it('normalizes projectId before calling store', async () => {
+			await store.createEntities([
+				{ name: 'NormTimeline', entityType: 'node', observations: ['obs1'] },
+			], normalizeProjectId('TimeProject'));
+
+			const result = await store.entityTimeline(
+				'NormTimeline',
+				normalizeProjectId(' TIMEPROJECT ')
+			);
+
+			expect(result).not.toBeNull();
+			expect(result!.name).toBe('NormTimeline');
+			expect(result!.project).toBe('timeproject');
+		});
+	});
+
+	// ----------------------------------------------------------
+	// Section 6: invalidate_relations tool handler
+	// ----------------------------------------------------------
+	describe('invalidate_relations tool handler', () => {
+
+		it('invalidates active relations and returns count', async () => {
+			await store.createEntities([
+				{ name: 'IR_A', entityType: 'test', observations: ['a'] },
+				{ name: 'IR_B', entityType: 'test', observations: ['b'] },
+			]);
+			await store.createRelations([
+				{ from: 'IR_A', to: 'IR_B', relationType: 'knows' },
+			]);
+
+			const changed = await store.invalidateRelations([
+				{ from: 'IR_A', to: 'IR_B', relationType: 'knows' },
+			]);
+			expect(changed).toBe(1);
+
+			const graph = await store.readGraph();
+			expect(graph.relations).toHaveLength(0);
+		});
+
+		it('idempotent: already-invalidated relation returns 0', async () => {
+			await store.createEntities([
+				{ name: 'Idem_A', entityType: 'test', observations: ['a'] },
+				{ name: 'Idem_B', entityType: 'test', observations: ['b'] },
+			]);
+			await store.createRelations([
+				{ from: 'Idem_A', to: 'Idem_B', relationType: 'knows' },
+			]);
+
+			expect(await store.invalidateRelations([
+				{ from: 'Idem_A', to: 'Idem_B', relationType: 'knows' },
+			])).toBe(1);
+
+			expect(await store.invalidateRelations([
+				{ from: 'Idem_A', to: 'Idem_B', relationType: 'knows' },
+			])).toBe(0);
+		});
+
+		it('reports actual vs requested counts for mixed batch', async () => {
+			await store.createEntities([
+				{ name: 'Mix_A', entityType: 'test', observations: ['a'] },
+				{ name: 'Mix_B', entityType: 'test', observations: ['b'] },
+				{ name: 'Mix_C', entityType: 'test', observations: ['c'] },
+			]);
+			await store.createRelations([
+				{ from: 'Mix_A', to: 'Mix_B', relationType: 'rel1' },
+				{ from: 'Mix_A', to: 'Mix_C', relationType: 'rel2' },
+			]);
+
+			// Pre-invalidate one
+			await store.invalidateRelations([
+				{ from: 'Mix_A', to: 'Mix_B', relationType: 'rel1' },
+			]);
+
+			const relations = [
+				{ from: 'Mix_A', to: 'Mix_B', relationType: 'rel1' },
+				{ from: 'Mix_A', to: 'Mix_C', relationType: 'rel2' },
+			];
+			const changed = await store.invalidateRelations(relations);
+			expect(changed).toBe(1);
+
+			// Verify handler message construction
+			const requested = relations.length;
+			const message = changed === requested
+				? `Invalidated ${changed} relation(s).`
+				: `Invalidated ${changed} of ${requested} relation(s) (${requested - changed} already inactive).`;
+			expect(message).toBe('Invalidated 1 of 2 relation(s) (1 already inactive).');
+		});
+
+		it('returns 0 when invalidating non-existent relations', async () => {
+			await store.createEntities([
+				{ name: 'Ghost_A', entityType: 'test', observations: ['a'] },
+				{ name: 'Ghost_B', entityType: 'test', observations: ['b'] },
+			]);
+
+			const changed = await store.invalidateRelations([
+				{ from: 'Ghost_A', to: 'Ghost_B', relationType: 'nonexistent' },
+			]);
+			expect(changed).toBe(0);
+		});
+
+		it('handler message uses simple format when all succeed', async () => {
+			await store.createEntities([
+				{ name: 'All_A', entityType: 'test', observations: ['a'] },
+				{ name: 'All_B', entityType: 'test', observations: ['b'] },
+			]);
+			await store.createRelations([
+				{ from: 'All_A', to: 'All_B', relationType: 'r1' },
+			]);
+
+			const changed = await store.invalidateRelations([
+				{ from: 'All_A', to: 'All_B', relationType: 'r1' },
+			]);
+			expect(changed).toBe(1);
+			const message = changed === 1
+				? `Invalidated ${changed} relation(s).`
+				: `should not reach here`;
+			expect(message).toBe('Invalidated 1 relation(s).');
+		});
+	});
+
+	// ----------------------------------------------------------
+	// Section 7: supersede_observations tool handler
+	// ----------------------------------------------------------
+	describe('supersede_observations tool handler', () => {
+
+		it('supersedes observation and old is hidden from active queries', async () => {
+			await store.createEntities([
+				{ name: 'SupEntity', entityType: 'concept', observations: ['status: draft'] },
+			], normalizeProjectId('sup-test'));
+
+			await store.supersedeObservations([
+				{ entityName: 'SupEntity', oldContent: 'status: draft', newContent: 'status: published' },
+			]);
+
+			const graph = await store.readGraph(normalizeProjectId('sup-test'), { limit: 40 });
+			expect(graph.entities).toHaveLength(1);
+			expect(graph.entities[0].observations).toHaveLength(1);
+			expect(graph.entities[0].observations[0].content).toBe('status: published');
+		});
+
+		it('throws when old observation does not exist on entity', async () => {
+			await store.createEntities([
+				{ name: 'SupMissing', entityType: 'concept', observations: ['existing content'] },
+			]);
+
+			await expect(
+				store.supersedeObservations([
+					{ entityName: 'SupMissing', oldContent: 'wrong content', newContent: 'new content' },
+				])
+			).rejects.toThrow();
+		});
+
+		it('throws when entity does not exist', async () => {
+			await expect(
+				store.supersedeObservations([
+					{ entityName: 'NoSuchEntity', oldContent: 'anything', newContent: 'anything else' },
+				])
+			).rejects.toThrow('not found');
+		});
+
+		it('superseded observation appears in timeline but not in readGraph', async () => {
+			await store.createEntities([
+				{ name: 'SupTimeline', entityType: 'test', observations: ['v1'] },
+			]);
+
+			await store.supersedeObservations([
+				{ entityName: 'SupTimeline', oldContent: 'v1', newContent: 'v2' },
+			]);
+
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'SupTimeline');
+			expect(entity).toBeDefined();
+			expect(entity!.observations).toHaveLength(1);
+			expect(entity!.observations[0].content).toBe('v2');
+
+			const timeline = await store.entityTimeline('SupTimeline');
+			expect(timeline).not.toBeNull();
+			expect(timeline!.observations).toHaveLength(2);
+			expect(timeline!.observations.find(o => o.status === 'superseded')!.content).toBe('v1');
+			expect(timeline!.observations.find(o => o.status === 'active')!.content).toBe('v2');
+		});
+
+		it('Zod rejects empty oldContent', () => {
+			const SupersessionsInputSchema = z.object({
+				supersessions: z.array(z.object({
+					entityName: z.string().min(1).max(500),
+					oldContent: z.string().min(1).max(5000),
+					newContent: z.string().min(1).max(5000),
+				})).max(100),
+			});
+
+			const result = SupersessionsInputSchema.safeParse({
+				supersessions: [{ entityName: 'E1', oldContent: '', newContent: 'new' }],
+			});
+			expect(result.success).toBe(false);
+		});
+
+		it('Zod rejects missing entityName', () => {
+			const SupersessionsInputSchema = z.object({
+				supersessions: z.array(z.object({
+					entityName: z.string().min(1).max(500),
+					oldContent: z.string().min(1).max(5000),
+					newContent: z.string().min(1).max(5000),
+				})).max(100),
+			});
+
+			const result = SupersessionsInputSchema.safeParse({
+				supersessions: [{ oldContent: 'old', newContent: 'new' }],
+			});
+			expect(result.success).toBe(false);
+		});
+	});
+
+	// ----------------------------------------------------------
+	// Section 8: Error responses
+	// ----------------------------------------------------------
+	describe('error responses', () => {
+
+		it('add_observations throws for non-existent entity', async () => {
+			await expect(
+				store.addObservations([
+					{ entityName: 'EntityThatDoesNotExist', contents: ['some observation'] },
+				])
+			).rejects.toThrow('Entity with name EntityThatDoesNotExist not found');
+		});
+
+		it('add_observations rolls back entire batch when one entity missing', async () => {
+			await store.createEntities([
+				{ name: 'ValidEntity', entityType: 'test', observations: ['exists'] },
+			]);
+
+			await expect(
+				store.addObservations([
+					{ entityName: 'ValidEntity', contents: ['new obs'] },
+					{ entityName: 'InvalidEntity', contents: ['will fail'] },
+				])
+			).rejects.toThrow('Entity with name InvalidEntity not found');
+
+			// Transaction rolled back — ValidEntity should NOT have the new observation
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'ValidEntity');
+			expect(entity!.observations).toHaveLength(1);
+			expect(entity!.observations[0].content).toBe('exists');
+		});
+
+		it('Zod rejects empty entityName in add_observations', () => {
+			const AddObsSchema = z.object({
+				observations: z.array(z.object({
+					entityName: z.string().min(1).max(500),
+					contents: z.array(z.string().min(1).max(5000)).max(100),
+				})).max(100),
+			});
+			expect(AddObsSchema.safeParse({
+				observations: [{ entityName: '', contents: ['obs'] }],
+			}).success).toBe(false);
+		});
+
+		it('Zod rejects empty contents string in add_observations', () => {
+			const AddObsSchema = z.object({
+				observations: z.array(z.object({
+					entityName: z.string().min(1).max(500),
+					contents: z.array(z.string().min(1).max(5000)).max(100),
+				})).max(100),
+			});
+			expect(AddObsSchema.safeParse({
+				observations: [{ entityName: 'X', contents: [''] }],
+			}).success).toBe(false);
+		});
+
+		it('Zod rejects empty from field in invalidate_relations', () => {
+			const InvalidateSchema = z.object({
+				relations: z.array(z.object({
+					from: z.string().min(1).max(500),
+					to: z.string().min(1).max(500),
+					relationType: z.string().min(1).max(500),
+				})).min(1).max(100),
+			});
+			expect(InvalidateSchema.safeParse({
+				relations: [{ from: '', to: 'B', relationType: 'knows' }],
+			}).success).toBe(false);
+		});
+
+		it('Zod rejects empty entityName in entity_timeline', () => {
+			const TimelineSchema = z.object({
+				entityName: z.string().min(1).max(500),
+				projectId: ProjectIdSchema,
+			});
+			expect(TimelineSchema.safeParse({ entityName: '' }).success).toBe(false);
+		});
+	});
+
+	// ----------------------------------------------------------
+	// Section 9: create_entities skip signal
+	// ----------------------------------------------------------
+	describe('create_entities skip signal', () => {
+
+		it('all entities already exist produces skip summary', async () => {
+			const projectId = normalizeProjectId('skip-test');
+			await store.createEntities([
+				{ name: 'Existing1', entityType: 'test', observations: ['obs1'] },
+				{ name: 'Existing2', entityType: 'test', observations: ['obs2'] },
+			], projectId);
+
+			const result = await store.createEntities([
+				{ name: 'Existing1', entityType: 'test', observations: ['obs1'] },
+				{ name: 'Existing2', entityType: 'test', observations: ['obs2'] },
+			], projectId);
+
+			expect(result.created).toHaveLength(0);
+			expect(result.skipped).toHaveLength(2);
+		});
+
+		it('mixed batch reports created and skipped', async () => {
+			const projectId = normalizeProjectId('mixed-skip');
+			await store.createEntities([
+				{ name: 'AlreadyHere', entityType: 'test', observations: ['old obs'] },
+			], projectId);
+
+			const result = await store.createEntities([
+				{ name: 'AlreadyHere', entityType: 'test', observations: ['new obs'] },
+				{ name: 'BrandNew', entityType: 'test', observations: ['fresh obs'] },
+			], projectId);
+
+			expect(result.created).toHaveLength(1);
+			expect(result.created[0].name).toBe('BrandNew');
+			expect(result.skipped).toHaveLength(1);
+			expect(result.skipped[0].name).toBe('AlreadyHere');
+		});
+
+		it('skipped entry includes existingProject for collision feedback', async () => {
+			const projectId = normalizeProjectId('ProjectX');
+			await store.createEntities([
+				{ name: 'Singleton', entityType: 'unique', observations: ['data'] },
+			], projectId);
+
+			const result = await store.createEntities([
+				{ name: 'Singleton', entityType: 'unique', observations: ['more data'] },
+			], projectId);
+
+			expect(result.skipped).toHaveLength(1);
+			expect(result.skipped[0].name).toBe('Singleton');
+			expect(result.skipped[0].existingProject).toBe('projectx');
+		});
+	});
 });

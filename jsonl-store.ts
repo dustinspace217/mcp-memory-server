@@ -110,6 +110,9 @@ export function normalizeObservation(obs: unknown): Observation {
  * SQLite supports vector search, observation supersede, and temporal relations.
  */
 export class JsonlStore implements GraphStore {
+  /** @param memoryFilePath - Absolute path to the .jsonl file. Created on first write
+   *  if it doesn't exist. The entire graph is loaded from this file on every read
+   *  and written back atomically on every write. */
   constructor(private memoryFilePath: string) {
     console.error(
       'WARNING: JSONL backend is deprecated and will be removed in v2.0. ' +
@@ -122,6 +125,9 @@ export class JsonlStore implements GraphStore {
 
   /** No-op for JSONL -- no connection to close. */
   async close(): Promise<void> {}
+
+  /** No-op for JSONL -- no background tasks to stop. */
+  shutdown(): void {}
 
   /**
    * Reads the JSONL file and parses it into a KnowledgeGraph.
@@ -500,7 +506,7 @@ export class JsonlStore implements GraphStore {
    *
    * @throws Error always -- JSONL backend does not support invalidate_relations
    */
-  async invalidateRelations(_relations: InvalidateRelationInput[]): Promise<void> {
+  async invalidateRelations(_relations: InvalidateRelationInput[]): Promise<number> {
     throw new Error('invalidate_relations not supported in JSONL backend: migrate to SQLite');
   }
 

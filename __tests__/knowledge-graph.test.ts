@@ -2511,4 +2511,189 @@ describe('SqliteStore-specific', () => {
 		// (it may be higher due to pagination, never lower)
 		expect(result.totalCount).toBeGreaterThanOrEqual(result.entities.length);
 	});
+
+	// ----------------------------------------------------------
+	// temporal relations: full create/invalidate/re-create lifecycle
+	// ----------------------------------------------------------
+	it('should preserve both historical entries after create-invalidate-create-invalidate cycle', async () => {
+		await store.createEntities([
+			{ name: 'X', entityType: 'test', observations: ['x-obs'] },
+			{ name: 'Y', entityType: 'test', observations: ['y-obs'] },
+		], undefined);
+
+		// First cycle: create and invalidate
+		await store.createRelations([{ from: 'X', to: 'Y', relationType: 'linked' }]);
+		await store.invalidateRelations([{ from: 'X', to: 'Y', relationType: 'linked' }]);
+
+		// Small delay to ensure the second superseded_at timestamp differs from the first.
+		// The UNIQUE constraint is (from_entity, to_entity, relation_type, superseded_at),
+		// so two invalidations within the same millisecond would collide.
+		await new Promise(r => setTimeout(r, 5));
+
+		// Second cycle: re-create and invalidate again
+		await store.createRelations([{ from: 'X', to: 'Y', relationType: 'linked' }]);
+		await store.invalidateRelations([{ from: 'X', to: 'Y', relationType: 'linked' }]);
+
+		// Active graph should have zero relations
+		const graph = await store.readGraph();
+		expect(graph.relations).toHaveLength(0);
+
+		// Timeline should show BOTH historical relation entries (both superseded)
+		const timeline = await store.entityTimeline('X');
+		expect(timeline).not.toBeNull();
+		expect(timeline!.relations).toHaveLength(2);
+		const superseded = timeline!.relations.filter(r => r.status === 'superseded');
+		expect(superseded).toHaveLength(2);
+		for (const rel of superseded) {
+			expect(rel.from).toBe('X');
+			expect(rel.to).toBe('Y');
+			expect(rel.supersededAt).not.toBe('');
+		}
+	});
+
+	// ----------------------------------------------------------
+	// entityTimeline — entity with only relations, no observations
+	// ----------------------------------------------------------
+	it('timeline should work for entity with only relations (no observations)', async () => {
+		await store.createEntities([
+			{ name: 'RelOnly', entityType: 'test', observations: [] },
+			{ name: 'Target', entityType: 'test', observations: ['target-obs'] },
+		], undefined);
+		await store.createRelations([{ from: 'RelOnly', to: 'Target', relationType: 'points-to' }]);
+
+		const timeline = await store.entityTimeline('RelOnly');
+		expect(timeline).not.toBeNull();
+		expect(timeline!.observations).toHaveLength(0);
+		expect(timeline!.relations).toHaveLength(1);
+		expect(timeline!.relations[0].status).toBe('active');
+	});
+
+	// ----------------------------------------------------------
+	// entityTimeline — entity with only observations, no relations
+	// ----------------------------------------------------------
+	it('timeline should work for entity with only observations (no relations)', async () => {
+		await store.createEntities([
+			{ name: 'ObsOnly', entityType: 'test', observations: ['fact one', 'fact two'] },
+		], undefined);
+
+		const timeline = await store.entityTimeline('ObsOnly');
+		expect(timeline).not.toBeNull();
+		expect(timeline!.observations).toHaveLength(2);
+		expect(timeline!.observations.every(o => o.status === 'active')).toBe(true);
+		expect(timeline!.relations).toHaveLength(0);
+	});
+
+	// ----------------------------------------------------------
+	// addObservations — empty contents array
+	// ----------------------------------------------------------
+	it('should handle empty contents array without crashing', async () => {
+		await store.createEntities([
+			{ name: 'EmptyContents', entityType: 'test', observations: ['existing'] },
+		], undefined);
+
+		const results = await store.addObservations([
+			{ entityName: 'EmptyContents', contents: [] },
+		]);
+
+		expect(results).toHaveLength(1);
+		expect(results[0].addedObservations).toHaveLength(0);
+
+		const graph = await store.readGraph();
+		const entity = graph.entities.find(e => e.name === 'EmptyContents');
+		expect(entity?.observations).toHaveLength(1);
+	});
+
+	// ----------------------------------------------------------
+	// supersedeObservations edge cases
+	// ----------------------------------------------------------
+	it('should throw when oldContent does not exist as active observation', async () => {
+		await store.createEntities([
+			{ name: 'SupEdge', entityType: 'test', observations: ['actual content'] },
+		], undefined);
+
+		await expect(
+			store.supersedeObservations([
+				{ entityName: 'SupEdge', oldContent: 'nonexistent content', newContent: 'replacement' },
+			])
+		).rejects.toThrow(/not found/);
+	});
+
+	it('should be idempotent when newContent already exists as active observation', async () => {
+		await store.createEntities([
+			{ name: 'SupIdem', entityType: 'test', observations: ['old value', 'new value'] },
+		], undefined);
+
+		// Supersede 'old value' -> 'new value', but 'new value' already exists
+		await store.supersedeObservations([
+			{ entityName: 'SupIdem', oldContent: 'old value', newContent: 'new value' },
+		]);
+
+		const graph = await store.readGraph();
+		const entity = graph.entities.find(e => e.name === 'SupIdem')!;
+		expect(entity.observations).toHaveLength(1);
+		expect(entity.observations[0].content).toBe('new value');
+
+		const timeline = await store.entityTimeline('SupIdem');
+		const superseded = timeline!.observations.filter(o => o.status === 'superseded');
+		expect(superseded).toHaveLength(1);
+		expect(superseded[0].content).toBe('old value');
+	});
+
+	// ----------------------------------------------------------
+	// invalidateRelations return count accuracy
+	// ----------------------------------------------------------
+	it('should return count of actually invalidated relations (skipping already inactive)', async () => {
+		await store.createEntities([
+			{ name: 'R1', entityType: 'test', observations: ['r1'] },
+			{ name: 'R2', entityType: 'test', observations: ['r2'] },
+			{ name: 'R3', entityType: 'test', observations: ['r3'] },
+			{ name: 'R4', entityType: 'test', observations: ['r4'] },
+		], undefined);
+
+		await store.createRelations([
+			{ from: 'R1', to: 'R2', relationType: 'link' },
+			{ from: 'R2', to: 'R3', relationType: 'link' },
+			{ from: 'R3', to: 'R4', relationType: 'link' },
+		]);
+
+		// Pre-invalidate one
+		expect(await store.invalidateRelations([
+			{ from: 'R1', to: 'R2', relationType: 'link' },
+		])).toBe(1);
+
+		// Now invalidate all 3 — but R1->R2 is already inactive
+		expect(await store.invalidateRelations([
+			{ from: 'R1', to: 'R2', relationType: 'link' },
+			{ from: 'R2', to: 'R3', relationType: 'link' },
+			{ from: 'R3', to: 'R4', relationType: 'link' },
+		])).toBe(2);
+
+		const graph = await store.readGraph();
+		expect(graph.relations).toHaveLength(0);
+	});
+
+	it('should return 0 when all targeted relations are already inactive', async () => {
+		await store.createEntities([
+			{ name: 'P', entityType: 'test', observations: ['p'] },
+			{ name: 'Q', entityType: 'test', observations: ['q'] },
+		], undefined);
+
+		await store.createRelations([{ from: 'P', to: 'Q', relationType: 'connected' }]);
+		await store.invalidateRelations([{ from: 'P', to: 'Q', relationType: 'connected' }]);
+
+		expect(await store.invalidateRelations([
+			{ from: 'P', to: 'Q', relationType: 'connected' },
+		])).toBe(0);
+	});
+
+	it('should return 0 when invalidating relations that never existed', async () => {
+		await store.createEntities([
+			{ name: 'M', entityType: 'test', observations: ['m'] },
+			{ name: 'N', entityType: 'test', observations: ['n'] },
+		], undefined);
+
+		expect(await store.invalidateRelations([
+			{ from: 'M', to: 'N', relationType: 'phantom' },
+		])).toBe(0);
+	});
 });

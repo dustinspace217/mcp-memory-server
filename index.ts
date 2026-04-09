@@ -432,10 +432,14 @@ server.registerTool(
     outputSchema: { success: z.boolean(), message: z.string() }
   },
   async ({ relations }) => {
-    await store.invalidateRelations(relations);
+    const changed = await store.invalidateRelations(relations);
+    // Report actual changes vs requested — already-invalidated relations are skipped
+    const message = changed === relations.length
+      ? `Invalidated ${changed} relation(s).`
+      : `Invalidated ${changed} of ${relations.length} relation(s) (${relations.length - changed} already inactive).`;
     return {
-      content: [{ type: "text" as const, text: `Invalidated ${relations.length} relation(s).` }],
-      structuredContent: { success: true, message: `Invalidated ${relations.length} relation(s).` }
+      content: [{ type: "text" as const, text: message }],
+      structuredContent: { success: true, message, invalidated: changed, requested: relations.length }
     };
   }
 );
@@ -513,18 +517,16 @@ main().catch((error) => {
   process.exit(1);
 });
 
-// Graceful shutdown: close the store to release SQLite file locks and flush WAL.
-// Without this, -wal and -shm sidecar files may linger on disk after unclean exit.
-// Graceful shutdown: signal the embedding sweep to stop, then close the database.
-// Wrapped in try/catch so process.exit() always runs even if close() throws
-// (e.g., double-close, database corruption, or mid-transaction signal).
+// Graceful shutdown: signal the embedding sweep to stop, then close the database
+// to release SQLite file locks and flush WAL. Without this, -wal and -shm sidecar
+// files may linger on disk after unclean exit. Wrapped in try/catch so
+// process.exit() always runs even if close() throws.
 process.on('SIGINT', async () => {
   try {
-    // Signal the store to stop the embedding sweep gracefully
-    if (store && 'shutdown' in store) {
-      (store as SqliteStore).shutdown();
+    if (store) {
+      store.shutdown();
+      await store.close();
     }
-    if (store) await store.close();
   } catch (err) {
     console.error('Error closing store during SIGINT shutdown:', err);
   }
@@ -532,10 +534,10 @@ process.on('SIGINT', async () => {
 });
 process.on('SIGTERM', async () => {
   try {
-    if (store && 'shutdown' in store) {
-      (store as SqliteStore).shutdown();
+    if (store) {
+      store.shutdown();
+      await store.close();
     }
-    if (store) await store.close();
   } catch (err) {
     console.error('Error closing store during SIGTERM shutdown:', err);
   }

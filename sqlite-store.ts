@@ -922,19 +922,34 @@ export class SqliteStore implements GraphStore {
             const embedding = await this.embeddingPipeline.embed(obs.content);
             if (!embedding) continue;
 
-            // KNN search for top-3 nearest neighbors across all entities.
-            // We filter to same-entity + not-self afterward.
+            // KNN search for nearest neighbors across all entities.
+            // We request a larger k (20) because we filter to same-entity
+            // afterward — with a small k (3), all top results might belong
+            // to unrelated entities and the real same-entity match could be
+            // missed entirely. At scale (50k+ observations), consider
+            // partitioned vec0 tables or a WHERE clause on entity_id if
+            // sqlite-vec adds support for filtered KNN.
             const knnRows = this.db.prepare(`
               SELECT v.observation_id, v.distance FROM vec_observations v
-              WHERE v.embedding MATCH ? AND k = 3
+              WHERE v.embedding MATCH ? AND k = 20
             `).all(
               Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
             ) as { observation_id: string; distance: number }[];
 
+            // Track how many same-entity matches we've found for this observation.
+            // Cap at 3 to avoid flooding the response when many observations
+            // on the same entity are semantically related.
+            let matchesForThisObs = 0;
+            const MAX_SIMILAR_PER_OBS = 3;
+
             for (const knn of knnRows) {
+              if (matchesForThisObs >= MAX_SIMILAR_PER_OBS) break;
+
               // Convert L2 distance on normalized vectors to cosine similarity.
-              // For unit vectors: cos_sim = 1 - (L2_dist^2 / 2)
-              const similarity = 1 - knn.distance / 2;
+              // For unit vectors: cos_sim = 1 - (L2_dist² / 2).
+              // sqlite-vec default metric is L2 (Euclidean), not squared L2,
+              // so we must square it ourselves before dividing by 2.
+              const similarity = 1 - (knn.distance * knn.distance) / 2;
               if (similarity <= 0.85) continue;
 
               // Check that this observation belongs to the same entity AND is not
@@ -946,6 +961,7 @@ export class SqliteStore implements GraphStore {
 
               if (obsRow) {
                 similar.push({ content: obsRow.content, similarity: Math.round(similarity * 1000) / 1000 });
+                matchesForThisObs++;
               }
             }
           }
@@ -1229,10 +1245,13 @@ export class SqliteStore implements GraphStore {
     }
 
     // Deduplicate: chunked queries may return the same relation if its endpoints
-    // span different chunks (e.g., from in chunk 1, to in chunk 2)
+    // span different chunks (e.g., from in chunk 1, to in chunk 2).
+    // Uses null-byte (\0) separator instead of JSON.stringify for efficiency —
+    // avoids allocating a JSON array string per relation. \0 can't appear in
+    // entity names (Zod .min(1) + MCP JSON transport rejects null bytes).
     const seen = new Set<string>();
     return results.filter(r => {
-      const key = JSON.stringify([r.from, r.to, r.relationType]);
+      const key = `${r.from}\0${r.to}\0${r.relationType}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -1654,19 +1673,22 @@ export class SqliteStore implements GraphStore {
    *
    * @param relations - Array of { from, to, relationType } identifying relations to invalidate
    */
-  async invalidateRelations(relations: InvalidateRelationInput[]): Promise<void> {
+  async invalidateRelations(relations: InvalidateRelationInput[]): Promise<number> {
     const now = new Date().toISOString();
     // Only update active relations (superseded_at = '') — already-invalidated are skipped
     const invalidate = this.db.prepare(
       `UPDATE relations SET superseded_at = ?
        WHERE from_entity = ? AND to_entity = ? AND relation_type = ? AND superseded_at = ''`
     );
+    let totalChanged = 0;
     const txn = this.db.transaction(() => {
       for (const r of relations) {
-        invalidate.run(now, r.from, r.to, r.relationType);
+        const result = invalidate.run(now, r.from, r.to, r.relationType);
+        totalChanged += result.changes;
       }
     });
     txn();
+    return totalChanged;
   }
 
   /**
