@@ -120,7 +120,7 @@ const ProjectIdSchema = z.string().trim().min(1).max(500)
  * @param projectId - Raw projectId string from tool input, may be undefined
  * @returns Cleaned lowercase string, or undefined if input was empty/missing
  */
-function normalizeProjectId(projectId?: string): string | undefined {
+export function normalizeProjectId(projectId?: string): string | undefined {
   if (!projectId) return undefined;
   // trim() removes surrounding whitespace; toLowerCase() ensures
   // "MyProject" and "myproject" map to the same scope;

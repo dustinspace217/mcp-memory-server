@@ -614,8 +614,9 @@ export class SqliteStore implements GraphStore {
    * @returns CreateEntitiesResult with created entities and skipped duplicates
    */
   async createEntities(entities: EntityInput[], projectId?: string): Promise<CreateEntitiesResult> {
-    // Normalize the project ID: trim whitespace, lowercase, NFC normalize, or null for global
-    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC') || null;
+    // projectId arrives pre-normalized from normalizeProjectId() in index.ts.
+    // Convert undefined (global scope) to null for the SQLite column value.
+    const normalizedProject = projectId ?? null;
 
     // Capture the current time once for all entities in this batch (consistent timestamps)
     const now = new Date().toISOString();
@@ -1080,7 +1081,8 @@ export class SqliteStore implements GraphStore {
       cursor = decodeCursor(pagination.cursor, fingerprint);
     }
 
-    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
+    // projectId arrives pre-normalized from normalizeProjectId() in index.ts
+    const normalizedProject = projectId;
 
     // Build the WHERE clause dynamically based on project filter and cursor position.
     // Conditions array collects SQL fragments; params array collects bound values.
@@ -1208,7 +1210,8 @@ export class SqliteStore implements GraphStore {
     // Escape LIKE wildcards so user input like "100%" matches literally
     const escaped = escapeLike(query);
     const pattern = `%${escaped}%`;
-    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
+    // projectId arrives pre-normalized from normalizeProjectId() in index.ts
+    const normalizedProject = projectId;
 
     // Use a CTE (Common Table Expression) to compute the set of matching entity IDs
     // once, then reuse it for both pagination and total count. This avoids running the
@@ -1399,7 +1402,8 @@ export class SqliteStore implements GraphStore {
     // Safe via MCP (Zod .max(100) on names array) but needed for direct callers with 900+ names.
     type EntityRow = { name: string; entityType: string; project: string | null; updated_at: string; created_at: string };
     let entityRows: EntityRow[] = [];
-    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
+    // projectId arrives pre-normalized from normalizeProjectId() in index.ts
+    const normalizedProject = projectId;
 
     for (let i = 0; i < names.length; i += CHUNK_SIZE) {
       const chunk = names.slice(i, i + CHUNK_SIZE);

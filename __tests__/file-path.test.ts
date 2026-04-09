@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { ensureMemoryFilePath, defaultMemoryPath } from '../index.js';
+import { ensureMemoryFilePath, defaultMemoryPath, normalizeProjectId } from '../index.js';
 
 describe('ensureMemoryFilePath', () => {
   const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -102,5 +102,34 @@ describe('ensureMemoryFilePath', () => {
       const migratedContent = await fs.readFile(jsonlMemoryPath, 'utf-8');
       expect(migratedContent).toBe(testContent);
     });
+  });
+});
+
+// normalizeProjectId is now exported from index.ts and is the single
+// place where project IDs are cleaned up. Stores trust this was called.
+describe('normalizeProjectId', () => {
+  it('should lowercase and trim whitespace', () => {
+    expect(normalizeProjectId('  My-Project  ')).toBe('my-project');
+  });
+
+  it('should NFC-normalize Unicode', () => {
+    // NFD "cafe\u0301" and NFC "caf\u00e9" should both become "café"
+    expect(normalizeProjectId('cafe\u0301')).toBe('caf\u00e9');
+  });
+
+  it('should return undefined for empty string', () => {
+    expect(normalizeProjectId('')).toBeUndefined();
+  });
+
+  it('should return undefined for whitespace-only string', () => {
+    expect(normalizeProjectId('   ')).toBeUndefined();
+  });
+
+  it('should return undefined for undefined input', () => {
+    expect(normalizeProjectId(undefined)).toBeUndefined();
+  });
+
+  it('should return undefined when called with no arguments', () => {
+    expect(normalizeProjectId()).toBeUndefined();
   });
 });

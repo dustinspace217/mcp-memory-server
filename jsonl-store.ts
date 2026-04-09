@@ -319,8 +319,9 @@ export class JsonlStore implements GraphStore {
    */
   async createEntities(entities: EntityInput[], projectId?: string): Promise<CreateEntitiesResult> {
     const graph = await this.loadGraph();
-    // Normalize the project ID: trim whitespace, lowercase, or null for global
-    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC') || null;
+    // projectId arrives pre-normalized from normalizeProjectId() in index.ts.
+    // Convert undefined (global scope) to null for the entity project field.
+    const normalizedProject = projectId ?? null;
 
     // Capture a single timestamp for all entities created in this batch
     const now = new Date().toISOString();
@@ -491,9 +492,9 @@ export class JsonlStore implements GraphStore {
     let filteredRelations = graph.relations;
 
     if (projectId) {
-      const normalizedProject = projectId.trim().toLowerCase().normalize('NFC');
+      // projectId arrives pre-normalized from normalizeProjectId() in index.ts
       filteredEntities = graph.entities.filter(e =>
-        e.project === normalizedProject || e.project === null
+        e.project === projectId || e.project === null
       );
       const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
       filteredRelations = graph.relations.filter(r =>
@@ -517,7 +518,8 @@ export class JsonlStore implements GraphStore {
   async searchNodes(query: string, projectId?: string, pagination?: PaginationParams): Promise<PaginatedKnowledgeGraph> {
     const graph = await this.loadGraph();
     const lowerQuery = query.toLowerCase();
-    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
+    // projectId arrives pre-normalized from normalizeProjectId() in index.ts
+    const normalizedProject = projectId;
     // Fingerprint includes both projectId and query so cursors can't cross-pollinate
     const fingerprint = searchNodesFingerprint(projectId, query);
 
@@ -559,7 +561,8 @@ export class JsonlStore implements GraphStore {
   async openNodes(names: string[], projectId?: string): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
     const nameSet = new Set(names);
-    const normalizedProject = projectId?.trim().toLowerCase().normalize('NFC');
+    // projectId arrives pre-normalized from normalizeProjectId() in index.ts
+    const normalizedProject = projectId;
 
     // First filter: match by name
     let filteredEntities = graph.entities.filter(e => nameSet.has(e.name));

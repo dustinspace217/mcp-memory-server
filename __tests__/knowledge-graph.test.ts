@@ -618,10 +618,12 @@ describe.each<[string, string, StoreFactory]>([
 			expect(result.created[0].project).toBeNull();
 		});
 
-		it('should normalize projectId to lowercase and trimmed', async () => {
+		it('should store pre-normalized projectId as-is', async () => {
+			// Normalization now happens in normalizeProjectId() in index.ts before
+			// reaching the store. Store receives already-normalized values.
 			const result = await store.createEntities(
 				[{ name: 'NormEntity', entityType: 'test', observations: ['obs1'] }],
-				'  My-Project  '
+				'my-project'
 			);
 			expect(result.created[0].project).toBe('my-project');
 		});
