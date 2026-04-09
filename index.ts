@@ -168,8 +168,21 @@ server.registerTool(
   async ({ entities, projectId }) => {
     // normalizeProjectId lowercases and trims; undefined = global scope
     const result = await store.createEntities(entities, normalizeProjectId(projectId));
+
+    // Build a human-readable summary before the JSON payload (#31).
+    // When all entities are skipped (name collisions), the caller needs
+    // a clear signal — raw JSON with created:[] is easy to miss.
+    let summary: string;
+    if (result.created.length === 0 && result.skipped.length > 0) {
+      summary = `All ${result.skipped.length} entities already exist (skipped). No new entities were created.\n\n`;
+    } else if (result.skipped.length > 0) {
+      summary = `Created ${result.created.length} entities. Skipped ${result.skipped.length} (already exist).\n\n`;
+    } else {
+      summary = `Created ${result.created.length} entities.\n\n`;
+    }
+
     return {
-      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      content: [{ type: "text" as const, text: summary + JSON.stringify(result, null, 2) }],
       structuredContent: { created: result.created, skipped: result.skipped }
     };
   }
