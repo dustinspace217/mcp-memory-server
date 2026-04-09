@@ -17,15 +17,24 @@ Standalone fork of @modelcontextprotocol/server-memory. Provides persistent memo
 
 The server is split across 6 source files:
 
-### `types.ts` (~155 lines)
+### `types.ts` (~225 lines)
 - Defines the `Entity`, `Relation`, `KnowledgeGraph`, and `Observation` types
+- `RelationInput` type: 3-field input (from, to, relationType) for creating/deleting relations — callers never construct temporal fields
+- `Relation` type: 5-field output (from, to, relationType, createdAt, supersededAt) — temporal fields are system-managed
+- `InvalidateRelationInput` type: identifies relations to retire via `invalidateRelations()`
 - `Entity.project: string | null` — scopes the entity to a project (`null` = global, never `undefined`)
 - `Entity.updatedAt: string` and `Entity.createdAt: string` — ISO 8601 UTC timestamps (sentinel `'0000-00-00T00:00:00.000Z'` for legacy data)
 - `CreateEntitiesResult` and `SkippedEntity` types — collision reporting when entity names already exist
 - `PaginationParams`, `PaginatedKnowledgeGraph`, `InvalidCursorError` types for cursor-based pagination
 - `SupersedeInput` type: `{ entityName, oldContent, newContent }` for observation supersede operations
+- `TimelineObservation`, `TimelineRelation`, `EntityTimelineResult` types for full entity history (active + superseded items with computed `status` field)
+- `SimilarObservation` type: `{ content, similarity }` returned when newly added observations are semantically close to existing ones (cosine > 0.85)
+- `AddObservationResult` includes optional `similarExisting?: SimilarObservation[]` for similarity warnings
 - Defines the `GraphStore` interface — the contract both storage backends must implement
 - All CRUD methods are declared here; both `JsonlStore` and `SqliteStore` implement this interface
+- `createRelations(relations: RelationInput[])` and `deleteRelations(relations: RelationInput[])` use the input type; return `Relation[]` (with temporal fields)
+- `invalidateRelations(relations: InvalidateRelationInput[])` — marks relations as superseded (idempotent)
+- `entityTimeline(entityName, projectId?)` — returns full history including superseded observations and invalidated relations
 - `supersedeObservations(supersessions: SupersedeInput[])` method on `GraphStore` — atomically retires old observations and inserts replacements
 - Updated `GraphStore.readGraph` and `GraphStore.searchNodes` signatures accept `PaginationParams` and return `PaginatedKnowledgeGraph`
 - `Observation` type: `{ content: string; createdAt: string }` — each observation carries an ISO 8601 UTC timestamp (or `'unknown'` for data migrated from old string format)
@@ -48,41 +57,50 @@ The server is split across 6 source files:
 - `EMBEDDING_DIM = 384` constant (matches all-MiniLM-L6-v2 output dimensionality)
 - Model: `Xenova/all-MiniLM-L6-v2` ONNX — ~23MB download on first use, cached thereafter
 
-### `jsonl-store.ts` (~575 lines)
-- `JsonlStore` class: JSONL flat-file backend (renamed from `KnowledgeGraphManager`)
+### `jsonl-store.ts` (~655 lines) — DEPRECATED
+- `JsonlStore` class: JSONL flat-file backend — **deprecated**, maintained only for environments without C build tools
+- Does NOT support: vector search, temporal relations, entity timeline, invalidate_relations, similarity check
+- `invalidateRelations()` and `entityTimeline()` throw "not supported in JSONL backend"
 - Implements the `GraphStore` interface
 - Optional `project` field on entity JSONL lines (`null`/missing = global)
 - `updatedAt` and `createdAt` fields serialized/deserialized with sentinel fallback for legacy files
+- Backward-compat deserialization for temporal fields on relations (defaults added on read)
 - Atomic writes: saves to a `.tmp` file then uses `fs.rename` to swap it in — prevents partial writes from corrupting the file
 - `loadGraph()` uses per-line error isolation — malformed JSONL lines are logged to stderr and skipped, so one bad line doesn't kill the whole graph
 - Full graph is loaded from disk and saved back on every operation (no partial updates)
 - In-memory cursor-based pagination with entity name as tiebreaker
 - Imports cursor utilities from `cursor.ts`
 
-### `sqlite-store.ts` (~1400 lines)
+### `sqlite-store.ts` (~1750 lines)
 - `SqliteStore` class: SQLite backend using `better-sqlite3`
 - Implements the `GraphStore` interface
+- **Schema version tracking**: `schema_version` table with `CHECK(id=1)` single-row constraint. Versions 1–5 tracked. Legacy databases detected via column existence heuristics and assigned an initial version. All migrations run in sequence on startup.
 - `project TEXT` nullable column on entities table — `NULL` means global (visible to all projects)
 - `updated_at` and `created_at` columns on entities table (sentinel default for legacy data, backfilled from observation timestamps during migration in a transaction)
 - `superseded_at TEXT NOT NULL DEFAULT ''` on observations — empty string sentinel means active, ISO timestamp means superseded. `UNIQUE(entity_id, content, superseded_at)` constraint. All queries filter `WHERE superseded_at = ''` to exclude retired observations.
 - `idx_observations_active` partial index on `observations(entity_id) WHERE superseded_at = ''`
+- **Temporal relations**: `created_at TEXT NOT NULL DEFAULT ''` and `superseded_at TEXT NOT NULL DEFAULT ''` on relations table. `UNIQUE(from_entity, to_entity, relation_type, superseded_at)` constraint. Active queries filter `WHERE superseded_at = ''`. Schema v4→v5 migration uses table rebuild pattern.
+- `invalidateRelations()`: sets `superseded_at` to current timestamp on matching active relations. Idempotent — ignores already-invalidated relations.
+- `entityTimeline()`: returns full history of an entity — ALL observations and relations (active + superseded) sorted chronologically with computed `status` field.
 - `supersedeObservations()` atomically retires old observations and inserts replacements in a single transaction
 - Migration via `pragma('table_info')` for existing databases — table rebuild migration for superseded_at column
 - Phase 4 migration (timestamps) wrapped in explicit transaction — prevents crash between ALTER TABLE and backfill from leaving permanent sentinel timestamps
 - **Vector search**: loads `sqlite-vec` extension, creates `vec_observations` virtual table (`vec0` with 384-dim float vectors + `+observation_id TEXT NOT NULL` auxiliary column). Startup orphan cleanup removes vec rows without matching active observations. Background embedding sweep generates embeddings for un-embedded observations after model loads. Sweep has `.catch()` on the promise (prevents unhandled rejection crash), try-catch around batch INSERTs, and DELETE-before-INSERT to prevent duplicate vec rows from races with `syncEmbedding()`.
 - `syncEmbedding()` centralized helper — all 5 mutation paths (create, add, delete, deleteEntity, supersede) fire-and-forget it to keep `vec_observations` in sync. Never throws (internal try-catch), never awaited on mutation paths so MCP responses return immediately after the sync transaction.
+- **Similarity check** in `addObservations()`: after inserting new observations, embeds them and runs KNN search against same-entity observations. Returns `similarExisting` array (cosine > 0.85) in the response for deduplication awareness.
 - Hybrid `searchNodes()`: runs LIKE query first, then augments with KNN vector results if embedding model is ready. Vector-only matches are appended to LIKE results, deduped against full LIKE match set across all pages.
-- `idx_relations_to_entity` index for relation lookups; `idx_entities_project_updated(project, updated_at DESC, id DESC)` and `idx_entities_updated(updated_at DESC, id DESC)` indexes for paginated reads
+- `idx_relations_to_entity_active` partial index on `relations(to_entity) WHERE superseded_at = ''`; `idx_entities_project_updated(project, updated_at DESC, id DESC)` and `idx_entities_updated(updated_at DESC, id DESC)` indexes for paginated reads
 - Single-column `idx_entities_project` dropped on startup (redundant — covered by composite `idx_entities_project_updated`)
+- **Graceful shutdown**: `private shuttingDown` flag checked in `runEmbeddingSweep` loop. `shutdown()` method sets the flag. Called from SIGINT/SIGTERM handlers before `close()`.
 - Opens the database with WAL mode (Write-Ahead Logging) — allows reads to proceed concurrently with writes
 - `foreign_keys = ON` is set per connection — SQLite does not enable FK constraints by default, so this must be set explicitly each time the connection opens
-- Deduplication is enforced at the database level via `UNIQUE` constraints on entity names, relation triples, and (entity + observation content + superseded_at) — `INSERT OR IGNORE` silently skips duplicate inserts
+- Deduplication is enforced at the database level via `UNIQUE` constraints on entity names, relation triples (+ superseded_at), and (entity + observation content + superseded_at) — `INSERT OR IGNORE` silently skips duplicate inserts
 - Relations must reference existing entity names (FK constraints), so adding a relation with a missing endpoint throws rather than silently creating a dangling edge
 - Cursor-based keyset pagination on `(updated_at DESC, id DESC)` — imports cursor utilities from `cursor.ts`
 - `openNodes` uses IN-clause chunking (CHUNK_SIZE=900) for consistency with other methods
 
-### `index.ts` (~430 lines)
-- Entry point: registers all MCP tools via `server.registerTool()`
+### `index.ts` (~543 lines)
+- Entry point: registers 13 MCP tools via `server.registerTool()`
 - `StoreConfig` type and `ensureMemoryFilePath()`: resolves the storage path from `MEMORY_FILE_PATH` env var and returns which store class to use
   - `.jsonl` extension → `JsonlStore`
   - `.db` or `.sqlite` extension → `SqliteStore`
@@ -97,6 +115,11 @@ The server is split across 6 source files:
 - `PaginatedOutputSchema` for shared output validation
 - `list_projects` tool returns distinct project names from the store
 - `supersede_observations` tool atomically retires old observations and inserts replacements via `store.supersedeObservations()`
+- `invalidate_relations` tool marks relations as superseded (idempotent — ignores already-invalidated)
+- `entity_timeline` tool returns full history of an entity (active + superseded observations and relations with computed status field)
+- `add_observations` response includes optional `similarExisting` field with similarity warnings (cosine > 0.85)
+- `RelationInputSchema` (3-field input) and `RelationOutputSchema` (5-field with temporal columns) — separate schemas for input validation vs. output serialization
+- SIGINT/SIGTERM handlers call `store.shutdown()` for graceful embedding sweep termination before `store.close()`
 - MCP tools registered with separate input/output Zod schemas
 - Zod schemas enforce `.min(1)` on all string inputs, `.max(500)` on names / `.max(5000)` on observation content, and `.max(100)` on all input arrays
 - All dedup operations use Set-based O(1) lookups (entity names, JSON-serialized composite relation keys, observation content) with within-batch dedup (Sets updated during iteration)
@@ -129,19 +152,23 @@ The server is split across 6 source files:
 - **vec0 is brute-force KNN** — at current scale (~1500 observations), sub-millisecond. At ~50,000+, consider switching to ANN index (sqlite-vec supports IVF).
 - **Pagination sorts by `updatedAt`, not semantic relevance** — vector search improves recall (finding entities LIKE would miss) but does not affect ranking.
 
-## Tests
-- `__tests__/knowledge-graph.test.ts` — parameterized suite (`describe.each`) running ~99 shared behavioral tests against both `JsonlStore` and `SqliteStore`, covering all CRUD operations, deduplication, composite key safety, search, edge cases, observation timestamps, normalizeObservation validation, atomic writes (JSONL), idempotent delete edge cases, project filtering, cursor-based pagination, supersedeObservations (10 tests: basic supersede, idempotent, missing oldContent/entity throws, updatedAt bump, invisibility to searchNodes/openNodes, batch atomicity, rollback on failure). Plus ~14 JSONL-specific tests and ~9 SQLite-specific tests.
-- `__tests__/vector-search.test.ts` — 4 tests: vector state reporting, MEMORY_VECTOR_SEARCH=off degradation, LIKE fallback while loading, superseded observations excluded from LIKE search
-- `__tests__/file-path.test.ts` — 10 tests covering `StoreConfig` return type, extension routing (.jsonl / .db / .sqlite / default), and legacy .json→.jsonl migration
-- `__tests__/migration.test.ts` — 5 tests covering JSONL→SQLite auto-migration: data transfer, .jsonl.bak rename, idempotency when .db already exists, empty JSONL file handling
+## Tests (310 total across 7 test files)
+- `__tests__/knowledge-graph.test.ts` (236 tests) — parameterized suite (`describe.each`) running shared behavioral tests against both `JsonlStore` and `SqliteStore`, covering all CRUD operations, deduplication, composite key safety, search, edge cases, observation timestamps, normalizeObservation validation, atomic writes (JSONL), idempotent delete edge cases, project filtering, cursor-based pagination, supersedeObservations, temporal relations (createdAt/supersededAt on relations, invalidateRelations, entityTimeline), similarity check, totalCount accuracy. Plus JSONL-specific and SQLite-specific tests.
+- `__tests__/mcp-tools.test.ts` (35 tests) — integration tests for MCP tool handlers including invalidate_relations and entity_timeline tools
+- `__tests__/file-path.test.ts` (16 tests) — `StoreConfig` return type, extension routing (.jsonl / .db / .sqlite / default), and legacy .json→.jsonl migration
+- `__tests__/migration.test.ts` (5 tests) — JSONL→SQLite auto-migration: data transfer, .jsonl.bak rename, idempotency when .db already exists, empty JSONL file handling
+- `__tests__/migration-validation.test.ts` (10 tests) — schema version tracking and migration validation across versions 1–5
+- `__tests__/vector-search.test.ts` (4 tests) — vector state reporting, MEMORY_VECTOR_SEARCH=off degradation, LIKE fallback while loading, superseded observations excluded from LIKE search
+- `__tests__/vector-integration.test.ts` (4 tests) — end-to-end tests with real embedding model: semantic search, LIKE+vector dedup, superseded observation exclusion, similarExisting check. Skip with `SKIP_VECTOR_INTEGRATION=1`.
 - `__tests__/smoke-test-vec.ts` — one-off script (not a vitest test) validating sqlite-vec + better-sqlite3 + @huggingface/transformers compatibility on this platform
 
-## Planned Phases
-1. ~~**Timestamps**~~ — DONE: observations are `{ content, createdAt }` objects; legacy string observations auto-migrate with `createdAt: 'unknown'`
-2. ~~**SQLite storage backend**~~ — DONE: SQLite default with JSONL fallback, GraphStore interface, auto-migration, FK constraints, parameterized tests
-3. ~~**Project filtering**~~ — DONE: optional projectId parameter on tools, project column in SQLite, collision reporting via CreateEntitiesResult
-4. ~~**Pagination**~~ — DONE: cursor-based pagination for read_graph and search_nodes, entity timestamps (updatedAt/createdAt), keyset ordering by recency
-5. ~~**Memory enhancements**~~ — DONE: observation supersede mechanism (superseded_at column, supersede_observations tool), vector search (sqlite-vec + @huggingface/transformers, hybrid LIKE+KNN search), hook updates for supersede guidance
+## Version History
+- **v1.0.0** — Temporal relations (superseded_at on relations, invalidate_relations + entity_timeline tools), similarity check on addObservations, schema version tracking (versions 1–5), graceful shutdown, totalCount fix, JSONL backend deprecated
+- **v0.11.0** — Observation supersede mechanism, vector search (sqlite-vec + all-MiniLM-L6-v2), hybrid LIKE+KNN search
+- **v0.10.0** — Cursor-based pagination, entity timestamps (updatedAt/createdAt)
+- **v0.9.0** — Project filtering, collision reporting
+- **v0.8.0** — SQLite storage backend, auto-migration from JSONL
+- **v0.7.0** — Timestamped observations
 
 ## Relevant Agents
 - **code-reviewer** — logic errors, edge cases in graph operations
