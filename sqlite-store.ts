@@ -1587,14 +1587,80 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
-   * Returns full timeline for an entity (all observations and relations, active + superseded).
-   * Stub for Task 6a — actual implementation comes in Task 7.
+   * Returns full timeline for an entity including ALL observations and relations
+   * (both active and superseded). This is the "history view" — unlike readGraph/searchNodes
+   * which only show active items, this shows the complete change history.
    *
-   * @param _entityName - The entity to retrieve timeline for
-   * @param _projectId - Optional project scope
-   * @returns null until Task 7 implements the query
+   * @param entityName - The entity to retrieve timeline for
+   * @param projectId - Optional project scope (entity must belong to this project or be global)
+   * @returns EntityTimelineResult with observations and relations sorted chronologically, or null if not found
    */
-  async entityTimeline(_entityName: string, _projectId?: string): Promise<EntityTimelineResult | null> {
-    throw new Error('entity_timeline not yet implemented: pending Task 7');
+  async entityTimeline(entityName: string, projectId?: string): Promise<EntityTimelineResult | null> {
+    const normalizedProject = projectId ?? null;
+
+    // Find the entity by name, optionally filtered by project
+    let entitySql = 'SELECT id, name, entity_type, project, updated_at, created_at FROM entities WHERE name = ?';
+    const params: (string | null)[] = [entityName];
+    if (normalizedProject) {
+      // Include entities belonging to this project OR global entities (project IS NULL)
+      entitySql += ' AND (project = ? OR project IS NULL)';
+      params.push(normalizedProject);
+    }
+
+    const entityRow = this.db.prepare(entitySql).get(...params) as {
+      id: number; name: string; entity_type: string;
+      project: string | null; updated_at: string; created_at: string;
+    } | undefined;
+
+    if (!entityRow) return null;
+
+    // Fetch ALL observations (active AND superseded) sorted chronologically.
+    // Unlike buildEntities() which filters superseded_at = '', this returns everything.
+    const obsRows = this.db.prepare(`
+      SELECT content, created_at, superseded_at
+      FROM observations WHERE entity_id = ?
+      ORDER BY created_at ASC
+    `).all(entityRow.id) as { content: string; created_at: string; superseded_at: string }[];
+
+    // Map DB rows to TimelineObservation with computed status field
+    const observations: TimelineObservation[] = obsRows.map(o => ({
+      content: o.content,
+      createdAt: o.created_at,
+      supersededAt: o.superseded_at,
+      // '' superseded_at = still active; non-empty = has been superseded
+      status: o.superseded_at === '' ? 'active' as const : 'superseded' as const,
+    }));
+
+    // Fetch ALL relations (active AND superseded) involving this entity.
+    // Unlike getConnectedRelations() which filters active only, this returns everything.
+    const relRows = this.db.prepare(`
+      SELECT from_entity, to_entity, relation_type, created_at, superseded_at
+      FROM relations
+      WHERE from_entity = ? OR to_entity = ?
+      ORDER BY created_at ASC
+    `).all(entityName, entityName) as {
+      from_entity: string; to_entity: string; relation_type: string;
+      created_at: string; superseded_at: string;
+    }[];
+
+    // Map DB rows to TimelineRelation with computed status field
+    const relations: TimelineRelation[] = relRows.map(r => ({
+      from: r.from_entity,
+      to: r.to_entity,
+      relationType: r.relation_type,
+      createdAt: r.created_at,
+      supersededAt: r.superseded_at,
+      status: r.superseded_at === '' ? 'active' as const : 'superseded' as const,
+    }));
+
+    return {
+      name: entityRow.name,
+      entityType: entityRow.entity_type,
+      project: entityRow.project,
+      createdAt: entityRow.created_at,
+      updatedAt: entityRow.updated_at,
+      observations,
+      relations,
+    };
   }
 }

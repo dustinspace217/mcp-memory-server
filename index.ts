@@ -404,6 +404,80 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "invalidate_relations",
+  {
+    title: "Invalidate Relations",
+    description: "Mark relations as no longer active by setting their superseded_at timestamp. " +
+      "The relations are preserved for history but hidden from active queries (readGraph, searchNodes, openNodes). " +
+      "Idempotent — already-invalidated relations are silently skipped. " +
+      "Use this instead of delete_relations when you want to preserve the relation's history.",
+    inputSchema: {
+      relations: z.array(z.object({
+        from: z.string().min(1).max(500).describe("Source entity name"),
+        to: z.string().min(1).max(500).describe("Target entity name"),
+        relationType: z.string().min(1).max(500).describe("The type of the relation"),
+      })).min(1).max(100).describe("Relations to invalidate"),
+    },
+    outputSchema: { success: z.boolean(), message: z.string() }
+  },
+  async ({ relations }) => {
+    await store.invalidateRelations(relations);
+    return {
+      content: [{ type: "text" as const, text: `Invalidated ${relations.length} relation(s).` }],
+      structuredContent: { success: true, message: `Invalidated ${relations.length} relation(s).` }
+    };
+  }
+);
+
+server.registerTool(
+  "entity_timeline",
+  {
+    title: "Entity Timeline",
+    description: "Returns full history of an entity including superseded observations and invalidated relations. " +
+      "Unlike readGraph/searchNodes which only show active items, this shows the complete change history " +
+      "with status indicators ('active' or 'superseded') on each observation and relation.",
+    inputSchema: {
+      entityName: z.string().min(1).max(500).describe("Name of the entity to get timeline for"),
+      projectId: ProjectIdSchema,
+    },
+    outputSchema: {
+      name: z.string(),
+      entityType: z.string(),
+      project: z.string().nullable(),
+      createdAt: z.string(),
+      updatedAt: z.string(),
+      observations: z.array(z.object({
+        content: z.string(),
+        createdAt: z.string(),
+        supersededAt: z.string(),
+        status: z.enum(['active', 'superseded']),
+      })),
+      relations: z.array(z.object({
+        from: z.string(),
+        to: z.string(),
+        relationType: z.string(),
+        createdAt: z.string(),
+        supersededAt: z.string(),
+        status: z.enum(['active', 'superseded']),
+      })),
+    }
+  },
+  async ({ entityName, projectId }) => {
+    const result = await store.entityTimeline(entityName, normalizeProjectId(projectId));
+    if (!result) {
+      return {
+        content: [{ type: "text" as const, text: `Entity "${entityName}" not found.` }],
+        isError: true,
+      };
+    }
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      structuredContent: result,
+    };
+  }
+);
+
 /**
  * Entry point. Resolves the storage configuration, instantiates the appropriate store,
  * and starts the MCP server on stdio transport.

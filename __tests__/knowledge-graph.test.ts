@@ -2426,4 +2426,54 @@ describe('SqliteStore-specific', () => {
 			expect(graph.relations).toHaveLength(1);
 		});
 	});
+
+	// ----------------------------------------------------------
+	// entityTimeline (full history including superseded items)
+	// ----------------------------------------------------------
+	describe('entityTimeline', () => {
+		it('should return all observations including superseded', async () => {
+			await store.createEntities([
+				{ name: 'A', entityType: 'test', observations: ['version 1'] }
+			], undefined);
+
+			await store.supersedeObservations([
+				{ entityName: 'A', oldContent: 'version 1', newContent: 'version 2' }
+			]);
+
+			const timeline = await store.entityTimeline('A');
+			expect(timeline).not.toBeNull();
+			expect(timeline!.observations).toHaveLength(2);
+
+			// Sorted by createdAt ASC — older observation first
+			expect(timeline!.observations[0].content).toBe('version 1');
+			expect(timeline!.observations[0].status).toBe('superseded');
+			expect(timeline!.observations[0].supersededAt).not.toBe('');
+
+			expect(timeline!.observations[1].content).toBe('version 2');
+			expect(timeline!.observations[1].status).toBe('active');
+			expect(timeline!.observations[1].supersededAt).toBe('');
+		});
+
+		it('should return null for non-existent entity', async () => {
+			const timeline = await store.entityTimeline('nonexistent');
+			expect(timeline).toBeNull();
+		});
+
+		it('should include temporal relations', async () => {
+			await store.createEntities([
+				{ name: 'A', entityType: 'test', observations: ['hello'] },
+				{ name: 'B', entityType: 'test', observations: ['world'] },
+			], undefined);
+			await store.createRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+			await store.invalidateRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+			await store.createRelations([{ from: 'A', to: 'B', relationType: 'knows' }]);
+
+			const timeline = await store.entityTimeline('A');
+			expect(timeline).not.toBeNull();
+			// Should see two relation entries: one superseded, one active
+			expect(timeline!.relations).toHaveLength(2);
+			expect(timeline!.relations.filter(r => r.status === 'superseded')).toHaveLength(1);
+			expect(timeline!.relations.filter(r => r.status === 'active')).toHaveLength(1);
+		});
+	});
 });
