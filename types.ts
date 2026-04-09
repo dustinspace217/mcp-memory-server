@@ -29,11 +29,59 @@ export interface Entity {
   createdAt: string;       // ISO 8601 UTC, or ENTITY_TIMESTAMP_SENTINEL for legacy data
 }
 
-/** A directed edge between two entities with a relation type. */
+/** Input type for creating/deleting relations — just the triple, no temporal fields.
+ * Used by createRelations() and deleteRelations() callers. */
+export interface RelationInput {
+  from: string;
+  to: string;
+  relationType: string;
+}
+
+/** Full relation as returned by queries — includes temporal tracking fields.
+ * createdAt: ISO 8601 UTC when the relation was established (sentinel for legacy).
+ * supersededAt: '' = active, ISO timestamp = invalidated. */
 export interface Relation {
   from: string;
   to: string;
   relationType: string;
+  createdAt: string;
+  supersededAt: string;
+}
+
+/** Input for invalidate_relations — identifies relations to retire. */
+export interface InvalidateRelationInput {
+  from: string;
+  to: string;
+  relationType: string;
+}
+
+/** Observation entry in an entity timeline — includes superseded observations. */
+export interface TimelineObservation {
+  content: string;
+  createdAt: string;
+  supersededAt: string;
+  status: 'active' | 'superseded';
+}
+
+/** Relation entry in an entity timeline — includes invalidated relations. */
+export interface TimelineRelation {
+  from: string;
+  to: string;
+  relationType: string;
+  createdAt: string;
+  supersededAt: string;
+  status: 'active' | 'superseded';
+}
+
+/** Full timeline response for a single entity. */
+export interface EntityTimelineResult {
+  name: string;
+  entityType: string;
+  project: string | null;
+  createdAt: string;
+  updatedAt: string;
+  observations: TimelineObservation[];
+  relations: TimelineRelation[];
 }
 
 /** The complete knowledge graph: all entities and all relations. */
@@ -139,16 +187,21 @@ export interface GraphStore {
   close(): Promise<void>;
 
   createEntities(entities: EntityInput[], projectId?: string): Promise<Readonly<CreateEntitiesResult>>;
-  createRelations(relations: Relation[]): Promise<Readonly<Relation[]>>;
+  createRelations(relations: RelationInput[]): Promise<Readonly<Relation[]>>;
   addObservations(observations: AddObservationInput[]): Promise<Readonly<AddObservationResult[]>>;
   deleteEntities(entityNames: string[]): Promise<void>;
   deleteObservations(deletions: DeleteObservationInput[]): Promise<void>;
-  deleteRelations(relations: Relation[]): Promise<void>;
+  deleteRelations(relations: RelationInput[]): Promise<void>;
   supersedeObservations(supersessions: SupersedeInput[]): Promise<void>;
+  /** Invalidates relations by setting superseded_at to current timestamp.
+   * Idempotent — ignores already-invalidated relations. */
+  invalidateRelations(relations: InvalidateRelationInput[]): Promise<void>;
   readGraph(projectId?: string, pagination?: PaginationParams): Promise<Readonly<PaginatedKnowledgeGraph>>;
   searchNodes(query: string, projectId?: string, pagination?: PaginationParams): Promise<Readonly<PaginatedKnowledgeGraph>>;
   openNodes(names: string[], projectId?: string): Promise<Readonly<KnowledgeGraph>>;
   listProjects(): Promise<string[]>;
+  /** Returns full timeline for an entity (all observations and relations, active + superseded). */
+  entityTimeline(entityName: string, projectId?: string): Promise<EntityTimelineResult | null>;
 }
 
 /**

@@ -12,6 +12,8 @@ import {
   type Observation,
   type Entity,
   type Relation,
+  type RelationInput,
+  type InvalidateRelationInput,
   type KnowledgeGraph,
   type GraphStore,
   type EntityInput,
@@ -23,6 +25,9 @@ import {
   type PaginationParams,
   type PaginatedKnowledgeGraph,
   type SupersedeInput,
+  type EntityTimelineResult,
+  type TimelineObservation,
+  type TimelineRelation,
 } from './types.js';
 import { JsonlStore } from './jsonl-store.js';
 import {
@@ -177,6 +182,7 @@ export class SqliteStore implements GraphStore {
     //   4 = added superseded_at to observations (table rebuild for UNIQUE constraint change)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_version (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
         version INTEGER NOT NULL
       );
     `);
@@ -214,8 +220,9 @@ export class SqliteStore implements GraphStore {
         currentVersion = 4;
       }
 
-      // Seed the version table so future startups skip the pragma detection
-      this.db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(currentVersion);
+      // Seed the version table so future startups skip the pragma detection.
+      // id=1 is enforced by CHECK(id = 1) — only one row can ever exist.
+      this.db.prepare('INSERT INTO schema_version (id, version) VALUES (1, ?)').run(currentVersion);
     }
 
     // === Run sequential migrations ===
@@ -748,7 +755,7 @@ export class SqliteStore implements GraphStore {
    * @returns Only the relations that were actually created
    * @throws SqliteError if from or to entity doesn't exist (FK constraint violation)
    */
-  async createRelations(relations: Relation[]): Promise<Relation[]> {
+  async createRelations(relations: RelationInput[]): Promise<Relation[]> {
     const insert = this.db.prepare(
       'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type) VALUES (?, ?, ?)'
     );
@@ -759,7 +766,15 @@ export class SqliteStore implements GraphStore {
       for (const r of relations) {
         const info = insert.run(r.from, r.to, r.relationType);
         if (info.changes > 0) {
-          results.push(r);
+          // Return full Relation with temporal defaults (pre-migration sentinel values).
+          // After Task 6b adds the actual columns, these come from the DB.
+          results.push({
+            from: r.from,
+            to: r.to,
+            relationType: r.relationType,
+            createdAt: ENTITY_TIMESTAMP_SENTINEL,
+            supersededAt: '',
+          });
         }
       }
     });
@@ -928,7 +943,7 @@ export class SqliteStore implements GraphStore {
    *
    * @param relations - Array of { from, to, relationType }
    */
-  async deleteRelations(relations: Relation[]): Promise<void> {
+  async deleteRelations(relations: RelationInput[]): Promise<void> {
     const del = this.db.prepare(
       'DELETE FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ?'
     );
@@ -1086,12 +1101,18 @@ export class SqliteStore implements GraphStore {
     for (let i = 0; i < entityNames.length; i += halfChunk) {
       const chunk = entityNames.slice(i, i + halfChunk);
       const placeholders = chunk.map(() => '?').join(',');
+      // Query selects 3 columns; temporal fields (createdAt, supersededAt) are added
+      // as defaults until Task 6b migrates the schema to include them in the table.
       const rows = this.db.prepare(`
         SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType
         FROM relations
         WHERE from_entity IN (${placeholders}) OR to_entity IN (${placeholders})
-      `).all(...chunk, ...chunk) as Relation[];
-      results.push(...rows);
+      `).all(...chunk, ...chunk) as { from: string; to: string; relationType: string }[];
+      results.push(...rows.map(r => ({
+        ...r,
+        createdAt: ENTITY_TIMESTAMP_SENTINEL,
+        supersededAt: '',
+      })));
     }
 
     // Deduplicate: chunked queries may return the same relation if its endpoints
@@ -1498,5 +1519,29 @@ export class SqliteStore implements GraphStore {
       'SELECT DISTINCT project FROM entities WHERE project IS NOT NULL ORDER BY project'
     ).all() as { project: string }[];
     return rows.map(r => r.project);
+  }
+
+  /**
+   * Invalidates relations by setting superseded_at to current timestamp.
+   * Stub for Task 6a — actual implementation comes in Task 6b after the
+   * superseded_at column is added to the relations table.
+   *
+   * @param _relations - Array of { from, to, relationType } to invalidate
+   * @throws Error always until Task 6b adds the column
+   */
+  async invalidateRelations(_relations: InvalidateRelationInput[]): Promise<void> {
+    throw new Error('invalidate_relations not yet implemented: pending schema migration (Task 6b)');
+  }
+
+  /**
+   * Returns full timeline for an entity (all observations and relations, active + superseded).
+   * Stub for Task 6a — actual implementation comes in Task 7.
+   *
+   * @param _entityName - The entity to retrieve timeline for
+   * @param _projectId - Optional project scope
+   * @returns null until Task 7 implements the query
+   */
+  async entityTimeline(_entityName: string, _projectId?: string): Promise<EntityTimelineResult | null> {
+    throw new Error('entity_timeline not yet implemented: pending Task 7');
   }
 }

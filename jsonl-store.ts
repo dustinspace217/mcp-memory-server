@@ -10,6 +10,8 @@ import {
   type Observation,
   type Entity,
   type Relation,
+  type RelationInput,
+  type InvalidateRelationInput,
   type KnowledgeGraph,
   type GraphStore,
   type EntityInput,
@@ -21,6 +23,7 @@ import {
   type PaginationParams,
   type PaginatedKnowledgeGraph,
   type SupersedeInput,
+  type EntityTimelineResult,
   InvalidCursorError,
 } from './types.js';
 import {
@@ -174,7 +177,11 @@ export class JsonlStore implements GraphStore {
             graph.relations.push({
               from: item.from,
               to: item.to,
-              relationType: item.relationType
+              relationType: item.relationType,
+              // Temporal defaults for backward compat with JSONL files that predate the type split.
+              // JSONL files may or may not have these fields serialized.
+              createdAt: typeof item.createdAt === 'string' ? item.createdAt : ENTITY_TIMESTAMP_SENTINEL,
+              supersededAt: typeof item.supersededAt === 'string' ? item.supersededAt : '',
             });
           }
         } catch (processError) {
@@ -204,11 +211,12 @@ export class JsonlStore implements GraphStore {
         updatedAt: e.updatedAt, createdAt: e.createdAt
       })),
       ...graph.relations.map(r => JSON.stringify({
-        type: "relation", from: r.from, to: r.to, relationType: r.relationType
+        type: "relation", from: r.from, to: r.to, relationType: r.relationType,
+        createdAt: r.createdAt, supersededAt: r.supersededAt
       })),
     ];
     const tmpPath = this.memoryFilePath + '.tmp';
-    // try-finally ensures .tmp is cleaned up on ANY failure (writeFile or rename),
+    // try-catch ensures .tmp is cleaned up on ANY failure (writeFile or rename),
     // not just rename failure. Fixes #49: disk-full writeFile left .tmp behind.
     try {
       await fs.writeFile(tmpPath, lines.join("\n") + "\n");
@@ -369,8 +377,12 @@ export class JsonlStore implements GraphStore {
   /**
    * Creates new relations. Deduplicates by composite key [from, to, relationType].
    * Does NOT validate that endpoint entities exist (JSONL limitation).
+   * Accepts RelationInput (3-field) and returns Relation (5-field with temporal defaults).
+   *
+   * @param relations - Array of { from, to, relationType } inputs
+   * @returns Only the relations that were actually created, with temporal defaults
    */
-  async createRelations(relations: Relation[]): Promise<Relation[]> {
+  async createRelations(relations: RelationInput[]): Promise<Relation[]> {
     const graph = await this.loadGraph();
     const existingKeys = new Set(graph.relations.map(r => JSON.stringify([r.from, r.to, r.relationType])));
     const newRelations: Relation[] = [];
@@ -378,7 +390,15 @@ export class JsonlStore implements GraphStore {
       const key = JSON.stringify([r.from, r.to, r.relationType]);
       if (!existingKeys.has(key)) {
         existingKeys.add(key);
-        newRelations.push(r);
+        // Build full Relation with temporal defaults (JSONL doesn't store these fields)
+        const fullRelation: Relation = {
+          from: r.from,
+          to: r.to,
+          relationType: r.relationType,
+          createdAt: ENTITY_TIMESTAMP_SENTINEL,
+          supersededAt: '',
+        };
+        newRelations.push(fullRelation);
       }
     }
     graph.relations.push(...newRelations);
@@ -451,10 +471,12 @@ export class JsonlStore implements GraphStore {
   }
 
   /**
-   * Deletes relations by exact match on all three fields.
+   * Deletes relations by exact match on all three fields (from, to, relationType).
    * Silently ignores non-existent relations (idempotent).
+   *
+   * @param relations - Array of { from, to, relationType } identifying relations to delete
    */
-  async deleteRelations(relations: Relation[]): Promise<void> {
+  async deleteRelations(relations: RelationInput[]): Promise<void> {
     const graph = await this.loadGraph();
     const keysToDelete = new Set(relations.map(r => JSON.stringify([r.from, r.to, r.relationType])));
     graph.relations = graph.relations.filter(r => !keysToDelete.has(JSON.stringify([r.from, r.to, r.relationType])));
@@ -470,6 +492,26 @@ export class JsonlStore implements GraphStore {
    */
   async supersedeObservations(_supersessions: SupersedeInput[]): Promise<void> {
     throw new Error('supersede_observations not supported in JSONL backend: migrate to SQLite');
+  }
+
+  /**
+   * Invalidate relations is not supported in the JSONL backend.
+   * This feature requires SQLite for the superseded_at column on relations.
+   *
+   * @throws Error always -- JSONL backend does not support invalidate_relations
+   */
+  async invalidateRelations(_relations: InvalidateRelationInput[]): Promise<void> {
+    throw new Error('invalidate_relations not supported in JSONL backend: migrate to SQLite');
+  }
+
+  /**
+   * Entity timeline is not supported in the JSONL backend.
+   * This feature requires SQLite for querying superseded observations and relations.
+   *
+   * @throws Error always -- JSONL backend does not support entity_timeline
+   */
+  async entityTimeline(_entityName: string, _projectId?: string): Promise<EntityTimelineResult | null> {
+    throw new Error('entity_timeline not supported in JSONL backend: migrate to SQLite');
   }
 
   /**

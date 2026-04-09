@@ -67,7 +67,7 @@ export async function ensureMemoryFilePath(): Promise<StoreConfig> {
 }
 
 // Re-export types that tests and external consumers may need
-export { type Observation, type Entity, type Relation, type KnowledgeGraph, type CreateEntitiesResult, type SkippedEntity, type PaginationParams, type PaginatedKnowledgeGraph, InvalidCursorError } from './types.js';
+export { type Observation, type Entity, type Relation, type RelationInput, type KnowledgeGraph, type CreateEntitiesResult, type SkippedEntity, type PaginationParams, type PaginatedKnowledgeGraph, InvalidCursorError } from './types.js';
 export { JsonlStore, normalizeObservation } from './jsonl-store.js';
 export { SqliteStore } from './sqlite-store.js';
 
@@ -99,10 +99,20 @@ const EntityOutputSchema = z.object({
   createdAt: z.string().describe("ISO 8601 UTC timestamp of creation, or sentinel for legacy data"),
 });
 
-const RelationSchema = z.object({
+// Input schema for creating/deleting relations — just the 3 identifying fields.
+// Callers don't provide temporal fields (those are system-managed).
+const RelationInputSchema = z.object({
   from: z.string().min(1).max(500).describe("The name of the entity where the relation starts"),
   to: z.string().min(1).max(500).describe("The name of the entity where the relation ends"),
   relationType: z.string().min(1).max(500).describe("The type of the relation")
+});
+
+// Output schema for relations returned by queries — includes system-managed temporal fields.
+// createdAt: ISO 8601 UTC when the relation was established (sentinel for legacy data).
+// supersededAt: '' = active, ISO timestamp = invalidated.
+const RelationOutputSchema = RelationInputSchema.extend({
+  createdAt: z.string().describe("ISO 8601 UTC timestamp when relation was created, or sentinel for legacy data"),
+  supersededAt: z.string().describe("'' = active, ISO timestamp = invalidated"),
 });
 
 // Optional project scope for filtering tools. Omit to operate globally.
@@ -141,7 +151,7 @@ const SkippedEntitySchema = z.object({
 // Plain object (not z.object()) because registerTool's outputSchema expects { [key]: ZodType }.
 const PaginatedOutputSchema = {
   entities: z.array(EntityOutputSchema),
-  relations: z.array(RelationSchema),
+  relations: z.array(RelationOutputSchema),
   nextCursor: z.string().nullable().describe("Cursor for the next page, or null if this is the last page"),
   totalCount: z.number().describe("Total number of matching entities across all pages"),
 };
@@ -193,8 +203,8 @@ server.registerTool(
   {
     title: "Create Relations",
     description: "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice",
-    inputSchema: { relations: z.array(RelationSchema).max(100) },
-    outputSchema: { relations: z.array(RelationSchema) }
+    inputSchema: { relations: z.array(RelationInputSchema).max(100) },
+    outputSchema: { relations: z.array(RelationOutputSchema) }
   },
   async ({ relations }) => {
     const result = await store.createRelations(relations);
@@ -276,7 +286,7 @@ server.registerTool(
   {
     title: "Delete Relations",
     description: "Delete multiple relations from the knowledge graph",
-    inputSchema: { relations: z.array(RelationSchema).max(100).describe("An array of relations to delete") },
+    inputSchema: { relations: z.array(RelationInputSchema).max(100).describe("An array of relations to delete") },
     outputSchema: { success: z.boolean(), message: z.string() }
   },
   async ({ relations }) => {
@@ -365,7 +375,7 @@ server.registerTool(
       names: z.array(z.string().min(1).max(500)).max(100).describe("An array of entity names to retrieve"),
       projectId: ProjectIdSchema,
     },
-    outputSchema: { entities: z.array(EntityOutputSchema), relations: z.array(RelationSchema) }
+    outputSchema: { entities: z.array(EntityOutputSchema), relations: z.array(RelationOutputSchema) }
   },
   async ({ names, projectId }) => {
     const graph = await store.openNodes(names, normalizeProjectId(projectId));

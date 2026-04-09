@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import type { GraphStore, Relation, SupersedeInput } from '../types.js';
+import type { GraphStore, RelationInput, SupersedeInput } from '../types.js';
 import { InvalidCursorError } from '../types.js';
 import { JsonlStore, normalizeObservation } from '../jsonl-store.js';
 import { SqliteStore } from '../sqlite-store.js';
@@ -92,13 +92,15 @@ describe.each<[string, string, StoreFactory]>([
 				{ name: 'Bob', entityType: 'person', observations: [] },
 			]);
 
-			const relations: Relation[] = [
+			const relations: RelationInput[] = [
 				{ from: 'Alice', to: 'Bob', relationType: 'knows' },
 			];
 
 			const newRelations = await store.createRelations(relations);
 			expect(newRelations).toHaveLength(1);
-			expect(newRelations).toEqual(relations);
+			// Return type is full Relation (with temporal fields), so use objectContaining
+			// to match just the 3 input fields without asserting on createdAt/supersededAt
+			expect(newRelations[0]).toEqual(expect.objectContaining(relations[0]));
 
 			const graph = await store.readGraph();
 			expect(graph.relations).toHaveLength(1);
@@ -110,7 +112,7 @@ describe.each<[string, string, StoreFactory]>([
 				{ name: 'Bob', entityType: 'person', observations: [] },
 			]);
 
-			const relations: Relation[] = [
+			const relations: RelationInput[] = [
 				{ from: 'Alice', to: 'Bob', relationType: 'knows' },
 			];
 
