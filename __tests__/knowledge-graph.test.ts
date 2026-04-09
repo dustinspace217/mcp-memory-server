@@ -2011,6 +2011,37 @@ describe('JsonlStore-specific', () => {
 			// The .tmp file should be renamed to the real file, not left behind
 			await expect(fs.access(storePath + '.tmp')).rejects.toThrow();
 		});
+
+		it('should clean up .tmp file when writeFile fails (#49)', async () => {
+			// Create an entity so the graph has data to save
+			await store.createEntities([
+				{ name: 'existing', entityType: 'test', observations: ['hello'] }
+			], undefined);
+
+			// Monkey-patch fs.writeFile to simulate disk-full failure.
+			// Dynamic import returns the cached module, so patching it affects the store.
+			const fsMod = await import('fs');
+			const origFn = fsMod.promises.writeFile;
+			fsMod.promises.writeFile = (async () => {
+				throw new Error('ENOSPC: no space left on device');
+			}) as typeof fsMod.promises.writeFile;
+
+			try {
+				await expect(
+					store.createEntities([
+						{ name: 'test2', entityType: 'test', observations: ['world'] }
+					], undefined)
+				).rejects.toThrow('ENOSPC');
+			} finally {
+				// Restore the real writeFile before any further test cleanup
+				fsMod.promises.writeFile = origFn;
+			}
+
+			// The .tmp file should NOT exist after the failure — saveGraph's
+			// try/catch should have cleaned it up
+			const tmpExists = await fsMod.promises.access(storePath + '.tmp').then(() => true, () => false);
+			expect(tmpExists).toBe(false);
+		});
 	});
 });
 

@@ -199,12 +199,14 @@ export class JsonlStore implements GraphStore {
       })),
     ];
     const tmpPath = this.memoryFilePath + '.tmp';
-    await fs.writeFile(tmpPath, lines.join("\n") + "\n");
+    // try-finally ensures .tmp is cleaned up on ANY failure (writeFile or rename),
+    // not just rename failure. Fixes #49: disk-full writeFile left .tmp behind.
     try {
+      await fs.writeFile(tmpPath, lines.join("\n") + "\n");
       await fs.rename(tmpPath, this.memoryFilePath);
-    } catch (renameError) {
+    } catch (err) {
       try { await fs.unlink(tmpPath); } catch { /* best effort */ }
-      throw renameError;
+      throw err;
     }
   }
 
