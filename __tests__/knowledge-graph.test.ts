@@ -1714,6 +1714,30 @@ describe('JsonlStore-specific', () => {
 	});
 
 	// ----------------------------------------------------------
+	// Deprecation warning
+	// ----------------------------------------------------------
+	it('should log deprecation warning on construction', async () => {
+		const warnings: string[] = [];
+		const origStderr = console.error;
+		console.error = (...args: unknown[]) => {
+			warnings.push(args.map(String).join(' '));
+		};
+
+		try {
+			const warnPath = path.join(testDir, `test-warn-${Date.now()}.jsonl`);
+			const warnStore = new JsonlStore(warnPath);
+			await warnStore.init();
+			await warnStore.close();
+			try { await fs.unlink(warnPath); } catch { /* ignore */ }
+
+			const hasDeprecation = warnings.some(w => w.includes('deprecated'));
+			expect(hasDeprecation).toBe(true);
+		} finally {
+			console.error = origStderr;
+		}
+	});
+
+	// ----------------------------------------------------------
 	// JSONL file format
 	// ----------------------------------------------------------
 	it('should handle JSONL format correctly', async () => {

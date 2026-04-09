@@ -101,9 +101,18 @@ export function normalizeObservation(obs: unknown): Observation {
  * on every read, modifies in memory, and writes back atomically (temp file + rename).
  *
  * Implements GraphStore so it can be swapped with SqliteStore transparently.
+ *
+ * @deprecated JSONL backend is deprecated and will be removed in v2.0.
+ * Migrate to SQLite by setting MEMORY_FILE_PATH to a .db file (e.g., memory.db).
+ * SQLite supports vector search, observation supersede, and temporal relations.
  */
 export class JsonlStore implements GraphStore {
-  constructor(private memoryFilePath: string) {}
+  constructor(private memoryFilePath: string) {
+    console.error(
+      'WARNING: JSONL backend is deprecated and will be removed in v2.0. ' +
+      'Migrate to SQLite by setting MEMORY_FILE_PATH to a .db file (e.g., memory.db).'
+    );
+  }
 
   /** No-op for JSONL -- no setup required. */
   async init(): Promise<void> {}
