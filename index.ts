@@ -229,14 +229,24 @@ server.registerTool(
     outputSchema: {
       results: z.array(z.object({
         entityName: z.string(),
-        addedObservations: z.array(ObservationSchema)
+        addedObservations: z.array(ObservationSchema),
+        similarExisting: z.array(z.object({
+          content: z.string(),
+          similarity: z.number(),
+        })).optional().describe("Semantically similar existing observations (cosine > 0.85). Present when embedding model is ready."),
       }))
     }
   },
   async ({ observations }) => {
     const result = await store.addObservations(observations);
+    // Alert callers when similar observations were detected
+    let responseText = JSON.stringify(result, null, 2);
+    const hasSimilar = result.some(r => r.similarExisting && r.similarExisting.length > 0);
+    if (hasSimilar) {
+      responseText = 'Note: Some observations are semantically similar to existing ones. Check similarExisting fields.\n\n' + responseText;
+    }
     return {
-      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      content: [{ type: "text" as const, text: responseText }],
       structuredContent: { results: result }
     };
   }
@@ -505,10 +515,15 @@ main().catch((error) => {
 
 // Graceful shutdown: close the store to release SQLite file locks and flush WAL.
 // Without this, -wal and -shm sidecar files may linger on disk after unclean exit.
+// Graceful shutdown: signal the embedding sweep to stop, then close the database.
 // Wrapped in try/catch so process.exit() always runs even if close() throws
 // (e.g., double-close, database corruption, or mid-transaction signal).
 process.on('SIGINT', async () => {
   try {
+    // Signal the store to stop the embedding sweep gracefully
+    if (store && 'shutdown' in store) {
+      (store as SqliteStore).shutdown();
+    }
     if (store) await store.close();
   } catch (err) {
     console.error('Error closing store during SIGINT shutdown:', err);
@@ -517,6 +532,9 @@ process.on('SIGINT', async () => {
 });
 process.on('SIGTERM', async () => {
   try {
+    if (store && 'shutdown' in store) {
+      (store as SqliteStore).shutdown();
+    }
     if (store) await store.close();
   } catch (err) {
     console.error('Error closing store during SIGTERM shutdown:', err);

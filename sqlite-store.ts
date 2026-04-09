@@ -20,6 +20,7 @@ import {
   type AddObservationInput,
   type DeleteObservationInput,
   type AddObservationResult,
+  type SimilarObservation,
   type SkippedEntity,
   type CreateEntitiesResult,
   type PaginationParams,
@@ -92,6 +93,9 @@ export class SqliteStore implements GraphStore {
 
   /** Whether the vec_observations virtual table exists (sqlite-vec loaded successfully). */
   private vecTableExists = false;
+
+  /** Set to true when SIGTERM/SIGINT received. Tells the embedding sweep to stop. */
+  private shuttingDown = false;
 
   /** Exposes the current vector search state for callers to inspect. */
   get vectorState(): VectorState {
@@ -573,6 +577,15 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
+   * Signals the store to stop accepting new work and shut down gracefully.
+   * The current embedding batch finishes, but no new batches start.
+   * Call close() after this to release the database connection.
+   */
+  shutdown(): void {
+    this.shuttingDown = true;
+  }
+
+  /**
    * Centralized helper for maintaining vec_observations in sync with observations.
    * All mutation paths (create, add, delete, supersede) call this after their
    * core transaction commits. Never throws -- embedding is best-effort.
@@ -638,6 +651,8 @@ export class SqliteStore implements GraphStore {
     while (true) {
       // If the database was closed (e.g., during shutdown), stop the sweep
       if (!this.db) break;
+      // If shutdown was signaled, let the current batch finish but don't start new ones
+      if (this.shuttingDown) break;
 
       // Find active observations missing from vec_observations.
       // LEFT JOIN on the TEXT observation_id column (cast to match observations.id).
@@ -884,6 +899,65 @@ export class SqliteStore implements GraphStore {
           // syncEmbedding never rejects (internal try-catch), safe to not await
           this.syncEmbedding(obsRow.id, obs.content, 'upsert');
         }
+      }
+    }
+
+    // --- Similarity check: find semantically similar existing observations ---
+    // After inserting new observations, if the embedding model is ready,
+    // embed each new observation and find near-neighbors on the same entity.
+    // Returns matches with cosine similarity > 0.85 so the caller can decide
+    // whether to supersede, append, or ignore. Best-effort: omitted if model not ready.
+    if (this.vecTableExists && this.embeddingPipeline.state.status === 'ready') {
+      try {
+        for (const r of results) {
+          if (r.addedObservations.length === 0) continue;
+
+          // Get the entity ID for similarity queries
+          const entityRow = findEntity.get(r.entityName) as { id: number } | undefined;
+          if (!entityRow) continue;
+
+          const similar: SimilarObservation[] = [];
+
+          for (const obs of r.addedObservations) {
+            const embedding = await this.embeddingPipeline.embed(obs.content);
+            if (!embedding) continue;
+
+            // KNN search for top-3 nearest neighbors across all entities.
+            // We filter to same-entity + not-self afterward.
+            const knnRows = this.db.prepare(`
+              SELECT v.observation_id, v.distance FROM vec_observations v
+              WHERE v.embedding MATCH ? AND k = 3
+            `).all(
+              Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+            ) as { observation_id: string; distance: number }[];
+
+            for (const knn of knnRows) {
+              // Convert L2 distance on normalized vectors to cosine similarity.
+              // For unit vectors: cos_sim = 1 - (L2_dist^2 / 2)
+              const similarity = 1 - knn.distance / 2;
+              if (similarity <= 0.85) continue;
+
+              // Check that this observation belongs to the same entity AND is not
+              // the just-inserted observation itself (filter by content != obs.content)
+              const obsRow = this.db.prepare(`
+                SELECT o.content FROM observations o
+                WHERE o.id = ? AND o.entity_id = ? AND o.superseded_at = '' AND o.content != ?
+              `).get(parseInt(knn.observation_id, 10), entityRow.id, obs.content) as { content: string } | undefined;
+
+              if (obsRow) {
+                similar.push({ content: obsRow.content, similarity: Math.round(similarity * 1000) / 1000 });
+              }
+            }
+          }
+
+          if (similar.length > 0) {
+            r.similarExisting = similar;
+          }
+        }
+      } catch (err: unknown) {
+        // Similarity check is best-effort — don't fail the whole operation
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`Similarity check failed: ${msg}`);
       }
     }
 
@@ -1396,7 +1470,9 @@ export class SqliteStore implements GraphStore {
     // Total count: when paginated, extract from the first row's total_count column
     // (embedded via the CTE scalar subquery). When unpaginated, use array length.
     // If no rows matched, total_count is absent so fall back to 0.
-    const totalCount = isPaginated
+    // totalCount starts from the LIKE query count. It may be adjusted upward
+    // after vector search adds supplementary entities that LIKE missed.
+    let totalCount = isPaginated
       ? (pageRows.length > 0 ? pageRows[0].total_count! : 0)
       : pageRows.length;
 
@@ -1474,6 +1550,13 @@ export class SqliteStore implements GraphStore {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`Vector search augmentation failed: ${msg}`);
       }
+    }
+
+    // Adjust totalCount upward to account for vector-supplementary entities
+    // that weren't found by the LIKE query. This ensures totalCount >= entities.length,
+    // which is the safe direction for "should I fetch more?" decisions.
+    if (entities.length > totalCount) {
+      totalCount = entities.length;
     }
 
     // Relations: include vector-supplementary entities in the lookup set.

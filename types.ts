@@ -146,11 +146,20 @@ export type DeleteObservationInput = {
   contents: string[];
 };
 
+/** Returned when a newly added observation is semantically similar to an existing one.
+ *  Allows callers to decide whether to supersede, keep both, or investigate. */
+export interface SimilarObservation {
+  content: string;
+  similarity: number;  // cosine similarity, 0.0-1.0 (higher = more similar)
+}
+
 /** Return type for addObservations. Reports which observations were actually added
- *  (excludes duplicates). */
+ *  (excludes duplicates). similarExisting is present when the embedding model is
+ *  ready and found near-matches (cosine > 0.85) for newly added observations. */
 export type AddObservationResult = {
   entityName: string;
   addedObservations: Observation[];
+  similarExisting?: SimilarObservation[];
 };
 
 /** An entity that was skipped during createEntities because its name

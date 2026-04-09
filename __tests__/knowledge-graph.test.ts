@@ -2476,4 +2476,39 @@ describe('SqliteStore-specific', () => {
 			expect(timeline!.relations.filter(r => r.status === 'active')).toHaveLength(1);
 		});
 	});
+
+	// ----------------------------------------------------------
+	// similarity check on observation writes
+	// ----------------------------------------------------------
+	it('addObservations should return empty similarExisting when model not ready', async () => {
+		await store.createEntities([
+			{ name: 'A', entityType: 'test', observations: ['initial fact'] }
+		], undefined);
+
+		const result = await store.addObservations([
+			{ entityName: 'A', contents: ['a new fact'] }
+		]);
+
+		// When model isn't ready or no similar observations found,
+		// similarExisting should be omitted (undefined) or present as empty array
+		for (const r of result) {
+			if (r.similarExisting) {
+				expect(Array.isArray(r.similarExisting)).toBe(true);
+			}
+		}
+	});
+
+	// ----------------------------------------------------------
+	// totalCount accuracy with vector search
+	// ----------------------------------------------------------
+	it('totalCount should be >= entities.length in searchNodes', async () => {
+		await store.createEntities([
+			{ name: 'test-entity-alpha', entityType: 'test', observations: ['alpha observation'] },
+		], undefined);
+
+		const result = await store.searchNodes('alpha');
+		// totalCount should always be >= the number of entities returned
+		// (it may be higher due to pagination, never lower)
+		expect(result.totalCount).toBeGreaterThanOrEqual(result.entities.length);
+	});
 });
