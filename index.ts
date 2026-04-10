@@ -82,6 +82,9 @@ let store: GraphStore;
 const ObservationSchema = z.object({
   content: z.string().min(1).describe("The content of the observation"),
   createdAt: z.string().describe("ISO 8601 UTC timestamp, or 'unknown' for migrated data"),
+  importance: z.number().describe("Importance score 1.0-5.0 (3.0 = medium)"),
+  contextLayer: z.enum(['L0', 'L1']).nullable().describe("Context layer: 'L0' = always loaded, 'L1' = session start, null = L2 (on-demand)"),
+  memoryType: z.string().nullable().describe("Memory type tag (e.g., 'decision', 'preference', 'fact'). null = unclassified"),
 });
 
 const EntityInputSchema = z.object({
@@ -223,7 +226,13 @@ server.registerTool(
     inputSchema: {
       observations: z.array(z.object({
         entityName: z.string().min(1).max(500).describe("The name of the entity to add the observations to"),
-        contents: z.array(z.string().min(1).max(5000)).max(100).describe("An array of observation contents to add")
+        contents: z.array(z.string().min(1).max(5000)).max(100).describe("An array of observation contents to add"),
+        importances: z.array(z.number().min(1).max(5)).max(100).optional()
+          .describe("Parallel array of importance scores (1.0-5.0) matching contents. Omit for default 3.0."),
+        contextLayers: z.array(z.enum(['L0', 'L1']).nullable()).max(100).optional()
+          .describe("Parallel array of context layers matching contents. 'L0' = always loaded, 'L1' = session start, null = on-demand (L2). Omit for default null."),
+        memoryTypes: z.array(z.string().max(50).nullable()).max(100).optional()
+          .describe("Parallel array of memory type tags matching contents. Recommended: 'decision','preference','fact','problem','milestone','emotional'. null = unclassified. Omit for default null."),
       })).max(100)
     },
     outputSchema: {

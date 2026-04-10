@@ -87,13 +87,17 @@ export async function migrateJsonToJsonl(scriptDir: string, jsonlPath: string): 
  */
 export function normalizeObservation(obs: unknown): Observation {
   if (typeof obs === 'string') {
-    return { content: obs, createdAt: 'unknown' };
+    return { content: obs, createdAt: 'unknown', importance: 3.0, contextLayer: null, memoryType: null };
   }
   if (typeof obs === 'object' && obs !== null && 'content' in obs && typeof (obs as any).content === 'string') {
-    const o = obs as { content: string; createdAt?: unknown };
+    // Cast to access optional fields — legacy JSONL data won't have the v1.1 metadata fields
+    const o = obs as { content: string; createdAt?: unknown; importance?: unknown; contextLayer?: unknown; memoryType?: unknown };
     return {
       content: o.content,
       createdAt: typeof o.createdAt === 'string' ? o.createdAt : 'unknown',
+      importance: typeof o.importance === 'number' ? o.importance : 3.0,
+      contextLayer: typeof o.contextLayer === 'string' ? o.contextLayer : null,
+      memoryType: typeof o.memoryType === 'string' ? o.memoryType : null,
     };
   }
   throw new Error(`Invalid observation format: ${JSON.stringify(obs)}`);
@@ -428,10 +432,19 @@ export class JsonlStore implements GraphStore {
       const now = new Date().toISOString();
       const existingContents = new Set(entity.observations.map(obs => obs.content));
       const newObservations: Observation[] = [];
-      for (const content of o.contents) {
+      for (let i = 0; i < o.contents.length; i++) {
+        const content = o.contents[i];
         if (!existingContents.has(content)) {
           existingContents.add(content);
-          newObservations.push({ content, createdAt: now });
+          // Read metadata from parallel arrays, falling back to defaults when
+          // the array is omitted or shorter than contents
+          newObservations.push({
+            content,
+            createdAt: now,
+            importance: o.importances?.[i] ?? 3.0,
+            contextLayer: o.contextLayers?.[i] ?? null,
+            memoryType: o.memoryTypes?.[i] ?? null,
+          });
         }
       }
       entity.observations.push(...newObservations);

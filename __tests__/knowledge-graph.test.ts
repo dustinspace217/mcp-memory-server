@@ -199,6 +199,131 @@ describe.each<[string, string, StoreFactory]>([
 	});
 
 	// ----------------------------------------------------------
+	// Observation metadata (importance, contextLayer, memoryType)
+	// ----------------------------------------------------------
+	describe('observation metadata', () => {
+		it('should store and return observation importance via addObservations', async () => {
+			await store.createEntities([
+				{ name: 'MetaA', entityType: 'test', observations: ['default obs'] },
+			]);
+			await store.addObservations([
+				{ entityName: 'MetaA', contents: ['critical fact'], importances: [5.0] },
+			]);
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'MetaA')!;
+			// Initial observation created via createEntities gets default importance 3.0
+			expect(entity.observations.find(o => o.content === 'default obs')!.importance).toBe(3.0);
+			// Explicitly scored observation
+			expect(entity.observations.find(o => o.content === 'critical fact')!.importance).toBe(5.0);
+		});
+
+		it('should default importance to 3.0 when importances array omitted', async () => {
+			await store.createEntities([
+				{ name: 'MetaB', entityType: 'test', observations: ['hello'] },
+			]);
+			await store.addObservations([
+				{ entityName: 'MetaB', contents: ['world'] },
+			]);
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'MetaB')!;
+			expect(entity.observations.every(o => o.importance === 3.0)).toBe(true);
+		});
+
+		it('should store and return context_layer via addObservations', async () => {
+			await store.createEntities([
+				{ name: 'MetaC', entityType: 'test', observations: ['regular fact'] },
+			]);
+			await store.addObservations([
+				{ entityName: 'MetaC', contents: ['core rule', 'session fact'], contextLayers: ['L0', 'L1'] },
+			]);
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'MetaC')!;
+			// Initial observation defaults to null (L2)
+			expect(entity.observations.find(o => o.content === 'regular fact')!.contextLayer).toBeNull();
+			// Explicitly layered observations
+			expect(entity.observations.find(o => o.content === 'core rule')!.contextLayer).toBe('L0');
+			expect(entity.observations.find(o => o.content === 'session fact')!.contextLayer).toBe('L1');
+		});
+
+		it('should default contextLayer to null when contextLayers array omitted', async () => {
+			await store.createEntities([
+				{ name: 'MetaD', entityType: 'test', observations: ['hello'] },
+			]);
+			await store.addObservations([
+				{ entityName: 'MetaD', contents: ['world'] },
+			]);
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'MetaD')!;
+			expect(entity.observations.every(o => o.contextLayer === null)).toBe(true);
+		});
+
+		it('should store and return memory_type via addObservations', async () => {
+			await store.createEntities([
+				{ name: 'MetaE', entityType: 'test', observations: ['generic fact'] },
+			]);
+			await store.addObservations([
+				{ entityName: 'MetaE', contents: ['chose SQLite over Postgres', 'always use tabs'],
+					memoryTypes: ['decision', 'preference'] },
+			]);
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'MetaE')!;
+			expect(entity.observations.find(o => o.content === 'generic fact')!.memoryType).toBeNull();
+			expect(entity.observations.find(o => o.content === 'chose SQLite over Postgres')!.memoryType).toBe('decision');
+			expect(entity.observations.find(o => o.content === 'always use tabs')!.memoryType).toBe('preference');
+		});
+
+		it('should default memoryType to null when memoryTypes array omitted', async () => {
+			await store.createEntities([
+				{ name: 'MetaF', entityType: 'test', observations: ['hello'] },
+			]);
+			await store.addObservations([
+				{ entityName: 'MetaF', contents: ['world'] },
+			]);
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'MetaF')!;
+			expect(entity.observations.every(o => o.memoryType === null)).toBe(true);
+		});
+
+		it('should carry forward metadata when superseding observations', async function() {
+			// JSONL backend doesn't support supersede — skip this test for JSONL
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'MetaG', entityType: 'test', observations: ['original'] },
+			]);
+			// Set metadata on the observation
+			await store.addObservations([
+				{ entityName: 'MetaG', contents: ['tagged fact'],
+					importances: [4.5], contextLayers: ['L1'], memoryTypes: ['decision'] },
+			]);
+			// Supersede the tagged observation — metadata should carry forward
+			await store.supersedeObservations([
+				{ entityName: 'MetaG', oldContent: 'tagged fact', newContent: 'updated tagged fact' },
+			]);
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'MetaG')!;
+			const updated = entity.observations.find(o => o.content === 'updated tagged fact')!;
+			expect(updated.importance).toBe(4.5);
+			expect(updated.contextLayer).toBe('L1');
+			expect(updated.memoryType).toBe('decision');
+		});
+
+		it('should handle partial parallel arrays (shorter than contents)', async () => {
+			await store.createEntities([
+				{ name: 'MetaH', entityType: 'test', observations: [] },
+			]);
+			// importances has only 1 element, contents has 3 — remaining default to 3.0
+			await store.addObservations([
+				{ entityName: 'MetaH', contents: ['a', 'b', 'c'], importances: [5.0] },
+			]);
+			const graph = await store.readGraph();
+			const entity = graph.entities.find(e => e.name === 'MetaH')!;
+			expect(entity.observations.find(o => o.content === 'a')!.importance).toBe(5.0);
+			expect(entity.observations.find(o => o.content === 'b')!.importance).toBe(3.0);
+			expect(entity.observations.find(o => o.content === 'c')!.importance).toBe(3.0);
+		});
+	});
+
+	// ----------------------------------------------------------
 	// deleteEntities
 	// ----------------------------------------------------------
 	describe('deleteEntities', () => {
@@ -1884,6 +2009,9 @@ describe('JsonlStore-specific', () => {
 		expect(alice.observations[0]).toEqual({
 			content: 'old observation',
 			createdAt: 'unknown',
+			importance: 3.0,
+			contextLayer: null,
+			memoryType: null,
 		});
 	});
 
@@ -1905,7 +2033,7 @@ describe('JsonlStore-specific', () => {
 		const graph = await store.readGraph();
 		const alice = graph.entities[0];
 		expect(alice.observations).toHaveLength(2);
-		expect(alice.observations[0]).toEqual({ content: 'old observation', createdAt: 'unknown' });
+		expect(alice.observations[0]).toEqual({ content: 'old observation', createdAt: 'unknown', importance: 3.0, contextLayer: null, memoryType: null });
 		expect(alice.observations[1].content).toBe('new observation');
 		expect(alice.observations[1].createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 		expect(alice.observations[1].createdAt).not.toBe('unknown');
@@ -1965,6 +2093,9 @@ describe('JsonlStore-specific', () => {
 			expect(graph.entities[0].observations[0]).toEqual({
 				content: 'hello',
 				createdAt: 'unknown',
+				importance: 3.0,
+				contextLayer: null,
+				memoryType: null,
 			});
 		});
 
@@ -2119,8 +2250,8 @@ describe('SqliteStore-specific', () => {
 			conn.close();
 
 			expect(row).toBeDefined();
-			// Fresh databases should be at version 5 (current schema with temporal relations).
-			expect(row!.version).toBe(5);
+			// Fresh databases should be at version 6 (current schema with observation metadata columns).
+			expect(row!.version).toBe(6);
 		});
 	});
 

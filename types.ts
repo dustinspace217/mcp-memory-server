@@ -5,10 +5,23 @@
  * A single piece of knowledge attached to an entity.
  * Each observation carries a creation timestamp for staleness detection.
  * createdAt is ISO 8601 UTC, or 'unknown' for data migrated from the old string format.
+ *
+ * importance: 1.0-5.0 score controlling how prominently this observation surfaces
+ *   in summaries and context layers. Default 3.0 (medium). 5.0 = critical, 1.0 = low.
+ * contextLayer: determines when this observation is loaded:
+ *   null = L2 (on-demand, only via search/readGraph — the default for all data)
+ *   'L0' = always loaded (~100 token budget, core identity and rules)
+ *   'L1' = loaded at session start (~800 token budget, active work and decisions)
+ * memoryType: free-form tag classifying the nature of the observation.
+ *   null = unclassified. Recommended values: 'decision', 'preference', 'fact',
+ *   'problem', 'milestone', 'emotional'. Enables type-filtered queries.
  */
 export interface Observation {
   content: string;
   createdAt: string;
+  importance: number;           // 1.0-5.0, default 3.0
+  contextLayer: string | null;  // null = L2 (on-demand), 'L0' = always loaded, 'L1' = session start
+  memoryType: string | null;    // null = unclassified
 }
 
 /**
@@ -135,10 +148,16 @@ export type EntityInput = {
   observations: (string | Observation)[];
 };
 
-/** Input type for addObservations. Each entry targets an entity by name. */
+/** Input type for addObservations. Each entry targets an entity by name.
+ *  importances, contextLayers, and memoryTypes are parallel arrays matching contents.
+ *  When omitted or shorter than contents, remaining observations get defaults
+ *  (importance: 3.0, contextLayer: null, memoryType: null). */
 export type AddObservationInput = {
   entityName: string;
   contents: string[];
+  importances?: number[];              // parallel array, optional, default 3.0 per observation
+  contextLayers?: (string | null)[];   // parallel array, optional, default null (L2) per observation
+  memoryTypes?: (string | null)[];     // parallel array, optional, default null (unclassified) per observation
 };
 
 /** Input type for deleteObservations. Field is 'contents' (not 'observations')
@@ -261,12 +280,20 @@ export interface GraphStore {
 }
 
 /**
- * Creates a new Observation with the current UTC timestamp.
+ * Creates a new Observation with the current UTC timestamp and optional metadata.
  * Called when observations are added through the API (not during migration).
  *
  * @param content - The observation content string
- * @returns An Observation object with content and an ISO 8601 createdAt timestamp
+ * @param importance - 1.0-5.0 importance score (default 3.0 = medium)
+ * @param contextLayer - 'L0', 'L1', or null (default null = L2, on-demand)
+ * @param memoryType - Free-form type tag (default null = unclassified)
+ * @returns An Observation object with all fields populated
  */
-export function createObservation(content: string): Observation {
-  return { content, createdAt: new Date().toISOString() };
+export function createObservation(
+  content: string,
+  importance: number = 3.0,
+  contextLayer: string | null = null,
+  memoryType: string | null = null
+): Observation {
+  return { content, createdAt: new Date().toISOString(), importance, contextLayer, memoryType };
 }

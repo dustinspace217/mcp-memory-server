@@ -334,6 +334,24 @@ export class SqliteStore implements GraphStore {
       currentVersion = 5;
     }
 
+    if (currentVersion < 6) {
+      // Migration 5 to 6: add observation metadata columns for v1.1 features.
+      // importance: REAL 1.0-5.0 score (default 3.0 = medium). Used by get_summary
+      //   and get_context_layers to prioritize which observations surface.
+      // context_layer: TEXT nullable. NULL = L2 (on-demand, the default).
+      //   'L0' = always loaded (about 100 token budget, core identity/rules).
+      //   'L1' = loaded at session start (about 800 token budget, active work/decisions).
+      // memory_type: TEXT nullable. NULL = unclassified. Free-form tag classifying
+      //   the nature of the observation (e.g., 'decision', 'preference', 'fact',
+      //   'problem', 'milestone', 'emotional'). Enables type-filtered queries.
+      // All three are simple column additions with no table rebuild or data backfill.
+      this.db.prepare(`ALTER TABLE observations ADD COLUMN importance REAL NOT NULL DEFAULT 3.0`).run();
+      this.db.prepare(`ALTER TABLE observations ADD COLUMN context_layer TEXT DEFAULT NULL`).run();
+      this.db.prepare(`ALTER TABLE observations ADD COLUMN memory_type TEXT DEFAULT NULL`).run();
+      this.db.prepare('UPDATE schema_version SET version = 6').run();
+      currentVersion = 6;
+    }
+
     // === Indexes (idempotent, run on every startup) ===
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
@@ -514,8 +532,10 @@ export class SqliteStore implements GraphStore {
     const getEntityId = this.db.prepare(
       'SELECT id FROM entities WHERE name = ?'
     );
+    // INSERT includes metadata columns — schema v6 guarantees they exist.
+    // Legacy JSONL observations will have default values (3.0, null, null).
     const insertObs = this.db.prepare(
-      'INSERT OR IGNORE INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)'
+      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type) VALUES (?, ?, ?, ?, ?, ?)'
     );
     const insertRel = this.db.prepare(
       'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type) VALUES (?, ?, ?)'
@@ -540,8 +560,9 @@ export class SqliteStore implements GraphStore {
         insertEntity.run(entity.name, entity.entityType, migratedProject, entityUpdatedAt, entityCreatedAt);
         const row = getEntityId.get(entity.name) as { id: number };
         for (const obs of entity.observations) {
-          // obs is already a normalized Observation object (JsonlStore.readGraph() calls normalizeObservation)
-          insertObs.run(row.id, obs.content, obs.createdAt);
+          // obs is already a normalized Observation object (JsonlStore.readGraph() calls normalizeObservation).
+          // Read metadata fields with defaults for legacy JSONL data that predates v1.1.
+          insertObs.run(row.id, obs.content, obs.createdAt, obs.importance ?? 3.0, obs.contextLayer ?? null, obs.memoryType ?? null);
         }
       }
       for (const rel of graph.relations) {
@@ -740,8 +761,10 @@ export class SqliteStore implements GraphStore {
     const getExistingProject = this.db.prepare(
       'SELECT project FROM entities WHERE name = ?'
     );
+    // INSERT includes all three observation metadata columns (importance, context_layer, memory_type).
+    // Schema v6 guarantees these columns exist. Defaults (3.0, NULL, NULL) match the column defaults.
     const insertObs = this.db.prepare(
-      'INSERT OR IGNORE INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)'
+      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type) VALUES (?, ?, ?, ?, ?, ?)'
     );
 
     const created: Entity[] = [];
@@ -768,8 +791,11 @@ export class SqliteStore implements GraphStore {
         const observations: Observation[] = [];
 
         for (const obs of e.observations) {
+          // createObservation() now accepts importance/contextLayer/memoryType params,
+          // but EntityInput observations are plain strings or Observation objects —
+          // strings get defaults via createObservation(obs), objects pass through as-is
           const o = typeof obs === 'string' ? createObservation(obs) : obs;
-          const obsInfo = insertObs.run(row.id, o.content, o.createdAt);
+          const obsInfo = insertObs.run(row.id, o.content, o.createdAt, o.importance, o.contextLayer, o.memoryType);
           if (obsInfo.changes > 0) {
             observations.push(o);
           }
@@ -847,8 +873,9 @@ export class SqliteStore implements GraphStore {
    */
   async addObservations(observations: AddObservationInput[]): Promise<AddObservationResult[]> {
     const findEntity = this.db.prepare('SELECT id FROM entities WHERE name = ?');
+    // INSERT includes all three metadata columns — schema v6 guarantees they exist
     const insertObs = this.db.prepare(
-      'INSERT OR IGNORE INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)'
+      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type) VALUES (?, ?, ?, ?, ?, ?)'
     );
     // Prepared statement to bump updated_at when observations are added to an entity
     const updateTimestamp = this.db.prepare(
@@ -868,9 +895,15 @@ export class SqliteStore implements GraphStore {
         // so observation.createdAt and entity.updated_at are consistent
         const now = new Date().toISOString();
         const addedObservations: Observation[] = [];
-        for (const content of o.contents) {
-          const obs = { content, createdAt: now };
-          const info = insertObs.run(row.id, obs.content, obs.createdAt);
+        for (let i = 0; i < o.contents.length; i++) {
+          const content = o.contents[i];
+          // Read metadata from parallel arrays, falling back to defaults when
+          // the array is omitted or shorter than contents
+          const importance = o.importances?.[i] ?? 3.0;
+          const contextLayer = o.contextLayers?.[i] ?? null;
+          const memoryType = o.memoryTypes?.[i] ?? null;
+          const obs: Observation = { content, createdAt: now, importance, contextLayer, memoryType };
+          const info = insertObs.run(row.id, content, now, importance, contextLayer, memoryType);
           if (info.changes > 0) {
             addedObservations.push(obs);
           }
@@ -1097,17 +1130,20 @@ export class SqliteStore implements GraphStore {
   async supersedeObservations(supersessions: SupersedeInput[]): Promise<void> {
     // Prepared statement to find an entity's ID by name
     const findEntity = this.db.prepare('SELECT id FROM entities WHERE name = ?');
-    // Find the active observation matching this entity + content
+    // Find the active observation matching this entity + content.
+    // SELECT includes metadata columns so we can carry them forward to the replacement.
     const findActiveObs = this.db.prepare(
-      `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
+      `SELECT id, importance, context_layer, memory_type FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
     );
     // Mark the old observation as superseded (set superseded_at to current timestamp)
     const supersedeObs = this.db.prepare(
       `UPDATE observations SET superseded_at = ? WHERE id = ?`
     );
-    // Insert the replacement observation as active (superseded_at defaults to '')
+    // Insert the replacement observation as active (superseded_at defaults to '').
+    // Carries forward importance/context_layer/memory_type from the superseded observation
+    // so metadata isn't lost during content updates (use set_observation_metadata to change these).
     const insertObs = this.db.prepare(
-      `INSERT OR IGNORE INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)`
+      `INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type) VALUES (?, ?, ?, ?, ?, ?)`
     );
     // Bump entity's updated_at timestamp
     const updateTimestamp = this.db.prepare(
@@ -1126,8 +1162,10 @@ export class SqliteStore implements GraphStore {
           throw new Error(`Entity with name ${s.entityName} not found`);
         }
 
-        // Find the active observation to supersede
-        const obsRow = findActiveObs.get(entityRow.id, s.oldContent) as { id: number } | undefined;
+        // Find the active observation to supersede (includes metadata for carry-forward)
+        const obsRow = findActiveObs.get(entityRow.id, s.oldContent) as {
+          id: number; importance: number; context_layer: string | null; memory_type: string | null;
+        } | undefined;
         if (!obsRow) {
           throw new Error(
             `Active observation "${s.oldContent}" not found on entity "${s.entityName}"`
@@ -1143,9 +1181,10 @@ export class SqliteStore implements GraphStore {
           this.db.prepare('DELETE FROM vec_observations WHERE observation_id = ?').run(String(obsRow.id));
         }
 
-        // Insert the replacement (INSERT OR IGNORE: if newContent already exists
-        // as an active observation on this entity, skip -- idempotent)
-        insertObs.run(entityRow.id, s.newContent, now);
+        // Insert the replacement — carry forward importance, context_layer, and memory_type
+        // from the old observation so metadata survives content updates.
+        // INSERT OR IGNORE: if newContent already exists as an active observation, skip.
+        insertObs.run(entityRow.id, s.newContent, now, obsRow.importance, obsRow.context_layer, obsRow.memory_type);
 
         // Bump updated_at so the entity surfaces in recency-ordered queries
         updateTimestamp.run(now, entityRow.id);
@@ -1190,15 +1229,23 @@ export class SqliteStore implements GraphStore {
       const placeholders = chunk.map(() => '?').join(',');
 
       const obsRows = this.db.prepare(`
-        SELECT e.name AS entityName, o.content, o.created_at AS createdAt
+        SELECT e.name AS entityName, o.content, o.created_at AS createdAt,
+               o.importance, o.context_layer, o.memory_type
         FROM observations o
         JOIN entities e ON o.entity_id = e.id
         WHERE e.name IN (${placeholders}) AND o.superseded_at = ''
-      `).all(...chunk) as { entityName: string; content: string; createdAt: string }[];
+      `).all(...chunk) as { entityName: string; content: string; createdAt: string;
+        importance: number; context_layer: string | null; memory_type: string | null }[];
 
       for (const o of obsRows) {
         if (!obsMap.has(o.entityName)) obsMap.set(o.entityName, []);
-        obsMap.get(o.entityName)!.push({ content: o.content, createdAt: o.createdAt });
+        obsMap.get(o.entityName)!.push({
+          content: o.content,
+          createdAt: o.createdAt,
+          importance: o.importance ?? 3.0,
+          contextLayer: o.context_layer ?? null,
+          memoryType: o.memory_type ?? null,
+        });
       }
     }
 
