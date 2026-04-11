@@ -259,19 +259,23 @@ export interface GraphStore {
    *  Entities are sorted by most recently updated first. Relations are included only when
    *  both endpoints appear in the result set.
    *  @param projectId - Optional project scope. When set, includes project + global entities.
-   *  @param pagination - Optional cursor and limit. Omit for all results (backward compat). */
-  readGraph(projectId?: string, pagination?: PaginationParams): Promise<Readonly<PaginatedKnowledgeGraph>>;
+   *  @param pagination - Optional cursor and limit. Omit for all results (backward compat).
+   *  @param asOf - Optional ISO 8601 UTC timestamp for point-in-time queries. When set,
+   *    returns only observations/relations that were active at that moment. JSONL ignores this. */
+  readGraph(projectId?: string, pagination?: PaginationParams, asOf?: string): Promise<Readonly<PaginatedKnowledgeGraph>>;
   /** Searches for entities matching a case-insensitive substring query against name,
    *  entityType, or observation content. Augmented with vector similarity search when
    *  the embedding model is ready (SQLite only). Results paginated by recency.
    *  @param query - Case-insensitive substring to search for
    *  @param projectId - Optional project scope
-   *  @param pagination - Optional cursor and limit */
-  searchNodes(query: string, projectId?: string, pagination?: PaginationParams): Promise<Readonly<PaginatedKnowledgeGraph>>;
+   *  @param pagination - Optional cursor and limit
+   *  @param asOf - Optional ISO 8601 UTC timestamp for point-in-time queries */
+  searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string): Promise<Readonly<PaginatedKnowledgeGraph>>;
   /** Retrieves specific entities by exact name match plus connected relations.
    *  Non-existent names are silently skipped. Use this instead of readGraph when you
-   *  need full relation context for a known set of entities. */
-  openNodes(names: string[], projectId?: string): Promise<Readonly<KnowledgeGraph>>;
+   *  need full relation context for a known set of entities.
+   *  @param asOf - Optional ISO 8601 UTC timestamp for point-in-time queries */
+  openNodes(names: string[], projectId?: string, asOf?: string): Promise<Readonly<KnowledgeGraph>>;
   /** Lists all distinct project names that have at least one entity.
    *  Global entities (project === null) are excluded. */
   listProjects(): Promise<string[]>;

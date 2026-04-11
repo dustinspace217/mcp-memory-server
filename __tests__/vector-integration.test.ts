@@ -127,4 +127,69 @@ describe('Vector search integration', () => {
     }
     // Not having similarExisting is acceptable (best-effort)
   });
+
+  it('should recover historical match via KNN at as_of after the observation was superseded', async () => {
+    // This test pins the vector-search-at-as_of fix: vec_observations rows
+    // are NOT deleted on supersession, so KNN can still match the historical
+    // embedding when queried with an as_of before the supersedeAt timestamp.
+    //
+    // Use semantically distinct observations with NO substring overlap with
+    // the search query, so the only path that can recover the match is KNN
+    // (LIKE will return zero results for the query).
+    await store.createEntities([
+      { name: 'kepler-historical', entityType: 'astronomy', observations: ['An exoplanet hunter spacecraft launched in 2009'] },
+    ], undefined);
+
+    // Wait for embedding sweep to pick up the new observation
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    const beforeSupersede = new Date().toISOString();
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    // Supersede with a totally unrelated observation. The old vec row must
+    // remain in vec_observations so historical KNN still finds it.
+    await store.supersedeObservations([
+      { entityName: 'kepler-historical', oldContent: 'An exoplanet hunter spacecraft launched in 2009', newContent: 'A 17th century German mathematician' }
+    ]);
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Query with a phrase that's semantically close to the OLD content but
+    // shares no substring with it — only KNN can recover this match.
+    const historical = await store.searchNodes('telescope NASA mission', undefined, undefined, beforeSupersede);
+    const found = historical.entities.find(e => e.name === 'kepler-historical');
+
+    // Best-effort: model-quality may vary, but at minimum the historical
+    // observation must still be present in the entity's observations list
+    // when looked up via openNodes at the same as_of.
+    const opened = await store.openNodes(['kepler-historical'], undefined, beforeSupersede);
+    const historicalEntity = opened.entities.find(e => e.name === 'kepler-historical');
+    expect(historicalEntity).toBeDefined();
+    expect(historicalEntity!.observations.map(o => o.content)).toContain('An exoplanet hunter spacecraft launched in 2009');
+
+    // If the model quality is good enough that KNN found it via search, verify
+    // the historical observation is what came back (not the new mathematician one).
+    if (found) {
+      const contents = found.observations.map(o => o.content);
+      expect(contents).toContain('An exoplanet hunter spacecraft launched in 2009');
+    }
+  });
+
+  it('should exclude KNN matches when the parent entity is soft-deleted at as_of', async () => {
+    // After soft-delete, the entity row's superseded_at is set. Even if a
+    // vec_observations row would otherwise match the KNN query, the JOIN to
+    // entities should filter it out via temporalEntFilter at as_of > deletion.
+    await store.createEntities([
+      { name: 'doomed-entity', entityType: 'test', observations: ['A unique watermark phrase about quantum entanglement experiments'] },
+    ], undefined);
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Soft-delete the entity
+    await store.deleteEntities(['doomed-entity']);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const afterDelete = new Date().toISOString();
+
+    // Search at a time AFTER the soft-delete — entity must not appear
+    const result = await store.searchNodes('quantum entanglement experiments', undefined, undefined, afterDelete);
+    const found = result.entities.find(e => e.name === 'doomed-entity');
+    expect(found).toBeUndefined();
+  });
 });

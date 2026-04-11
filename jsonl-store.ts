@@ -459,15 +459,20 @@ export class JsonlStore implements GraphStore {
   }
 
   /**
-   * Deletes entities by name and cascade-deletes their relations.
-   * Silently ignores names that don't match (idempotent).
+   * Delete entities is not supported in the JSONL backend.
+   *
+   * SQLite implements deleteEntities as soft-delete (sets superseded_at on the
+   * entity row + cascades to its observations and relations) so that as_of
+   * queries can still recover the entity at past timestamps. JSONL has no
+   * superseded_at column and no temporal model, so it can only offer hard-delete.
+   * Allowing JSONL to silently fall back to hard-delete would create a contract
+   * divergence: callers would lose history they expected to be preserved.
+   *
+   * @throws Error always -- JSONL backend does not support deleteEntities;
+   *         migrate to SQLite to use soft-delete semantics.
    */
-  async deleteEntities(entityNames: string[]): Promise<void> {
-    const graph = await this.loadGraph();
-    const namesToDelete = new Set(entityNames);
-    graph.entities = graph.entities.filter(e => !namesToDelete.has(e.name));
-    graph.relations = graph.relations.filter(r => !namesToDelete.has(r.from) && !namesToDelete.has(r.to));
-    await this.saveGraph(graph);
+  async deleteEntities(_entityNames: string[]): Promise<void> {
+    throw new Error('delete_entities not supported in JSONL backend: migrate to SQLite for soft-delete semantics');
   }
 
   /**
@@ -546,10 +551,13 @@ export class JsonlStore implements GraphStore {
    * @param pagination - Optional cursor and limit for paginated results
    * @returns PaginatedKnowledgeGraph with entities, relations, nextCursor, and totalCount
    */
-  async readGraph(projectId?: string, pagination?: PaginationParams): Promise<PaginatedKnowledgeGraph> {
+  async readGraph(projectId?: string, pagination?: PaginationParams, asOf?: string): Promise<PaginatedKnowledgeGraph> {
+    if (asOf !== undefined) {
+      throw new Error('as_of queries not supported in JSONL backend: migrate to SQLite');
+    }
     const graph = await this.loadGraph();
     // Fingerprint encodes the query parameters so cursors can't be reused across different queries
-    const fingerprint = readGraphFingerprint(projectId);
+    const fingerprint = readGraphFingerprint(projectId, asOf);
 
     if (!projectId && !pagination) {
       // Fast path: no filtering, no pagination — return everything unsorted
@@ -585,13 +593,16 @@ export class JsonlStore implements GraphStore {
    * @param pagination - Optional cursor and limit for paginated results
    * @returns PaginatedKnowledgeGraph with matching entities, relations, nextCursor, and totalCount
    */
-  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams): Promise<PaginatedKnowledgeGraph> {
+  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string): Promise<PaginatedKnowledgeGraph> {
+    if (asOf !== undefined) {
+      throw new Error('as_of queries not supported in JSONL backend: migrate to SQLite');
+    }
     const graph = await this.loadGraph();
     const lowerQuery = query.toLowerCase();
     // projectId arrives pre-normalized from normalizeProjectId() in index.ts
     const normalizedProject = projectId;
     // Fingerprint includes both projectId and query so cursors can't cross-pollinate
-    const fingerprint = searchNodesFingerprint(projectId, query);
+    const fingerprint = searchNodesFingerprint(projectId, query, asOf);
 
     // First filter: match by name, type, or observation content
     let filteredEntities = graph.entities.filter(e =>
@@ -628,7 +639,10 @@ export class JsonlStore implements GraphStore {
    * @param projectId - Optional project name; only returns entities in this project or global
    * @returns KnowledgeGraph with matching entities and connected relations
    */
-  async openNodes(names: string[], projectId?: string): Promise<KnowledgeGraph> {
+  async openNodes(names: string[], projectId?: string, asOf?: string): Promise<KnowledgeGraph> {
+    if (asOf !== undefined) {
+      throw new Error('as_of queries not supported in JSONL backend: migrate to SQLite');
+    }
     const graph = await this.loadGraph();
     const nameSet = new Set(names);
     // projectId arrives pre-normalized from normalizeProjectId() in index.ts

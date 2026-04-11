@@ -2,6 +2,36 @@
 
 Standalone fork of @modelcontextprotocol/server-memory. Provides persistent memory to MCP clients via a knowledge graph of entities, observations, and relations stored in SQLite (default) or JSONL.
 
+## Project Goals
+
+This project exists to make a memory server that **actually helps Claude across sessions and compactions** — not to chase theoretical completeness, and not to become a bloated, practically useless mess. The end user is Claude itself: the memory server's job is to be the kind of tool a Claude session would *want* to use — fast, accurate, drift-resistant, and directly useful in the moment.
+
+Every feature must answer the question: *"does this make a real, meaningful improvement to how Claude works across sessions and compactions?"* If the answer isn't a confident yes, the feature doesn't ship. A useless feature isn't neutral — it's friction that crowds out the useful ones and adds maintenance, test surface, and cognitive load with no payback.
+
+### The three durable goals (A/B/C)
+
+These are the evaluation criteria for every design decision in this project. Originally established for the memory freshness hook system (`~/.claude/projects/-home-dustin-Claude/memory/project_memory_system_goals.md`), they apply identically here because the freshness system and the memory server serve the same end: trustworthy, useful recall.
+
+- **A. Reduce drift and hallucination risk.** Stale facts must surface, not be silently recalled as truth. Every code path that exposes data is responsible for distinguishing "currently true" from "was true at time T."
+- **B. Faithful recall of who/what/when/where/why/how** for projects, conversations, actions, decisions. The memory server is the canonical record of how a body of work came to be the way it is. Losing that history defeats the purpose.
+- **C. Enhance meaningful conversations and quality code.** These are the two end-uses memory serves. A feature that doesn't trace back to one of them — directly or one hop away — doesn't belong in this project.
+
+### Goal-first evaluation
+
+When a design decision arises (coverage gap, scope ambiguity, trade-off), map the options against the three goals and the practical principle above, and pick the option that serves them best. **Implementation conventions are means, not ends.** If a convention conflicts with a goal, the goal wins. Don't escalate to the user until goal-first analysis fails to produce a clear answer. (Durable workflow rule from `feedback_goal_first_evaluation.md`.)
+
+### Anti-bloat gate (mandatory before adding any new tool, schema column, or code path)
+
+1. **Goal trace.** Does this serve A, B, or C in a way the existing tools don't already cover? Name the gap.
+2. **Practical use test.** Would a Claude session actually reach for this in the moment, or is it shelf decoration nobody invokes?
+3. **Cost proportionality.** Is the cost (complexity, maintenance, test surface, RAM at runtime) proportional to the practical benefit?
+
+If any answer is no, drop it or defer it to a later version. **Three usable tools beat ten clever ones nobody reaches for.** When in doubt, leave it out — features can always be added later if the gap proves real, but removing a shipped feature is much harder.
+
+### Why these goals are written here
+
+This section exists so any future Claude session opening this project sees the *animating purpose* before the *technical detail*. The risk this guards against is straightforward: a memory server that grows feature-by-feature without a north star eventually becomes the thing it was supposed to replace — slow, noisy, and untrustworthy. The goals above are the north star.
+
 ## Tech Stack
 - TypeScript, Node.js 22, ES modules
 - MCP SDK: @modelcontextprotocol/sdk (stdio transport)

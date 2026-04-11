@@ -105,8 +105,8 @@ export function clampLimit(limit?: number): number {
  * @param projectId - The project scope, or undefined/empty for global
  * @returns Fingerprint string for cursor validation
  */
-export function readGraphFingerprint(projectId?: string): string {
-  return `readGraph\0${projectId ?? ''}`;
+export function readGraphFingerprint(projectId?: string, asOf?: string): string {
+  return `readGraph\0${projectId ?? ''}\0${asOf ?? ''}`;
 }
 
 /**
@@ -124,6 +124,6 @@ export function readGraphFingerprint(projectId?: string): string {
  * @param query - The search query string
  * @returns Fingerprint string for cursor validation
  */
-export function searchNodesFingerprint(projectId?: string, query?: string): string {
-  return `searchNodes\0${projectId ?? ''}\0${query ?? ''}`;
+export function searchNodesFingerprint(projectId?: string, query?: string, asOf?: string): string {
+  return `searchNodes\0${projectId ?? ''}\0${query ?? ''}\0${asOf ?? ''}`;
 }

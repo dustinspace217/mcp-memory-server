@@ -79,7 +79,15 @@ const CreateEntitiesInputSchema = z.object({
 	projectId: ProjectIdSchema,
 });
 
-/** Schema for search_nodes input — query string + optional projectId, cursor, limit */
+/**
+ * Schema for the asOf parameter — ISO 8601 UTC timestamp with Z suffix only.
+ * Mirrors the production schema in index.ts: `.datetime({ offset: false })`
+ * forbids non-UTC offsets so caller-supplied timestamps lexicographically
+ * compare correctly against the Z-suffixed timestamps stored in SQLite.
+ */
+const AsOfSchema = z.string().datetime({ offset: false }).optional();
+
+/** Schema for search_nodes input — query string + optional projectId, cursor, limit, asOf */
 const SearchNodesInputSchema = z.object({
 	query: z.string().min(1).max(5000)
 		.describe("The search query to match against entity names, types, and observation content"),
@@ -88,22 +96,25 @@ const SearchNodesInputSchema = z.object({
 		.describe("Opaque cursor from a previous response for fetching the next page"),
 	limit: z.number().int().min(1).max(100).optional().default(40)
 		.describe("Max entities per page (default 40, max 100)"),
+	asOf: AsOfSchema,
 });
 
-/** Schema for read_graph input — optional projectId, cursor, limit */
+/** Schema for read_graph input — optional projectId, cursor, limit, asOf */
 const ReadGraphInputSchema = z.object({
 	projectId: ProjectIdSchema,
 	cursor: z.string().max(10000).optional()
 		.describe("Opaque cursor from a previous response"),
 	limit: z.number().int().min(1).max(100).optional().default(40)
 		.describe("Max entities per page"),
+	asOf: AsOfSchema,
 });
 
-/** Schema for open_nodes input — array of names + optional projectId */
+/** Schema for open_nodes input — array of names + optional projectId + asOf */
 const OpenNodesInputSchema = z.object({
 	names: z.array(z.string().min(1).max(500)).max(100)
 		.describe("An array of entity names to retrieve"),
 	projectId: ProjectIdSchema,
+	asOf: AsOfSchema,
 });
 
 // ============================================================
@@ -468,6 +479,78 @@ describe('MCP Tool Handler Integration', () => {
 			// ReadGraphInputSchema.limit has .max(100)
 			const result = ReadGraphInputSchema.safeParse({ limit: 101 });
 			expect(result.success).toBe(false);
+		});
+
+		// ----- asOf parameter validation -----
+		// All three temporal-aware tools (read_graph, search_nodes, open_nodes)
+		// share the same AsOfSchema. These tests pin the contract: Z-suffix only,
+		// optional, and rejects every common malformation a caller could send.
+
+		it('accepts a valid Z-suffixed UTC timestamp on read_graph', () => {
+			const result = ReadGraphInputSchema.safeParse({ asOf: '2026-04-11T12:00:00.000Z' });
+			expect(result.success).toBe(true);
+		});
+
+		it('accepts a valid Z-suffixed UTC timestamp on search_nodes', () => {
+			const result = SearchNodesInputSchema.safeParse({ query: 'foo', asOf: '2026-04-11T12:00:00.000Z' });
+			expect(result.success).toBe(true);
+		});
+
+		it('accepts a valid Z-suffixed UTC timestamp on open_nodes', () => {
+			const result = OpenNodesInputSchema.safeParse({ names: ['foo'], asOf: '2026-04-11T12:00:00.000Z' });
+			expect(result.success).toBe(true);
+		});
+
+		it('rejects timestamp with non-UTC offset (+05:00) on read_graph', () => {
+			// Offsets break lexicographic comparison against Z-suffixed stored values.
+			// `.datetime({ offset: false })` enforces this.
+			const result = ReadGraphInputSchema.safeParse({ asOf: '2026-04-11T12:00:00+05:00' });
+			expect(result.success).toBe(false);
+		});
+
+		it('rejects timestamp with non-UTC offset (-08:00) on search_nodes', () => {
+			const result = SearchNodesInputSchema.safeParse({ query: 'foo', asOf: '2026-04-11T12:00:00-08:00' });
+			expect(result.success).toBe(false);
+		});
+
+		it('rejects timestamp with non-UTC offset on open_nodes', () => {
+			const result = OpenNodesInputSchema.safeParse({ names: ['foo'], asOf: '2026-04-11T12:00:00+05:00' });
+			expect(result.success).toBe(false);
+		});
+
+		it('rejects empty string asOf on read_graph', () => {
+			// Empty-string contract: callers must omit asOf for current state, not send '';
+			// the store layer also throws on '' as a defense-in-depth measure.
+			const result = ReadGraphInputSchema.safeParse({ asOf: '' });
+			expect(result.success).toBe(false);
+		});
+
+		it('rejects empty string asOf on search_nodes', () => {
+			const result = SearchNodesInputSchema.safeParse({ query: 'foo', asOf: '' });
+			expect(result.success).toBe(false);
+		});
+
+		it('rejects empty string asOf on open_nodes', () => {
+			const result = OpenNodesInputSchema.safeParse({ names: ['foo'], asOf: '' });
+			expect(result.success).toBe(false);
+		});
+
+		it('rejects malformed asOf (not ISO 8601) on read_graph', () => {
+			const result = ReadGraphInputSchema.safeParse({ asOf: 'yesterday' });
+			expect(result.success).toBe(false);
+		});
+
+		it('rejects date-only asOf (no time component) on search_nodes', () => {
+			const result = SearchNodesInputSchema.safeParse({ query: 'foo', asOf: '2026-04-11' });
+			expect(result.success).toBe(false);
+		});
+
+		it('accepts omitting asOf (treats as undefined / current state)', () => {
+			const result = ReadGraphInputSchema.safeParse({});
+			expect(result.success).toBe(true);
+			if (result.success) {
+				expect(result.data.asOf).toBeUndefined();
+			}
 		});
 	});
 

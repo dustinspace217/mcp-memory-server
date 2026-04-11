@@ -187,6 +187,8 @@ export class SqliteStore implements GraphStore {
     //   3 = added updated_at, created_at to entities (with backfill from observations)
     //   4 = added superseded_at to observations (table rebuild for UNIQUE constraint change)
     //   5 = added created_at, superseded_at to relations (table rebuild for temporal relations)
+    //   6 = added importance, context_layer, memory_type columns to observations (Phase A)
+    //   7 = added superseded_at to entities + partial unique index on active rows (soft-delete)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_version (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -352,6 +354,96 @@ export class SqliteStore implements GraphStore {
       currentVersion = 6;
     }
 
+    if (currentVersion < 7) {
+      // Migration 6 to 7: soft-delete on entities + drop FK from relations.
+      //
+      // === Part 1: entities table rebuild (add superseded_at + partial unique index) ===
+      // Adds superseded_at column to entities. Empty string sentinel = active row;
+      // ISO timestamp = the entity has been soft-deleted (logically removed).
+      // Mirrors the same pattern observations and relations got in v3→v4 and v4→v5.
+      //
+      // Why a partial unique index instead of UNIQUE(name) or UNIQUE(name, superseded_at):
+      //   - UNIQUE(name) blocks re-creation after soft-delete.
+      //   - UNIQUE(name, superseded_at) allows multiple soft-deleted rows with the same
+      //     name but blocks re-creation of an active row after the first soft-delete
+      //     (because two active rows would both have superseded_at='').
+      //   - A partial unique index on (name) WHERE superseded_at='' enforces uniqueness
+      //     ONLY among active rows, allowing a clean delete-then-create cycle while
+      //     preserving full history.
+      //
+      // === Part 2: relations table rebuild (drop FK references) ===
+      // The relations table previously had FK references to entities(name) with
+      // ON DELETE CASCADE / ON UPDATE CASCADE. SQLite's FK validator requires the
+      // referenced column to have a *full* UNIQUE constraint or PRIMARY KEY. Our
+      // new partial unique index on entities(name) WHERE superseded_at='' does NOT
+      // qualify — SQLite raises "foreign key mismatch" at PREPARE time on any
+      // statement that touches relations once entities loses its full UNIQUE.
+      //
+      // The FK is also obsolete with soft-delete:
+      //   - Hard-delete is gone (deleteEntities is now a soft-update).
+      //   - Soft-CASCADE on entity delete is implemented in application code via
+      //     atomic same-timestamp updates (see deleteEntities()).
+      //   - createRelations() validates endpoint existence at the application layer.
+      //
+      // FK handling during the rebuild: relations referenced entities(name) with
+      // ON DELETE/UPDATE CASCADE. We toggle foreign_keys OFF around the swap so
+      // DROP TABLE entities doesn't cascade. After both rebuilds, FK is back ON
+      // but relations no longer has any FK constraint to enforce.
+      //
+      // Each DDL statement uses this.db.prepare(...).run() individually rather than
+      // a single multi-statement string — same workaround as in
+      // __tests__/migration-validation.test.ts (see comment at line 451).
+      this.db.pragma('foreign_keys = OFF');
+      this.db.transaction(() => {
+        // Part 1: rebuild entities
+        this.db.prepare(`
+          CREATE TABLE entities_new (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT NOT NULL,
+            entity_type   TEXT NOT NULL,
+            project       TEXT,
+            updated_at    TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+            created_at    TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+            superseded_at TEXT NOT NULL DEFAULT ''
+          )
+        `).run();
+        this.db.prepare(`
+          INSERT INTO entities_new (id, name, entity_type, project, updated_at, created_at, superseded_at)
+          SELECT id, name, entity_type, project, updated_at, created_at, '' FROM entities
+        `).run();
+        this.db.prepare(`DROP TABLE entities`).run();
+        this.db.prepare(`ALTER TABLE entities_new RENAME TO entities`).run();
+        this.db.prepare(`
+          CREATE UNIQUE INDEX idx_entities_name_active ON entities(name) WHERE superseded_at = ''
+        `).run();
+
+        // Part 2: rebuild relations to drop the FK references to entities(name).
+        // New schema preserves all columns and the UNIQUE composite, but the
+        // from_entity / to_entity columns are now plain TEXT with no FK clause.
+        this.db.prepare(`
+          CREATE TABLE relations_new (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_entity   TEXT NOT NULL,
+            to_entity     TEXT NOT NULL,
+            relation_type TEXT NOT NULL,
+            created_at    TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+            superseded_at TEXT NOT NULL DEFAULT '',
+            UNIQUE(from_entity, to_entity, relation_type, superseded_at)
+          )
+        `).run();
+        this.db.prepare(`
+          INSERT INTO relations_new (id, from_entity, to_entity, relation_type, created_at, superseded_at)
+          SELECT id, from_entity, to_entity, relation_type, created_at, superseded_at FROM relations
+        `).run();
+        this.db.prepare(`DROP TABLE relations`).run();
+        this.db.prepare(`ALTER TABLE relations_new RENAME TO relations`).run();
+
+        this.db.prepare('UPDATE schema_version SET version = 7').run();
+      })();
+      this.db.pragma('foreign_keys = ON');
+      currentVersion = 7;
+    }
+
     // === Indexes (idempotent, run on every startup) ===
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
@@ -514,7 +606,7 @@ export class SqliteStore implements GraphStore {
    * Runs in a single transaction -- rolls back on any error.
    * Uses INSERT OR IGNORE to tolerate duplicates in corrupted JSONL data.
    * Dangling relations (referencing non-existent entities) are silently skipped
-   * because the FK constraint prevents insertion.
+   * via an explicit application-level check (the FK was dropped in v7).
    *
    * Note: does NOT call syncEmbedding() for migrated observations. This is intentional --
    * migration runs during init() before the embedding model starts loading (startLoading()
@@ -541,6 +633,10 @@ export class SqliteStore implements GraphStore {
       'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type) VALUES (?, ?, ?)'
     );
 
+    // Build a Set of entity names that survived insertion. Used below to skip
+    // dangling relations (since the v7 schema no longer has an FK to enforce this).
+    const validEntityNames = new Set<string>();
+
     // db.transaction() wraps everything in BEGIN/COMMIT and auto-rolls-back on throw
     const txn = this.db.transaction(() => {
       for (const entity of graph.entities) {
@@ -559,6 +655,7 @@ export class SqliteStore implements GraphStore {
         const entityCreatedAt = entity.createdAt || ENTITY_TIMESTAMP_SENTINEL;
         insertEntity.run(entity.name, entity.entityType, migratedProject, entityUpdatedAt, entityCreatedAt);
         const row = getEntityId.get(entity.name) as { id: number };
+        validEntityNames.add(entity.name);
         for (const obs of entity.observations) {
           // obs is already a normalized Observation object (JsonlStore.readGraph() calls normalizeObservation).
           // Read metadata fields with defaults for legacy JSONL data that predates v1.1.
@@ -566,20 +663,13 @@ export class SqliteStore implements GraphStore {
         }
       }
       for (const rel of graph.relations) {
-        try {
-          // INSERT OR IGNORE handles duplicate relations; the try/catch handles FK violations
-          // (relation referencing an entity name that doesn't exist in this DB)
-          insertRel.run(rel.from, rel.to, rel.relationType);
-        } catch (err: unknown) {
-          // FK violation -- one or both endpoint entities don't exist.
-          // Log the details so the user knows what was dropped.
-          // Re-throw unexpected errors to trigger transaction rollback.
-          if (err instanceof Error && err.message.includes('FOREIGN KEY')) {
-            console.error(`WARNING: Skipped dangling relation during migration: ${rel.from} -> ${rel.to} [${rel.relationType}] (entity not found)`);
-          } else {
-            throw err;
-          }
+        // Application-level dangling-relation check (replaces dropped FK constraint).
+        if (!validEntityNames.has(rel.from) || !validEntityNames.has(rel.to)) {
+          console.error(`WARNING: Skipped dangling relation during migration: ${rel.from} -> ${rel.to} [${rel.relationType}] (entity not found)`);
+          continue;
         }
+        // INSERT OR IGNORE handles duplicate relations
+        insertRel.run(rel.from, rel.to, rel.relationType);
       }
     });
     txn();
@@ -750,16 +840,18 @@ export class SqliteStore implements GraphStore {
     // Capture the current time once for all entities in this batch (consistent timestamps)
     const now = new Date().toISOString();
 
-    // Prepared statements are compiled once and reused -- faster than db.exec() per row
+    // Prepared statements are compiled once and reused -- faster than parsing per row
     const insertEntity = this.db.prepare(
       'INSERT OR IGNORE INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, ?, ?, ?)'
     );
+    // Filter superseded_at = '' so we only retrieve the active row, not historical
+    // soft-deleted rows that share the same name (allowed by the partial unique index).
     const getEntityId = this.db.prepare(
-      'SELECT id FROM entities WHERE name = ?'
+      `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
     );
-    // Look up existing entity's project for skip reporting
+    // Look up existing entity's project for skip reporting -- active row only.
     const getExistingProject = this.db.prepare(
-      'SELECT project FROM entities WHERE name = ?'
+      `SELECT project FROM entities WHERE name = ? AND superseded_at = ''`
     );
     // INSERT includes all three observation metadata columns (importance, context_layer, memory_type).
     // Schema v6 guarantees these columns exist. Defaults (3.0, NULL, NULL) match the column defaults.
@@ -810,7 +902,9 @@ export class SqliteStore implements GraphStore {
     // Not awaited — the MCP response returns immediately after the sync transaction.
     // If the model isn't ready, syncEmbedding returns instantly and the sweep catches these later.
     for (const entity of created) {
-      const entityRow = this.db.prepare('SELECT id FROM entities WHERE name = ?').get(entity.name) as { id: number };
+      const entityRow = this.db.prepare(
+        `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
+      ).get(entity.name) as { id: number };
       for (const obs of entity.observations) {
         const obsRow = this.db.prepare(
           `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
@@ -837,6 +931,15 @@ export class SqliteStore implements GraphStore {
    */
   async createRelations(relations: RelationInput[]): Promise<Relation[]> {
     const now = new Date().toISOString();
+    // Endpoint existence check: previously enforced by FK constraint (relations
+    // referenced entities(name) ON DELETE CASCADE). The v7 migration dropped that
+    // FK because the partial unique index on entities(name) WHERE superseded_at=''
+    // doesn't satisfy SQLite's FK target requirement. We now validate at the
+    // application layer — only ACTIVE (non-soft-deleted) entities count as valid
+    // endpoints, matching the previous semantics.
+    const findActive = this.db.prepare(
+      `SELECT 1 FROM entities WHERE name = ? AND superseded_at = ''`
+    );
     const insert = this.db.prepare(
       'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)'
     );
@@ -845,6 +948,12 @@ export class SqliteStore implements GraphStore {
 
     const txn = this.db.transaction(() => {
       for (const r of relations) {
+        if (!findActive.get(r.from)) {
+          throw new Error(`Relation references non-existent entity: ${r.from}`);
+        }
+        if (!findActive.get(r.to)) {
+          throw new Error(`Relation references non-existent entity: ${r.to}`);
+        }
         const info = insert.run(r.from, r.to, r.relationType, now);
         if (info.changes > 0) {
           results.push({
@@ -872,7 +981,11 @@ export class SqliteStore implements GraphStore {
    * @throws Error if any entityName doesn't match an existing entity
    */
   async addObservations(observations: AddObservationInput[]): Promise<AddObservationResult[]> {
-    const findEntity = this.db.prepare('SELECT id FROM entities WHERE name = ?');
+    // Filter superseded_at = '' so soft-deleted entities are treated as nonexistent —
+    // matching hard-delete semantics: the entity is logically gone for new writes.
+    const findEntity = this.db.prepare(
+      `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
+    );
     // INSERT includes all three metadata columns — schema v6 guarantees they exist
     const insertObs = this.db.prepare(
       'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type) VALUES (?, ?, ?, ?, ?, ?)'
@@ -922,7 +1035,9 @@ export class SqliteStore implements GraphStore {
     // Fire-and-forget embedding generation for newly added observations (best-effort).
     // Not awaited — the MCP response returns immediately after the sync transaction.
     for (const result of results) {
-      const entityRow = this.db.prepare('SELECT id FROM entities WHERE name = ?').get(result.entityName) as { id: number } | undefined;
+      const entityRow = this.db.prepare(
+        `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
+      ).get(result.entityName) as { id: number } | undefined;
       if (!entityRow) continue;
       for (const obs of result.addedObservations) {
         const obsRow = this.db.prepare(
@@ -1014,37 +1129,60 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
-   * Deletes entities by name. ON DELETE CASCADE on the observations and relations
-   * foreign keys automatically removes related rows -- no manual cleanup needed.
-   * Silently ignores names that don't exist (idempotent).
+   * Soft-deletes entities by name. Sets superseded_at on the entity row, all of
+   * its active observations, and all active relations referencing it (incoming
+   * and outgoing). Atomic in a single transaction — partial failure rolls back
+   * the whole thing. A single `now` timestamp is used for all updates so that
+   * an `entity_timeline` query at exactly that timestamp shows a clean cut.
+   * Silently ignores names that don't exist or are already soft-deleted (idempotent).
    *
-   * @param entityNames - Array of entity name strings to delete
+   * Why soft-delete instead of hard DELETE: Phase B Task 3 (as_of point-in-time
+   * queries) needs to faithfully recall what existed at past timestamps. A hard
+   * delete removes the row irrecoverably and breaks Goal B (faithful recall of
+   * who/what/when/where/why/how). The partial unique index on (name) WHERE
+   * superseded_at='' (added in v6→v7) makes re-creation after soft-delete
+   * possible without UNIQUE collisions.
+   *
+   * vec_observations is intentionally NOT cleaned up — historical embeddings
+   * survive soft-delete the same way they survive observation supersession.
+   * This is what makes vector search at an earlier asOf still recoverable.
+   *
+   * @param entityNames - Array of entity name strings to soft-delete
    */
   async deleteEntities(entityNames: string[]): Promise<void> {
-    // Collect observation IDs before CASCADE deletes them -- vec_observations
-    // doesn't participate in CASCADE, so we must delete explicitly.
-    const obsIdsToDelete: number[] = [];
-    if (this.vecTableExists) {
-      for (const name of entityNames) {
-        const entityRow = this.db.prepare('SELECT id FROM entities WHERE name = ?').get(name) as { id: number } | undefined;
-        if (!entityRow) continue;
-        const obsRows = this.db.prepare('SELECT id FROM observations WHERE entity_id = ?').all(entityRow.id) as { id: number }[];
-        obsIdsToDelete.push(...obsRows.map(r => r.id));
-      }
-    }
+    // Look up only active entities — already-superseded ones are silently ignored.
+    const findActiveEntity = this.db.prepare(
+      `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
+    );
+    // Soft-delete the entity row.
+    const supersedeEntity = this.db.prepare(
+      `UPDATE entities SET superseded_at = ? WHERE id = ? AND superseded_at = ''`
+    );
+    // Soft-delete all of the entity's active observations.
+    const supersedeEntityObservations = this.db.prepare(
+      `UPDATE observations SET superseded_at = ? WHERE entity_id = ? AND superseded_at = ''`
+    );
+    // Soft-delete all active relations originating from this entity.
+    const supersedeOutgoingRelations = this.db.prepare(
+      `UPDATE relations SET superseded_at = ? WHERE from_entity = ? AND superseded_at = ''`
+    );
+    // Soft-delete all active relations terminating at this entity.
+    const supersedeIncomingRelations = this.db.prepare(
+      `UPDATE relations SET superseded_at = ? WHERE to_entity = ? AND superseded_at = ''`
+    );
 
-    const del = this.db.prepare('DELETE FROM entities WHERE name = ?');
     const txn = this.db.transaction(() => {
+      const now = new Date().toISOString();
       for (const name of entityNames) {
-        del.run(name);
+        const row = findActiveEntity.get(name) as { id: number } | undefined;
+        if (!row) continue; // already soft-deleted or never existed
+        supersedeEntity.run(now, row.id);
+        supersedeEntityObservations.run(now, row.id);
+        supersedeOutgoingRelations.run(now, name);
+        supersedeIncomingRelations.run(now, name);
       }
     });
     txn();
-
-    // Clean up vec_observations for CASCADE-deleted observations (fire-and-forget)
-    for (const obsId of obsIdsToDelete) {
-      this.syncEmbedding(obsId, '', 'delete');
-    }
   }
 
   /**
@@ -1054,7 +1192,12 @@ export class SqliteStore implements GraphStore {
    * @param deletions - Array of { entityName, contents: string[] }
    */
   async deleteObservations(deletions: DeleteObservationInput[]): Promise<void> {
-    const findEntity = this.db.prepare('SELECT id FROM entities WHERE name = ?');
+    // Filter superseded_at = '' so soft-deleted entities are treated as nonexistent —
+    // deleteObservations on a soft-deleted entity is a silent no-op (the observations
+    // are already retired as part of the soft-delete CASCADE).
+    const findEntity = this.db.prepare(
+      `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
+    );
     const delObs = this.db.prepare(
       `DELETE FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
     );
@@ -1128,8 +1271,12 @@ export class SqliteStore implements GraphStore {
    * @throws Error if any entity is not found or oldContent doesn't match an active observation
    */
   async supersedeObservations(supersessions: SupersedeInput[]): Promise<void> {
-    // Prepared statement to find an entity's ID by name
-    const findEntity = this.db.prepare('SELECT id FROM entities WHERE name = ?');
+    // Prepared statement to find an active entity by name. Soft-deleted entities
+    // are excluded — supersession on a logically-removed entity throws "not found"
+    // (matching pre-soft-delete semantics for missing entities).
+    const findEntity = this.db.prepare(
+      `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
+    );
     // Find the active observation matching this entity + content.
     // SELECT includes metadata columns so we can carry them forward to the replacement.
     const findActiveObs = this.db.prepare(
@@ -1172,14 +1319,14 @@ export class SqliteStore implements GraphStore {
           );
         }
 
-        // Retire the old observation by setting its superseded_at timestamp
+        // Retire the old observation by setting its superseded_at timestamp.
+        // We deliberately do NOT delete the corresponding vec_observations row:
+        // historical embeddings must survive supersession so that point-in-time
+        // vector search at an asOf earlier than `now` can still recover the
+        // historically-active observation. The vec table grows monotonically
+        // with observation history. (~1.5KB per superseded observation; acceptable
+        // cost for Goal A correctness — see Phase B Task 3 fix #4 Part B.)
         supersedeObs.run(now, obsRow.id);
-
-        // Delete the old observation's embedding synchronously inside the transaction.
-        // vec_observations doesn't participate in CASCADE, so we clean up explicitly.
-        if (this.vecTableExists) {
-          this.db.prepare('DELETE FROM vec_observations WHERE observation_id = ?').run(String(obsRow.id));
-        }
 
         // Insert the replacement — carry forward importance, context_layer, and memory_type
         // from the old observation so metadata survives content updates.
@@ -1208,18 +1355,93 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
+   * Builds SQL WHERE conditions for point-in-time observation filtering.
+   * When asOf is provided, returns only observations that were active at that moment:
+   * created on or before asOf AND either still active or superseded after asOf.
+   * When asOf is undefined, returns only currently-active observations.
+   *
+   * Three-state contract: undefined = current, valid ISO timestamp = point-in-time,
+   * empty string = throws (invalid). The strict `=== undefined` check (rather than `!asOf`)
+   * exists so an empty string can't silently fall through to the "no filter" branch
+   * and collide with `undefined` in the cursor fingerprint system.
+   *
+   * @param asOf - ISO 8601 UTC timestamp for point-in-time queries, or undefined for current
+   * @returns Object with { clause: SQL string, params: bind values to append }
+   * @throws Error if asOf is the empty string
+   */
+  private temporalObsFilter(asOf?: string): { clause: string; params: string[] } {
+    if (asOf === '') {
+      throw new Error('temporalObsFilter: asOf must be undefined or a valid ISO 8601 timestamp, not empty string');
+    }
+    if (asOf === undefined) return { clause: `o.superseded_at = ''`, params: [] };
+    return {
+      clause: `o.created_at <= ? AND (o.superseded_at = '' OR o.superseded_at > ?)`,
+      params: [asOf, asOf],
+    };
+  }
+
+  /**
+   * Same as temporalObsFilter but for the relations table.
+   * Uses 'r' alias prefix to avoid ambiguity in joined queries.
+   *
+   * @param asOf - ISO 8601 UTC timestamp for point-in-time queries, or undefined for current
+   * @returns Object with { clause: SQL string, params: bind values to append }
+   * @throws Error if asOf is the empty string
+   */
+  private temporalRelFilter(asOf?: string): { clause: string; params: string[] } {
+    if (asOf === '') {
+      throw new Error('temporalRelFilter: asOf must be undefined or a valid ISO 8601 timestamp, not empty string');
+    }
+    if (asOf === undefined) return { clause: `superseded_at = ''`, params: [] };
+    return {
+      clause: `created_at <= ? AND (superseded_at = '' OR superseded_at > ?)`,
+      params: [asOf, asOf],
+    };
+  }
+
+  /**
+   * Same as temporalObsFilter but for the entities table.
+   * Accepts an optional alias prefix so the helper can serve both joined queries
+   * (e.g., `entities e` → pass alias `'e'`) and unaliased queries on the bare
+   * entities table (pass alias `''`). Defaults to `'e'` to match the convention
+   * used by temporalObsFilter and temporalRelFilter.
+   *
+   * @param asOf - ISO 8601 UTC timestamp for point-in-time queries, or undefined for current
+   * @param alias - SQL alias for the entities table; pass `''` for unaliased queries
+   * @returns Object with { clause: SQL string, params: bind values to append }
+   * @throws Error if asOf is the empty string
+   */
+  private temporalEntFilter(
+    asOf?: string,
+    alias: string = 'e',
+  ): { clause: string; params: string[] } {
+    if (asOf === '') {
+      throw new Error('temporalEntFilter: asOf must be undefined or a valid ISO 8601 timestamp, not empty string');
+    }
+    const prefix = alias ? `${alias}.` : '';
+    if (asOf === undefined) return { clause: `${prefix}superseded_at = ''`, params: [] };
+    return {
+      clause: `${prefix}created_at <= ? AND (${prefix}superseded_at = '' OR ${prefix}superseded_at > ?)`,
+      params: [asOf, asOf],
+    };
+  }
+
+  /**
    * Fetches full Entity objects for a set of entity rows, including their observations.
    * Groups observation rows by entity name and assembles complete Entity objects.
    * Uses a single query per chunk to fetch all observations (avoids N+1 queries).
    * Chunks the IN clause to stay within SQLite's SQLITE_MAX_VARIABLE_NUMBER limit (default 999).
    *
    * @param entityRows - Array of { name, entityType, project } from an entities query
+   * @param asOf - Optional ISO 8601 UTC timestamp for point-in-time observation filtering
    * @returns Entity array with observations attached
    */
-  private buildEntities(entityRows: { name: string; entityType: string; project: string | null; updated_at: string; created_at: string; id?: number }[]): Entity[] {
+  private buildEntities(entityRows: { name: string; entityType: string; project: string | null; updated_at: string; created_at: string; id?: number }[], asOf?: string): Entity[] {
     if (entityRows.length === 0) return [];
 
     const names = entityRows.map(e => e.name);
+    // Build temporal filter for observations — controls which observations are included
+    const obsFilter = this.temporalObsFilter(asOf);
 
     // Group observations by entity name using a Map, fetching in chunks
     // to avoid exceeding SQLite's parameter limit (default 999)
@@ -1233,8 +1455,8 @@ export class SqliteStore implements GraphStore {
                o.importance, o.context_layer, o.memory_type
         FROM observations o
         JOIN entities e ON o.entity_id = e.id
-        WHERE e.name IN (${placeholders}) AND o.superseded_at = ''
-      `).all(...chunk) as { entityName: string; content: string; createdAt: string;
+        WHERE e.name IN (${placeholders}) AND ${obsFilter.clause}
+      `).all(...chunk, ...obsFilter.params) as { entityName: string; content: string; createdAt: string;
         importance: number; context_layer: string | null; memory_type: string | null }[];
 
       for (const o of obsRows) {
@@ -1268,8 +1490,11 @@ export class SqliteStore implements GraphStore {
    * @param entityNames - Array of entity name strings
    * @returns Active Relation array with from/to/relationType and temporal fields
    */
-  private getConnectedRelations(entityNames: string[]): Relation[] {
+  private getConnectedRelations(entityNames: string[], asOf?: string): Relation[] {
     if (entityNames.length === 0) return [];
+
+    // Build temporal filter for relations — controls which relations are included
+    const relFilter = this.temporalRelFilter(asOf);
 
     // Each name is bound twice (from_entity IN (...) OR to_entity IN (...)),
     // so use half the chunk size to stay within the parameter limit
@@ -1280,14 +1505,14 @@ export class SqliteStore implements GraphStore {
       const chunk = entityNames.slice(i, i + halfChunk);
       const placeholders = chunk.map(() => '?').join(',');
       // Select temporal columns directly — schema v5 guarantees they exist.
-      // Only return active relations (superseded_at = '').
+      // Temporal filter controls whether we see active-only or point-in-time.
       const rows = this.db.prepare(`
         SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType,
                created_at AS createdAt, superseded_at AS supersededAt
         FROM relations
         WHERE (from_entity IN (${placeholders}) OR to_entity IN (${placeholders}))
-          AND superseded_at = ''
-      `).all(...chunk, ...chunk) as Relation[];
+          AND ${relFilter.clause}
+      `).all(...chunk, ...chunk, ...relFilter.params) as Relation[];
       results.push(...rows);
     }
 
@@ -1314,10 +1539,11 @@ export class SqliteStore implements GraphStore {
    *
    * @param projectId - Optional project name to filter by; normalized to lowercase/trimmed
    * @param pagination - Optional cursor and limit for paginated results; omit for all results
+   * @param asOf - Optional ISO 8601 UTC timestamp for point-in-time observation/relation filtering
    * @returns PaginatedKnowledgeGraph with entities, relations, nextCursor, and totalCount
    */
-  async readGraph(projectId?: string, pagination?: PaginationParams): Promise<PaginatedKnowledgeGraph> {
-    const fingerprint = readGraphFingerprint(projectId);
+  async readGraph(projectId?: string, pagination?: PaginationParams, asOf?: string): Promise<PaginatedKnowledgeGraph> {
+    const fingerprint = readGraphFingerprint(projectId, asOf);
 
     // When pagination is undefined, return all results (backward compat).
     // When provided, clamp the limit to valid range and optionally decode cursor.
@@ -1332,10 +1558,18 @@ export class SqliteStore implements GraphStore {
     // projectId arrives pre-normalized from normalizeProjectId() in index.ts
     const normalizedProject = projectId;
 
-    // Build the WHERE clause dynamically based on project filter and cursor position.
-    // Conditions array collects SQL fragments; params array collects bound values.
+    // Build the WHERE clause dynamically based on project filter, temporal filter,
+    // and cursor position. Conditions array collects SQL fragments; params array
+    // collects bound values.
     const conditions: string[] = [];
     const params: (string | number)[] = [];
+
+    // Temporal filter on entities. With asOf undefined, this is just `superseded_at = ''`
+    // (active rows only). With asOf set, returns rows that were active at that moment.
+    // alias='' because the FROM clause uses bare `entities` without an alias.
+    const entFilter = this.temporalEntFilter(asOf, '');
+    conditions.push(entFilter.clause);
+    params.push(...entFilter.params);
 
     if (normalizedProject) {
       // Include entities belonging to this project OR global entities (project IS NULL)
@@ -1391,6 +1625,11 @@ export class SqliteStore implements GraphStore {
     if (isPaginated) {
       const countConditions: string[] = [];
       const countParams: (string | number)[] = [];
+      // Mirror the temporal filter applied to the main query so totalCount
+      // matches the page contents at this asOf.
+      const countEntFilter = this.temporalEntFilter(asOf, '');
+      countConditions.push(countEntFilter.clause);
+      countParams.push(...countEntFilter.params);
       if (normalizedProject) {
         countConditions.push('(project = ? OR project IS NULL)');
         countParams.push(normalizedProject);
@@ -1403,15 +1642,16 @@ export class SqliteStore implements GraphStore {
       totalCount = pageRows.length;
     }
 
-    // Build full Entity objects with observations from the page rows
-    const entities = this.buildEntities(pageRows);
+    // Build full Entity objects with observations from the page rows.
+    // asOf controls temporal filtering — when set, only observations active at that moment.
+    const entities = this.buildEntities(pageRows, asOf);
 
     // Relations: when paginated or project-filtered, only include relations where
     // both endpoints are in the current page's entity set.
     // When not paginated and not project-filtered, return all relations (backward compat).
     if (isPaginated || projectId) {
       const entityNames = new Set(pageRows.map(e => e.name));
-      const connectedRelations = this.getConnectedRelations(pageRows.map(e => e.name));
+      const connectedRelations = this.getConnectedRelations(pageRows.map(e => e.name), asOf);
       const filteredRelations = connectedRelations.filter(r =>
         entityNames.has(r.from) && entityNames.has(r.to)
       );
@@ -1419,12 +1659,13 @@ export class SqliteStore implements GraphStore {
     }
 
     // Unscoped + unpaginated: return all active relations (backward compatible with original behavior).
-    // Filters out invalidated relations (superseded_at != '') and includes temporal columns.
+    // When asOf is set, apply temporal filter; otherwise filter by superseded_at = ''.
+    const relFilter = this.temporalRelFilter(asOf);
     const relations = this.db.prepare(
       `SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType,
               created_at AS createdAt, superseded_at AS supersededAt
-       FROM relations WHERE superseded_at = ''`
-    ).all() as Relation[];
+       FROM relations WHERE ${relFilter.clause}`
+    ).all(...relFilter.params) as Relation[];
 
     return { entities, relations, nextCursor, totalCount };
   }
@@ -1446,8 +1687,8 @@ export class SqliteStore implements GraphStore {
    * @param pagination - Optional cursor and limit for paginated results; omit for all results
    * @returns PaginatedKnowledgeGraph with matching entities, relations, nextCursor, and totalCount
    */
-  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams): Promise<PaginatedKnowledgeGraph> {
-    const fingerprint = searchNodesFingerprint(projectId, query);
+  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string): Promise<PaginatedKnowledgeGraph> {
+    const fingerprint = searchNodesFingerprint(projectId, query, asOf);
 
     // When pagination is undefined, return all results (backward compat).
     const isPaginated = pagination !== undefined;
@@ -1468,12 +1709,23 @@ export class SqliteStore implements GraphStore {
     // once, then reuse it for both pagination and total count. This avoids running the
     // expensive LEFT JOIN + 3 LIKE patterns twice (was issue #50).
     // SQLite materializes CTEs referenced multiple times, so matched_ids is computed once.
-    const cteParams: (string | number)[] = [pattern, pattern, pattern];
+    // When asOf is set, both the entity and observation filters become temporal.
+    const obsFilter = this.temporalObsFilter(asOf);
+    const entFilter = this.temporalEntFilter(asOf, 'e2');
+    // Parameter binding order matches textual order in the statement.
+    // SQL text order: JOIN ON (obsFilter) → WHERE entFilter → WHERE LIKE patterns → optional project.
+    // SQL parameter binding follows textual order, so the params array must mirror it exactly.
+    const cteParams: (string | number)[] = [
+      ...obsFilter.params,
+      ...entFilter.params,
+      pattern, pattern, pattern,
+    ];
     let cteSql = `
       WITH matched_ids AS (
         SELECT DISTINCT e2.id FROM entities e2
-        LEFT JOIN observations o ON o.entity_id = e2.id AND o.superseded_at = ''
-        WHERE (e2.name LIKE ? ESCAPE '\\' OR e2.entity_type LIKE ? ESCAPE '\\' OR o.content LIKE ? ESCAPE '\\')
+        LEFT JOIN observations o ON o.entity_id = e2.id AND ${obsFilter.clause}
+        WHERE ${entFilter.clause}
+          AND (e2.name LIKE ? ESCAPE '\\' OR e2.entity_type LIKE ? ESCAPE '\\' OR o.content LIKE ? ESCAPE '\\')
     `;
 
     if (normalizedProject) {
@@ -1542,8 +1794,8 @@ export class SqliteStore implements GraphStore {
       ? (pageRows.length > 0 ? pageRows[0].total_count! : 0)
       : pageRows.length;
 
-    // Build full Entity objects with observations
-    const entities = this.buildEntities(pageRows);
+    // Build full Entity objects with observations (asOf controls temporal filtering)
+    const entities = this.buildEntities(pageRows, asOf);
 
     // --- Vector search: find additional entities LIKE missed ---
     // If the embedding model is ready, run a KNN search for semantically
@@ -1570,15 +1822,30 @@ export class SqliteStore implements GraphStore {
             const obsIds = knnRows.map(r => parseInt(r.observation_id, 10));
             const vecEntityIds = new Set<number>();
 
+            // Temporal filters for the KNN result hydration. With asOf undefined,
+            // both filters reduce to `superseded_at = ''` (current state). With
+            // asOf set, both filters check the temporal interval — including the
+            // case where the observation has since been superseded but was active
+            // at asOf, which is exactly the historical recall path that depends on
+            // vec_observations rows surviving supersession (see Phase B fix #4).
+            const knnObsFilter = this.temporalObsFilter(asOf);
+            const knnEntFilter = this.temporalEntFilter(asOf, 'e');
             for (let i = 0; i < obsIds.length; i += CHUNK_SIZE) {
               const chunk = obsIds.slice(i, i + CHUNK_SIZE);
               const placeholders = chunk.map(() => '?').join(',');
+              // Param order matches textual SQL order: chunk IN clause → obsFilter → entFilter → optional project.
               let vecSql = `
                 SELECT DISTINCT e.id FROM observations o
                 JOIN entities e ON o.entity_id = e.id
-                WHERE o.id IN (${placeholders}) AND o.superseded_at = ''
+                WHERE o.id IN (${placeholders})
+                  AND ${knnObsFilter.clause}
+                  AND ${knnEntFilter.clause}
               `;
-              const vecParams: (string | number)[] = [...chunk];
+              const vecParams: (string | number)[] = [
+                ...chunk,
+                ...knnObsFilter.params,
+                ...knnEntFilter.params,
+              ];
               if (normalizedProject) {
                 vecSql += ' AND (e.project = ? OR e.project IS NULL)';
                 vecParams.push(normalizedProject);
@@ -1599,14 +1866,18 @@ export class SqliteStore implements GraphStore {
             const newIds = [...vecEntityIds].filter(id => !allLikeIds.has(id));
 
             if (newIds.length > 0) {
-              // Fetch and build the vector-only entities
+              // Fetch and build the vector-only entities. Temporal filter is
+              // redundant because vecEntityIds is already filtered through the
+              // KNN JOIN above, but applied here as defense-in-depth so this
+              // query never returns soft-deleted rows under any reordering.
+              const hydrateFilter = this.temporalEntFilter(asOf, '');
               const ph = newIds.map(() => '?').join(',');
               const newRows = this.db.prepare(`
                 SELECT name, entity_type AS entityType, project, updated_at, created_at, id
-                FROM entities WHERE id IN (${ph})
+                FROM entities WHERE id IN (${ph}) AND ${hydrateFilter.clause}
                 ORDER BY updated_at DESC, id DESC
-              `).all(...newIds) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string; id: number }[];
-              const vecEntities = this.buildEntities(newRows);
+              `).all(...newIds, ...hydrateFilter.params) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string; id: number }[];
+              const vecEntities = this.buildEntities(newRows, asOf);
               entities.push(...vecEntities);
             }
           }
@@ -1633,7 +1904,7 @@ export class SqliteStore implements GraphStore {
     // When paginated or project-filtered, both endpoints must be in the result set.
     // When not paginated and not project-filtered, use OR logic (backward compat).
     if (isPaginated || projectId) {
-      const allRelations = this.getConnectedRelations(allEntityNamesList);
+      const allRelations = this.getConnectedRelations(allEntityNamesList, asOf);
       const filteredRelations = allRelations.filter(r =>
         entityNames.has(r.from) && entityNames.has(r.to)
       );
@@ -1641,7 +1912,7 @@ export class SqliteStore implements GraphStore {
     }
 
     // Unscoped + unpaginated: OR logic for relations (at least one endpoint matches)
-    const relations = this.getConnectedRelations(allEntityNamesList);
+    const relations = this.getConnectedRelations(allEntityNamesList, asOf);
     return { entities, relations, nextCursor, totalCount };
   }
 
@@ -1655,7 +1926,7 @@ export class SqliteStore implements GraphStore {
    * @param projectId - Optional project name; only returns entities in this project or global
    * @returns Matching entities with observations + connected relations
    */
-  async openNodes(names: string[], projectId?: string): Promise<KnowledgeGraph> {
+  async openNodes(names: string[], projectId?: string, asOf?: string): Promise<KnowledgeGraph> {
     if (names.length === 0) return { entities: [], relations: [] };
 
     // Chunk the IN clause to stay under SQLite's SQLITE_MAX_VARIABLE_NUMBER limit (999).
@@ -1665,37 +1936,43 @@ export class SqliteStore implements GraphStore {
     // projectId arrives pre-normalized from normalizeProjectId() in index.ts
     const normalizedProject = projectId;
 
+    // Temporal filter on entities — when asOf is undefined, this is the simple
+    // active filter. When asOf is set, the entity must have existed at that time.
+    const entFilter = this.temporalEntFilter(asOf, '');
+
     for (let i = 0; i < names.length; i += CHUNK_SIZE) {
       const chunk = names.slice(i, i + CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
 
       if (normalizedProject) {
         const rows = this.db.prepare(
-          `SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities WHERE name IN (${placeholders}) AND (project = ? OR project IS NULL)`
-        ).all(...chunk, normalizedProject) as EntityRow[];
+          `SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities
+           WHERE name IN (${placeholders}) AND ${entFilter.clause} AND (project = ? OR project IS NULL)`
+        ).all(...chunk, ...entFilter.params, normalizedProject) as EntityRow[];
         entityRows.push(...rows);
       } else {
         const rows = this.db.prepare(
-          `SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities WHERE name IN (${placeholders})`
-        ).all(...chunk) as EntityRow[];
+          `SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities
+           WHERE name IN (${placeholders}) AND ${entFilter.clause}`
+        ).all(...chunk, ...entFilter.params) as EntityRow[];
         entityRows.push(...rows);
       }
     }
 
-    const entities = this.buildEntities(entityRows);
+    const entities = this.buildEntities(entityRows, asOf);
 
     // When project-filtered, use AND logic for relations (both endpoints in result set);
     // when unfiltered, use OR logic (at least one endpoint matches) for backward compat
     if (projectId) {
       const entityNames = new Set(entityRows.map(e => e.name));
-      const allRelations = this.getConnectedRelations(entityRows.map(e => e.name));
+      const allRelations = this.getConnectedRelations(entityRows.map(e => e.name), asOf);
       const filteredRelations = allRelations.filter(r =>
         entityNames.has(r.from) && entityNames.has(r.to)
       );
       return { entities, relations: filteredRelations };
     }
 
-    const relations = this.getConnectedRelations(entityRows.map(e => e.name));
+    const relations = this.getConnectedRelations(entityRows.map(e => e.name), asOf);
     return { entities, relations };
   }
 
@@ -1706,8 +1983,12 @@ export class SqliteStore implements GraphStore {
    * @returns Sorted array of project name strings
    */
   async listProjects(): Promise<string[]> {
+    // Exclude soft-deleted entities — listProjects shows projects with at least
+    // one currently-active entity. A project where every entity has been
+    // soft-deleted should not appear in the list. (Historical/timeline access
+    // for those projects is still available via entityTimeline by name.)
     const rows = this.db.prepare(
-      'SELECT DISTINCT project FROM entities WHERE project IS NOT NULL ORDER BY project'
+      `SELECT DISTINCT project FROM entities WHERE project IS NOT NULL AND superseded_at = '' ORDER BY project`
     ).all() as { project: string }[];
     return rows.map(r => r.project);
   }
@@ -1750,29 +2031,45 @@ export class SqliteStore implements GraphStore {
   async entityTimeline(entityName: string, projectId?: string): Promise<EntityTimelineResult | null> {
     const normalizedProject = projectId ?? null;
 
-    // Find the entity by name, optionally filtered by project
-    let entitySql = 'SELECT id, name, entity_type, project, updated_at, created_at FROM entities WHERE name = ?';
+    // Find ALL entity rows with this name. After v7 (soft-delete), a name can
+    // legitimately have multiple rows: at most one active row plus any number of
+    // historical soft-deleted rows. Order them so the active row (if any) comes
+    // first; otherwise the most recently soft-deleted row. This is what we use
+    // for entity-level metadata. The timeline aggregates observations across
+    // ALL incarnations of the name.
+    let entitySql = `SELECT id, name, entity_type, project, updated_at, created_at, superseded_at
+                     FROM entities WHERE name = ?`;
     const params: (string | null)[] = [entityName];
     if (normalizedProject) {
       // Include entities belonging to this project OR global entities (project IS NULL)
       entitySql += ' AND (project = ? OR project IS NULL)';
       params.push(normalizedProject);
     }
+    // Active row (superseded_at='') sorts first; among soft-deleted rows, most recent first.
+    // SQLite booleans return 0/1, so `superseded_at = ''` sorts true (active) above false.
+    entitySql += ` ORDER BY (superseded_at = '') DESC, created_at DESC`;
 
-    const entityRow = this.db.prepare(entitySql).get(...params) as {
+    const entityRows = this.db.prepare(entitySql).all(...params) as {
       id: number; name: string; entity_type: string;
-      project: string | null; updated_at: string; created_at: string;
-    } | undefined;
+      project: string | null; updated_at: string; created_at: string; superseded_at: string;
+    }[];
 
-    if (!entityRow) return null;
+    if (entityRows.length === 0) return null;
+    // Use the first row (active if any, else most recent soft-deleted) as the canonical metadata.
+    const entityRow = entityRows[0];
+    // Collect all entity IDs for the observation lookup so we get the full history
+    // across re-creation cycles.
+    const allEntityIds = entityRows.map(r => r.id);
+    const idPlaceholders = allEntityIds.map(() => '?').join(',');
 
-    // Fetch ALL observations (active AND superseded) sorted chronologically.
-    // Unlike buildEntities() which filters superseded_at = '', this returns everything.
+    // Fetch ALL observations (active AND superseded) across ALL incarnations of the
+    // name, sorted chronologically. Unlike buildEntities() which filters
+    // superseded_at = '', this returns everything for the timeline view.
     const obsRows = this.db.prepare(`
       SELECT content, created_at, superseded_at
-      FROM observations WHERE entity_id = ?
+      FROM observations WHERE entity_id IN (${idPlaceholders})
       ORDER BY created_at ASC
-    `).all(entityRow.id) as { content: string; created_at: string; superseded_at: string }[];
+    `).all(...allEntityIds) as { content: string; created_at: string; superseded_at: string }[];
 
     // Map DB rows to TimelineObservation with computed status field
     const observations: TimelineObservation[] = obsRows.map(o => ({

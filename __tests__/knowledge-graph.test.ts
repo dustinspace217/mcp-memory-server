@@ -324,10 +324,297 @@ describe.each<[string, string, StoreFactory]>([
 	});
 
 	// ----------------------------------------------------------
+	// Point-in-time queries (as_of)
+	// ----------------------------------------------------------
+	describe('as_of queries', () => {
+		it('should return observations active at a specific point in time', async function() {
+			// JSONL doesn't support supersede or temporal queries — skip
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Temporal', entityType: 'test', observations: ['version 1'] },
+			]);
+
+			// Record a timestamp between the two versions
+			await new Promise(r => setTimeout(r, 15));
+			const midpoint = new Date().toISOString();
+			await new Promise(r => setTimeout(r, 15));
+
+			// Supersede version 1 with version 2
+			await store.supersedeObservations([
+				{ entityName: 'Temporal', oldContent: 'version 1', newContent: 'version 2' },
+			]);
+
+			// Current state should show version 2
+			const current = await store.readGraph();
+			expect(current.entities[0].observations[0].content).toBe('version 2');
+
+			// State at midpoint should show version 1
+			const historical = await store.readGraph(undefined, undefined, midpoint);
+			expect(historical.entities).toHaveLength(1);
+			expect(historical.entities[0].observations[0].content).toBe('version 1');
+		});
+
+		it('should filter relations by as_of timestamp', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'NodeA', entityType: 'test', observations: ['fact'] },
+				{ name: 'NodeB', entityType: 'test', observations: ['fact'] },
+			]);
+			await store.createRelations([
+				{ from: 'NodeA', to: 'NodeB', relationType: 'links_to' },
+			]);
+
+			// Record midpoint
+			await new Promise(r => setTimeout(r, 15));
+			const midpoint = new Date().toISOString();
+			await new Promise(r => setTimeout(r, 15));
+
+			// Invalidate the relation
+			await store.invalidateRelations([
+				{ from: 'NodeA', to: 'NodeB', relationType: 'links_to' },
+			]);
+
+			// Current state: no active relations
+			const current = await store.openNodes(['NodeA', 'NodeB']);
+			expect(current.relations).toHaveLength(0);
+
+			// At midpoint: relation was still active
+			const historical = await store.openNodes(['NodeA', 'NodeB'], undefined, midpoint);
+			expect(historical.relations).toHaveLength(1);
+			expect(historical.relations[0].from).toBe('NodeA');
+		});
+
+		it('should exclude entity that did not exist yet from historical reads', async function() {
+			if (ext === 'jsonl') return;
+			// Record timestamp before entity creation
+			const beforeCreation = new Date().toISOString();
+			await new Promise(r => setTimeout(r, 15));
+
+			await store.createEntities([
+				{ name: 'LateEntity', entityType: 'test', observations: ['born later'] },
+			]);
+
+			// At beforeCreation, the entity itself didn't exist yet — entities now
+			// have temporal filtering (created_at <= asOf), so the row must be absent
+			// from the historical view, not just present-with-empty-observations.
+			const historical = await store.readGraph(undefined, undefined, beforeCreation);
+			expect(historical.entities.find(e => e.name === 'LateEntity')).toBeUndefined();
+		});
+
+		it('should work with searchNodes as_of', async function() {
+			if (ext === 'jsonl') return;
+			// Use semantically distant content so vector KNN can't bridge old↔new.
+			// "quantum entanglement" and "kitchen apple recipe" are unrelated enough
+			// that the embedding model won't surface one when querying for the other.
+			// LIKE substring is the only path that could match either, and the query
+			// 'quantum entanglement' has zero substring overlap with the new content.
+			await store.createEntities([
+				{ name: 'SearchTarget', entityType: 'test', observations: ['quantum entanglement physics'] },
+			]);
+
+			await new Promise(r => setTimeout(r, 15));
+			const midpoint = new Date().toISOString();
+			await new Promise(r => setTimeout(r, 15));
+
+			await store.supersedeObservations([
+				{ entityName: 'SearchTarget', oldContent: 'quantum entanglement physics', newContent: 'kitchen apple recipe' },
+			]);
+
+			// Search at midpoint should find entity via the historical observation
+			const historical = await store.searchNodes('quantum entanglement', undefined, undefined, midpoint);
+			expect(historical.entities).toHaveLength(1);
+			expect(historical.entities[0].observations[0].content).toBe('quantum entanglement physics');
+
+			// Search current for 'quantum entanglement' — entity exists but the observation is superseded.
+			// LIKE won't match (no substring 'quantum' in 'kitchen apple recipe').
+			// Vector search may still bridge if model loaded fast enough — best-effort assertion.
+			const current = await store.searchNodes('quantum entanglement');
+			const found = current.entities.find(e => e.name === 'SearchTarget');
+			if (found) {
+				// If it slipped through via vector, at minimum its active observations
+				// must NOT contain the superseded historical content.
+				expect(found.observations.map(o => o.content)).not.toContain('quantum entanglement physics');
+			}
+		});
+
+		it('should treat as_of in the future as the current state', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'NowEntity', entityType: 'test', observations: ['present'] },
+			]);
+			// Future timestamp ~1 hour ahead
+			const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+			const graph = await store.readGraph(undefined, undefined, future);
+			const e = graph.entities.find(en => en.name === 'NowEntity');
+			expect(e).toBeDefined();
+			expect(e!.observations.map(o => o.content)).toContain('present');
+		});
+
+		it('should return empty graph for as_of before any data exists', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'A', entityType: 'test', observations: ['x'] },
+				{ name: 'B', entityType: 'test', observations: ['y'] },
+			]);
+			await store.createRelations([{ from: 'A', to: 'B', relationType: 'links' }]);
+
+			// 1990 is before any data created in this test
+			const ancient = '1990-01-01T00:00:00.000Z';
+			const rg = await store.readGraph(undefined, undefined, ancient);
+			expect(rg.entities).toHaveLength(0);
+			expect(rg.relations).toHaveLength(0);
+
+			const sn = await store.searchNodes('x', undefined, undefined, ancient);
+			expect(sn.entities).toHaveLength(0);
+
+			const on = await store.openNodes(['A', 'B'], undefined, ancient);
+			expect(on.entities).toHaveLength(0);
+			expect(on.relations).toHaveLength(0);
+		});
+
+		it('should be inclusive at as_of == observation.createdAt boundary', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'BoundaryE', entityType: 'test', observations: ['exact'] },
+			]);
+			// Read the exact created_at of the observation we just inserted
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const db: any = (store as any).db;
+			const createdAt = (db.prepare(
+				`SELECT created_at FROM observations WHERE content = ?`
+			).get('exact') as { created_at: string }).created_at;
+
+			const graph = await store.readGraph(undefined, undefined, createdAt);
+			const e = graph.entities.find(en => en.name === 'BoundaryE');
+			expect(e).toBeDefined();
+			expect(e!.observations.map(o => o.content)).toContain('exact');
+		});
+
+		it('should be exclusive at as_of == observation.supersededAt boundary', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'BoundaryS', entityType: 'test', observations: ['old'] },
+			]);
+			await new Promise(r => setTimeout(r, 5));
+			await store.supersedeObservations([
+				{ entityName: 'BoundaryS', oldContent: 'old', newContent: 'new' },
+			]);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const db: any = (store as any).db;
+			const supersededAt = (db.prepare(
+				`SELECT superseded_at FROM observations WHERE content = ?`
+			).get('old') as { superseded_at: string }).superseded_at;
+
+			// At supersededAt, the half-open interval [created_at, superseded_at) excludes 'old'
+			const graph = await store.readGraph(undefined, undefined, supersededAt);
+			const e = graph.entities.find(en => en.name === 'BoundaryS');
+			expect(e).toBeDefined();
+			const contents = e!.observations.map(o => o.content);
+			expect(contents).not.toContain('old');
+			expect(contents).toContain('new');
+		});
+
+		it('should preserve as_of across paginated round-trips', async function() {
+			if (ext === 'jsonl') return;
+			// Create 50 entities to force pagination (default limit 40)
+			const entitiesToCreate = Array.from({ length: 50 }, (_, i) => ({
+				name: `Pager${String(i).padStart(2, '0')}`,
+				entityType: 'test',
+				observations: [`v1-${i}`],
+			}));
+			await store.createEntities(entitiesToCreate);
+			await new Promise(r => setTimeout(r, 5));
+			const midpoint = new Date().toISOString();
+			await new Promise(r => setTimeout(r, 5));
+
+			// Mutate after midpoint — supersede observations on a few entities
+			await store.supersedeObservations([
+				{ entityName: 'Pager00', oldContent: 'v1-0', newContent: 'v2-0' },
+				{ entityName: 'Pager25', oldContent: 'v1-25', newContent: 'v2-25' },
+			]);
+
+			// Page 1 at midpoint
+			const page1 = await store.readGraph(undefined, { limit: 40 }, midpoint);
+			expect(page1.entities.length).toBe(40);
+			expect(page1.nextCursor).toBeDefined();
+
+			// Page 2 at midpoint (re-pass same as_of with cursor)
+			const page2 = await store.readGraph(
+				undefined,
+				{ cursor: page1.nextCursor!, limit: 40 },
+				midpoint,
+			);
+			expect(page2.entities.length).toBe(10);
+
+			// Both pages should see the historical 'v1-*' values, not 'v2-*'
+			const allContents = [
+				...page1.entities.flatMap(e => e.observations.map(o => o.content)),
+				...page2.entities.flatMap(e => e.observations.map(o => o.content)),
+			];
+			expect(allContents.some(c => c === 'v1-0')).toBe(true);
+			expect(allContents.some(c => c === 'v1-25')).toBe(true);
+			expect(allContents.some(c => c.startsWith('v2-'))).toBe(false);
+		});
+
+		it('should reject paginated cursor when as_of is changed between pages', async function() {
+			if (ext === 'jsonl') return;
+			const entitiesToCreate = Array.from({ length: 50 }, (_, i) => ({
+				name: `CFP${String(i).padStart(2, '0')}`,
+				entityType: 'test',
+				observations: [`obs-${i}`],
+			}));
+			await store.createEntities(entitiesToCreate);
+
+			const t1 = new Date().toISOString();
+			await new Promise(r => setTimeout(r, 5));
+			const t2 = new Date().toISOString();
+
+			// Page 1 at t1
+			const page1 = await store.readGraph(undefined, { limit: 40 }, t1);
+			expect(page1.nextCursor).toBeDefined();
+
+			// Page 2 with mismatched as_of (t2) — fingerprint mismatch must throw
+			await expect(
+				store.readGraph(undefined, { cursor: page1.nextCursor!, limit: 40 }, t2),
+			).rejects.toThrow(InvalidCursorError);
+		});
+
+		it('should reject paginated cursor when as_of is dropped on a follow-up page', async function() {
+			if (ext === 'jsonl') return;
+			const entitiesToCreate = Array.from({ length: 50 }, (_, i) => ({
+				name: `CFD${String(i).padStart(2, '0')}`,
+				entityType: 'test',
+				observations: [`obs-${i}`],
+			}));
+			await store.createEntities(entitiesToCreate);
+
+			const t1 = new Date().toISOString();
+			const page1 = await store.readGraph(undefined, { limit: 40 }, t1);
+			expect(page1.nextCursor).toBeDefined();
+
+			// Page 2 with as_of omitted entirely
+			await expect(
+				store.readGraph(undefined, { cursor: page1.nextCursor!, limit: 40 }),
+			).rejects.toThrow(InvalidCursorError);
+		});
+
+		it('should throw when asOf is the empty string', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'EmptyAsOf', entityType: 'test', observations: ['x'] },
+			]);
+			await expect(store.readGraph(undefined, undefined, '')).rejects.toThrow();
+		});
+	});
+
+	// ----------------------------------------------------------
 	// deleteEntities
 	// ----------------------------------------------------------
 	describe('deleteEntities', () => {
-		it('should delete entities', async () => {
+		it('should remove entities from active queries', async function() {
+			// JSONL now throws on deleteEntities (soft-delete is SQLite-only).
+			// JSONL throw behavior is verified in a dedicated test below.
+			if (ext === 'jsonl') return;
 			await store.createEntities([
 				{ name: 'Alice', entityType: 'person', observations: [] },
 				{ name: 'Bob', entityType: 'person', observations: [] },
@@ -340,7 +627,8 @@ describe.each<[string, string, StoreFactory]>([
 			expect(graph.entities[0].name).toBe('Bob');
 		});
 
-		it('should cascade delete relations when deleting entities', async () => {
+		it('should cascade-invalidate relations when deleting entities', async function() {
+			if (ext === 'jsonl') return;
 			await store.createEntities([
 				{ name: 'Alice', entityType: 'person', observations: [] },
 				{ name: 'Bob', entityType: 'person', observations: [] },
@@ -359,10 +647,147 @@ describe.each<[string, string, StoreFactory]>([
 			expect(graph.relations).toHaveLength(0);
 		});
 
-		it('should handle deleting non-existent entities', async () => {
+		it('should handle deleting non-existent entities', async function() {
+			if (ext === 'jsonl') return;
 			await store.deleteEntities(['NonExistent']);
 			const graph = await store.readGraph();
 			expect(graph.entities).toHaveLength(0);
+		});
+
+		it('JSONL backend throws on deleteEntities (soft-delete unsupported)', async function() {
+			if (ext !== 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Alice', entityType: 'person', observations: [] },
+			]);
+			await expect(store.deleteEntities(['Alice'])).rejects.toThrow(/not supported in JSONL/);
+		});
+	});
+
+	// ----------------------------------------------------------
+	// Soft-delete behavior (SQLite only)
+	// ----------------------------------------------------------
+	describe('soft-delete behavior', () => {
+		// Helper: open the underlying DB to assert raw column values.
+		// SqliteStore exposes the better-sqlite3 connection via a private field;
+		// we cast through `any` because the test only needs read-only inspection.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		function rawDb(s: GraphStore): any {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			return (s as any).db;
+		}
+
+		it('should set superseded_at on the entity row instead of hard-deleting', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Ghost', entityType: 'spectre', observations: ['boo'] },
+			]);
+			const beforeDelete = new Date().toISOString();
+			await new Promise(r => setTimeout(r, 5));
+
+			await store.deleteEntities(['Ghost']);
+
+			// Row still exists, but superseded_at is now set
+			const row = rawDb(store).prepare(
+				`SELECT name, superseded_at FROM entities WHERE name = ?`
+			).get('Ghost') as { name: string; superseded_at: string } | undefined;
+			expect(row).toBeDefined();
+			expect(row!.superseded_at).not.toBe('');
+			expect(row!.superseded_at >= beforeDelete).toBe(true);
+		});
+
+		it('should be invisible at as_of after the deletion timestamp', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Phantom', entityType: 'spectre', observations: ['eek'] },
+			]);
+			await new Promise(r => setTimeout(r, 5));
+			await store.deleteEntities(['Phantom']);
+			await new Promise(r => setTimeout(r, 5));
+			const afterDelete = new Date().toISOString();
+
+			const graph = await store.readGraph(undefined, undefined, afterDelete);
+			expect(graph.entities.find(e => e.name === 'Phantom')).toBeUndefined();
+		});
+
+		it('should be visible at as_of before the deletion timestamp', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Wraith', entityType: 'spectre', observations: ['hiss'] },
+			]);
+			await new Promise(r => setTimeout(r, 5));
+			const beforeDelete = new Date().toISOString();
+			await new Promise(r => setTimeout(r, 5));
+			await store.deleteEntities(['Wraith']);
+
+			const graph = await store.readGraph(undefined, undefined, beforeDelete);
+			const wraith = graph.entities.find(e => e.name === 'Wraith');
+			expect(wraith).toBeDefined();
+			expect(wraith!.observations.map(o => o.content)).toContain('hiss');
+		});
+
+		it('should atomically invalidate relations at the same timestamp as the entity', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Hub', entityType: 'node', observations: [] },
+				{ name: 'Leaf', entityType: 'node', observations: [] },
+			]);
+			await store.createRelations([
+				{ from: 'Hub', to: 'Leaf', relationType: 'connects' },
+				{ from: 'Leaf', to: 'Hub', relationType: 'reports_to' },
+			]);
+
+			await store.deleteEntities(['Hub']);
+
+			const db = rawDb(store);
+			const entityTs = (db.prepare(
+				`SELECT superseded_at FROM entities WHERE name = ?`
+			).get('Hub') as { superseded_at: string }).superseded_at;
+			const relTs = db.prepare(
+				`SELECT superseded_at FROM relations WHERE from_entity = ? OR to_entity = ?`
+			).all('Hub', 'Hub') as { superseded_at: string }[];
+
+			expect(relTs).toHaveLength(2);
+			for (const r of relTs) {
+				expect(r.superseded_at).toBe(entityTs);
+			}
+		});
+
+		it('should permit re-creating an entity with the same name after soft-delete', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Reborn', entityType: 'v1', observations: ['original'] },
+			]);
+			await store.deleteEntities(['Reborn']);
+
+			// Should NOT throw — partial unique index allows re-creation
+			const result = await store.createEntities([
+				{ name: 'Reborn', entityType: 'v2', observations: ['fresh'] },
+			]);
+			expect(result.created).toHaveLength(1);
+			expect(result.created[0].entityType).toBe('v2');
+
+			// Active query sees the new version
+			const graph = await store.readGraph();
+			const reborn = graph.entities.find(e => e.name === 'Reborn');
+			expect(reborn).toBeDefined();
+			expect(reborn!.entityType).toBe('v2');
+		});
+
+		it('deleteObservations on a soft-deleted entity is a no-op', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Casper', entityType: 'spectre', observations: ['friendly'] },
+			]);
+			await store.deleteEntities(['Casper']);
+
+			// Should not throw — deleteObservations is idempotent on missing entities
+			await store.deleteObservations([
+				{ entityName: 'Casper', observations: ['friendly'] },
+			]);
+
+			// Casper still gone from active query
+			const graph = await store.readGraph();
+			expect(graph.entities.find(e => e.name === 'Casper')).toBeUndefined();
 		});
 	});
 
@@ -2250,8 +2675,10 @@ describe('SqliteStore-specific', () => {
 			conn.close();
 
 			expect(row).toBeDefined();
-			// Fresh databases should be at version 6 (current schema with observation metadata columns).
-			expect(row!.version).toBe(6);
+			// Fresh databases should be at version 7 (v7 added soft-delete on entities
+			// via superseded_at + partial unique index, and rebuilt the relations table
+			// without the FK clause to coexist with the partial unique index).
+			expect(row!.version).toBe(7);
 		});
 	});
 

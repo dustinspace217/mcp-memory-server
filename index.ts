@@ -349,13 +349,14 @@ server.registerTool(
       projectId: ProjectIdSchema,
       cursor: z.string().max(10000).optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page."),
       limit: z.number().int().min(1).max(100).optional().default(40).describe("Max entities per page (default 40, max 100)"),
+      asOf: z.string().datetime({ offset: false }).optional().describe("ISO 8601 UTC timestamp (Z suffix only — no offsets). Returns graph state as it was at this moment. Omit for current state. When paginating, you MUST re-pass the same asOf on every page request — the cursor fingerprint encodes the temporal context, and a mismatched (or missing) asOf on a follow-up page will be rejected with InvalidCursorError."),
     },
     outputSchema: PaginatedOutputSchema,
   },
-  async ({ projectId, cursor, limit }) => {
+  async ({ projectId, cursor, limit, asOf }) => {
     // limit is always a number (Zod default 40), so pagination is always active via MCP.
     // The store's "return all" path only triggers for direct programmatic callers.
-    const result = await store.readGraph(normalizeProjectId(projectId), { cursor, limit });
+    const result = await store.readGraph(normalizeProjectId(projectId), { cursor, limit }, asOf);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       structuredContent: { ...result }
@@ -373,11 +374,12 @@ server.registerTool(
       projectId: ProjectIdSchema,
       cursor: z.string().max(10000).optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page."),
       limit: z.number().int().min(1).max(100).optional().default(40).describe("Max entities per page (default 40, max 100)"),
+      asOf: z.string().datetime({ offset: false }).optional().describe("ISO 8601 UTC timestamp (Z suffix only — no offsets). Returns graph state as it was at this moment. Omit for current state. When paginating, you MUST re-pass the same asOf on every page request — the cursor fingerprint encodes the temporal context, and a mismatched (or missing) asOf on a follow-up page will be rejected with InvalidCursorError."),
     },
     outputSchema: PaginatedOutputSchema,
   },
-  async ({ query, projectId, cursor, limit }) => {
-    const result = await store.searchNodes(query, normalizeProjectId(projectId), { cursor, limit });
+  async ({ query, projectId, cursor, limit, asOf }) => {
+    const result = await store.searchNodes(query, normalizeProjectId(projectId), { cursor, limit }, asOf);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       structuredContent: { ...result }
@@ -393,11 +395,12 @@ server.registerTool(
     inputSchema: {
       names: z.array(z.string().min(1).max(500)).max(100).describe("An array of entity names to retrieve"),
       projectId: ProjectIdSchema,
+      asOf: z.string().datetime({ offset: false }).optional().describe("ISO 8601 UTC timestamp (Z suffix only — no offsets). Returns entity state as it was at this moment. Omit for current state."),
     },
     outputSchema: { entities: z.array(EntityOutputSchema), relations: z.array(RelationOutputSchema) }
   },
-  async ({ names, projectId }) => {
-    const graph = await store.openNodes(names, normalizeProjectId(projectId));
+  async ({ names, projectId, asOf }) => {
+    const graph = await store.openNodes(names, normalizeProjectId(projectId), asOf);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
       structuredContent: { ...graph }

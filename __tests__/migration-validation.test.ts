@@ -507,10 +507,12 @@ describe('Migration safety validation', () => {
     const sqliteStore = new SqliteStore(dbPath);
     await sqliteStore.init();
 
-    // Verify schema_version is now 6
+    // Verify schema_version is at least 6 (init() runs all migrations up to the
+    // code's current version, which may be > 6 — this test only validates the
+    // 5→6 portion that adds metadata columns).
     const db2 = new Database(dbPath);
     const version = (db2.prepare(`SELECT version FROM schema_version`).get() as { version: number }).version;
-    expect(version).toBe(6);
+    expect(version).toBeGreaterThanOrEqual(6);
 
     // Verify new columns exist with correct defaults
     const v6Columns = db2.prepare(`PRAGMA table_info(observations)`).all() as { name: string; dflt_value: string | null; notnull: number }[];
@@ -550,6 +552,124 @@ describe('Migration safety validation', () => {
     expect(graph.entities).toHaveLength(1);
     expect(graph.entities[0].name).toBe('TestEntity');
     expect(graph.entities[0].observations).toHaveLength(2);
+
+    await sqliteStore.close();
+  });
+
+  it('should migrate v6 → v7: add superseded_at to entities + partial unique index', async () => {
+    // Create a v6 database directly using better-sqlite3, then verify that
+    // SqliteStore auto-migrates it to v7 (soft-delete on entities).
+    const id = Date.now();
+    dbPath = path.join(testDir, `test-v6-to-v7-${id}.db`);
+    jsonlPath = path.join(testDir, `nonexistent-${id}.jsonl`); // not used, just for cleanup
+
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
+
+    // Build v6 schema using individual prepare/run statements (security hook
+    // false-positive workaround — see comment at line 451 above).
+    db.prepare(`CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL)`).run();
+    db.prepare(`INSERT INTO schema_version (id, version) VALUES (1, 6)`).run();
+
+    // entities table (v6 schema — has updated_at, created_at, NO superseded_at)
+    db.prepare(`CREATE TABLE entities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      entity_type TEXT NOT NULL,
+      project TEXT,
+      updated_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+      created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}'
+    )`).run();
+
+    // observations table (v6 schema — has importance/context_layer/memory_type)
+    db.prepare(`CREATE TABLE observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      superseded_at TEXT NOT NULL DEFAULT '',
+      importance REAL NOT NULL DEFAULT 3.0,
+      context_layer TEXT,
+      memory_type TEXT,
+      UNIQUE(entity_id, content, superseded_at)
+    )`).run();
+
+    // relations table (v5+ schema — has created_at, superseded_at)
+    db.prepare(`CREATE TABLE relations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_entity TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+      to_entity TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+      relation_type TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      UNIQUE(from_entity, to_entity, relation_type, superseded_at)
+    )`).run();
+
+    // Seed test data: two entities with a relation between them, plus an observation
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, NULL, ?, ?)`).run('Alpha', 'test', now, now);
+    db.prepare(`INSERT INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, NULL, ?, ?)`).run('Beta', 'test', now, now);
+    const alphaId = (db.prepare(`SELECT id FROM entities WHERE name = ?`).get('Alpha') as { id: number }).id;
+    db.prepare(`INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)`).run(alphaId, 'alpha-obs', now);
+    db.prepare(`INSERT INTO relations (from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)`).run('Alpha', 'Beta', 'links', now);
+
+    // Verify v6 has NO superseded_at on entities
+    const v6Cols = db.prepare(`PRAGMA table_info(entities)`).all() as { name: string }[];
+    expect(v6Cols.map(c => c.name)).not.toContain('superseded_at');
+
+    db.close();
+
+    // Open with SqliteStore — should auto-migrate v6 → v7
+    const sqliteStore = new SqliteStore(dbPath);
+    await sqliteStore.init();
+
+    // Verify schema_version is now 7
+    const db2 = new Database(dbPath);
+    const version = (db2.prepare(`SELECT version FROM schema_version`).get() as { version: number }).version;
+    expect(version).toBe(7);
+
+    // Verify new column exists with correct default
+    const v7Cols = db2.prepare(`PRAGMA table_info(entities)`).all() as { name: string; dflt_value: string | null; notnull: number }[];
+    const supersededCol = v7Cols.find(c => c.name === 'superseded_at');
+    expect(supersededCol).toBeDefined();
+    // SQLite returns the default with surrounding quotes for string literals
+    expect(supersededCol!.dflt_value).toBe(`''`);
+    expect(supersededCol!.notnull).toBe(1); // NOT NULL
+
+    // Verify the partial unique index exists
+    const indexes = db2.prepare(`PRAGMA index_list(entities)`).all() as { name: string; unique: number; partial: number }[];
+    const partialIdx = indexes.find(i => i.name === 'idx_entities_name_active');
+    expect(partialIdx).toBeDefined();
+    expect(partialIdx!.unique).toBe(1);
+    expect(partialIdx!.partial).toBe(1);
+
+    // Verify the original UNIQUE(name) constraint was dropped (table rebuild).
+    // After the rebuild, only the new partial index should enforce active-name uniqueness.
+    // Confirm by checking that all entity rows survived and have superseded_at = ''.
+    const rows = db2.prepare(`SELECT name, superseded_at FROM entities ORDER BY name`).all() as { name: string; superseded_at: string }[];
+    expect(rows).toHaveLength(2);
+    expect(rows[0].name).toBe('Alpha');
+    expect(rows[0].superseded_at).toBe('');
+    expect(rows[1].name).toBe('Beta');
+    expect(rows[1].superseded_at).toBe('');
+
+    // FK integrity: relations row still references existing entity names after the rebuild
+    const rel = db2.prepare(`SELECT from_entity, to_entity FROM relations`).get() as { from_entity: string; to_entity: string };
+    expect(rel.from_entity).toBe('Alpha');
+    expect(rel.to_entity).toBe('Beta');
+
+    // Observations also still attached
+    const obsCount = (db2.prepare(`SELECT COUNT(*) as c FROM observations`).get() as { c: number }).c;
+    expect(obsCount).toBe(1);
+
+    db2.close();
+
+    // Verify data round-trips through SqliteStore.readGraph()
+    const graph = await sqliteStore.readGraph();
+    expect(graph.entities).toHaveLength(2);
+    expect(graph.relations).toHaveLength(1);
 
     await sqliteStore.close();
   });
