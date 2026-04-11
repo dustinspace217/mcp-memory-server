@@ -39,6 +39,7 @@ import {
   readGraphFingerprint,
   searchNodesFingerprint,
 } from './cursor.js';
+import { normalizeEntityName } from './normalize-name.js';
 
 /**
  * Checks if a file exists at the given path.
@@ -189,6 +190,8 @@ export class SqliteStore implements GraphStore {
     //   5 = added created_at, superseded_at to relations (table rebuild for temporal relations)
     //   6 = added importance, context_layer, memory_type columns to observations (Phase A)
     //   7 = added superseded_at to entities + partial unique index on active rows (soft-delete)
+    //   8 = added normalized_name to entities + rewrote relations to reference normalized form
+    //       (Layer 1 entity name normalization — collapses surface variants under one identity)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_version (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -444,6 +447,176 @@ export class SqliteStore implements GraphStore {
       currentVersion = 7;
     }
 
+    if (currentVersion < 8) {
+      // Migration 7 → 8: entity name normalization (Layer 1).
+      //
+      // Adds a `normalized_name` column to entities. The column is the
+      // IDENTITY KEY: a partial unique index on normalized_name (where
+      // superseded_at = '') collapses surface variants like 'dustin-space',
+      // 'dustin_space', 'Dustin Space' into a single entity. The original
+      // `name` column is preserved for display (Option B / hybrid).
+      //
+      // Relations rewrite: relations.from_entity / to_entity previously held
+      // the display form of names. After this migration they hold the
+      // normalized form, so identity matching at the relations layer goes
+      // through normalized_name. Read paths JOIN entities to translate
+      // back to display names for output.
+      //
+      // Collision detection: if two ACTIVE entities normalize to the same
+      // identity key, the migration ABORTS the transaction with a structured
+      // error listing the colliding pairs. Resolution requires manual
+      // cleanup (rename or soft-delete one of each pair) before retry.
+      //
+      // The live MCP memory DB had 0 collisions on 142 entities at the
+      // time this migration was written (verified 2026-04-11).
+      //
+      // Each DDL statement uses this.db.prepare(...).run() individually
+      // rather than a single multi-statement string -- same workaround
+      // documented in the v6→v7 block above.
+      //
+      // foreign_keys is toggled OFF for the duration of the migration. The
+      // v6→v7 migration was supposed to drop the FK from relations to
+      // entities(name), but some historical databases may have arrived at
+      // schema_version=7 while still carrying the FK (e.g. schema_version
+      // manipulated directly, or a fresh `CREATE TABLE IF NOT EXISTS` that
+      // re-created the relations table with the inline REFERENCES clause
+      // before the v6→v7 rebuild path ran). With the FK still present,
+      // rewriting relations.from_entity / to_entity to the normalized form
+      // (which no longer matches entities.name) fails with
+      // "foreign key mismatch". Turning FKs off sidesteps that; any
+      // integrity we need is enforced explicitly by the orphan check in
+      // Step 5 below. Pragma runs OUTSIDE the transaction (SQLite does not
+      // allow `PRAGMA foreign_keys` inside an open transaction).
+      this.db.pragma('foreign_keys = OFF');
+      this.db.transaction(() => {
+        // Step 1: add the normalized_name column with empty default so
+        // existing rows satisfy NOT NULL until the backfill runs.
+        this.db.prepare(`ALTER TABLE entities ADD COLUMN normalized_name TEXT NOT NULL DEFAULT ''`).run();
+
+        // Step 2: backfill normalized_name for every existing row.
+        // SQLite has no built-in NFC/lowercase/separator-strip helper, so
+        // we SELECT all rows and run normalizeEntityName() in JS.
+        // We backfill BOTH active and soft-deleted rows -- the partial
+        // unique index only constrains active rows, but historical rows
+        // need the column populated for any future read that filters on it.
+        const allEntities = this.db.prepare(
+          `SELECT id, name FROM entities`
+        ).all() as { id: number; name: string }[];
+        const updateNormalized = this.db.prepare(
+          `UPDATE entities SET normalized_name = ? WHERE id = ?`
+        );
+        for (const row of allEntities) {
+          // normalizeEntityName throws on empty/invalid input. Existing
+          // rows should never be empty (createEntities validation has
+          // always required non-empty names), but if it happens the
+          // throw aborts the transaction and surfaces a clean error.
+          const normalized = normalizeEntityName(row.name);
+          updateNormalized.run(normalized, row.id);
+        }
+
+        // Step 3: collision check among ACTIVE rows only.
+        // Two active entities with different display forms but the same
+        // normalized form would violate the upcoming partial unique
+        // index. Detect them now so the error is actionable instead of
+        // an opaque SQLITE_CONSTRAINT failure on index creation.
+        // GROUP_CONCAT joins the colliding display names with '|' as
+        // separator (chosen because it's not in the separator strip set,
+        // so display names won't contain it accidentally).
+        const collisions = this.db.prepare(`
+          SELECT normalized_name,
+                 GROUP_CONCAT(name, '|') AS display_names,
+                 COUNT(*) AS cnt
+          FROM entities
+          WHERE superseded_at = ''
+          GROUP BY normalized_name
+          HAVING COUNT(*) > 1
+        `).all() as { normalized_name: string; display_names: string; cnt: number }[];
+
+        if (collisions.length > 0) {
+          const lines = collisions.map(c =>
+            `  - [${c.display_names.split('|').map(n => `"${n}"`).join(', ')}] all normalize to "${c.normalized_name}"`
+          );
+          throw new Error(
+            `v7→v8 migration aborted: ${collisions.length} entity name collision(s) detected.\n` +
+            `Resolve manually before retrying (rename or soft-delete one of each pair).\n` +
+            lines.join('\n')
+          );
+        }
+
+        // Step 4: rewrite relations.from_entity / to_entity from display
+        // form to normalized form. Each relation row's from/to value is
+        // looked up in entities (by name) and replaced with the
+        // normalized_name of that entity.
+        //
+        // The WHERE EXISTS guards against orphan relations (rows whose
+        // from/to references no current entity). Orphans should not
+        // exist after the v5→v7 schema work, but the guard prevents
+        // them from being silently nulled here.
+        this.db.prepare(`
+          UPDATE relations
+          SET from_entity = (
+            SELECT normalized_name FROM entities WHERE entities.name = relations.from_entity
+          )
+          WHERE EXISTS (
+            SELECT 1 FROM entities WHERE entities.name = relations.from_entity
+          )
+        `).run();
+        this.db.prepare(`
+          UPDATE relations
+          SET to_entity = (
+            SELECT normalized_name FROM entities WHERE entities.name = relations.to_entity
+          )
+          WHERE EXISTS (
+            SELECT 1 FROM entities WHERE entities.name = relations.to_entity
+          )
+        `).run();
+
+        // Step 5: verify post-rewrite FK integrity at the application
+        // layer. Every relations.from_entity / to_entity should now
+        // resolve to an entities.normalized_name. Any that don't are
+        // orphans -- the migration aborts so the database isn't left
+        // in a half-translated state.
+        const orphans = this.db.prepare(`
+          SELECT id, from_entity, to_entity FROM relations
+          WHERE from_entity NOT IN (SELECT normalized_name FROM entities)
+             OR to_entity   NOT IN (SELECT normalized_name FROM entities)
+        `).all() as { id: number; from_entity: string; to_entity: string }[];
+
+        if (orphans.length > 0) {
+          const sample = orphans.slice(0, 10).map(o =>
+            `  - relation id=${o.id}: "${o.from_entity}" -> "${o.to_entity}"`
+          );
+          throw new Error(
+            `v7→v8 migration aborted: ${orphans.length} relation(s) reference non-existent entity names after rewrite.\n` +
+            `This indicates pre-existing FK orphans in the relations table. ` +
+            `Inspect and clean up before retrying.\n` +
+            sample.join('\n') +
+            (orphans.length > 10 ? `\n  ... and ${orphans.length - 10} more` : '')
+          );
+        }
+
+        // Step 6: drop the v7 partial unique index on display name and
+        // create the new one on normalized_name. The new index enforces
+        // identity uniqueness among active rows.
+        this.db.prepare(`DROP INDEX IF EXISTS idx_entities_name_active`).run();
+        this.db.prepare(`
+          CREATE UNIQUE INDEX idx_entities_normalized_active
+            ON entities(normalized_name) WHERE superseded_at = ''
+        `).run();
+
+        this.db.prepare('UPDATE schema_version SET version = 8').run();
+      })();
+      // Re-enable FKs after the rewrite. If any stale FK was still present
+      // on the relations table (see rationale at foreign_keys = OFF above),
+      // it would now be enforced — but the v7→v8 migration only rewrites
+      // relations.from_entity / to_entity to normalized form, and those
+      // values no longer match entities.name. In practice the FK is
+      // already absent on any db that went through the v6→v7 rebuild
+      // correctly; this pragma restores the session default either way.
+      this.db.pragma('foreign_keys = ON');
+      currentVersion = 8;
+    }
+
     // === Indexes (idempotent, run on every startup) ===
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
@@ -616,31 +789,37 @@ export class SqliteStore implements GraphStore {
    * @param graph - KnowledgeGraph loaded from the JSONL file by JsonlStore.readGraph()
    */
   private migrateFromJsonl(graph: KnowledgeGraph): void {
-    // Prepared statements are compiled once and reused for every row in the transaction
+    // Prepared statements are compiled once and reused for every row in the transaction.
+    // Schema v8 added normalized_name as the identity key — every entity insert must populate it.
     const insertEntity = this.db.prepare(
-      'INSERT OR IGNORE INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO entities (name, normalized_name, entity_type, project, updated_at, created_at) VALUES (?, ?, ?, ?, ?, ?)'
     );
-    // Used to look up the auto-assigned id after inserting an entity
+    // Look up the auto-assigned id after inserting. Goes through normalized_name +
+    // active filter so a hypothetical re-run (after partial crash) finds the right row
+    // even if a soft-deleted shadow exists for the same display name.
     const getEntityId = this.db.prepare(
-      'SELECT id FROM entities WHERE name = ?'
+      `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
     // INSERT includes metadata columns — schema v6 guarantees they exist.
     // Legacy JSONL observations will have default values (3.0, null, null).
     const insertObs = this.db.prepare(
       'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type) VALUES (?, ?, ?, ?, ?, ?)'
     );
+    // Relations store the NORMALIZED form for from_entity / to_entity (post-v8). The
+    // JSONL file holds display names, so we normalize before insert.
     const insertRel = this.db.prepare(
       'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type) VALUES (?, ?, ?)'
     );
 
-    // Build a Set of entity names that survived insertion. Used below to skip
-    // dangling relations (since the v7 schema no longer has an FK to enforce this).
-    const validEntityNames = new Set<string>();
+    // Track valid normalized names so we can skip dangling relations (no FK to enforce
+    // this since v7 dropped the FK constraint on relations).
+    const validNormalizedNames = new Set<string>();
 
     // db.transaction() wraps everything in BEGIN/COMMIT and auto-rolls-back on throw
     const txn = this.db.transaction(() => {
       for (const entity of graph.entities) {
-        // INSERT OR IGNORE: if name already exists (duplicate in JSONL), skip silently.
+        // INSERT OR IGNORE: if normalized_name already exists (duplicate or surface
+        // variant in JSONL), the partial unique index drops the second one silently.
         // Normalize the project value (trim + lowercase + NFC) to match the normalization
         // applied by createEntities. Without this, mixed-case project values from JSONL
         // (e.g., "My-Project") would be stored verbatim and become invisible to
@@ -653,9 +832,19 @@ export class SqliteStore implements GraphStore {
         // otherwise fall back to the sentinel value for legacy data
         const entityUpdatedAt = entity.updatedAt || ENTITY_TIMESTAMP_SENTINEL;
         const entityCreatedAt = entity.createdAt || ENTITY_TIMESTAMP_SENTINEL;
-        insertEntity.run(entity.name, entity.entityType, migratedProject, entityUpdatedAt, entityCreatedAt);
-        const row = getEntityId.get(entity.name) as { id: number };
-        validEntityNames.add(entity.name);
+        // Compute the identity key. normalizeEntityName() throws on empty/separator-only
+        // names — that throws out of the txn callback and rolls back the migration cleanly.
+        const normalizedName = normalizeEntityName(entity.name);
+        insertEntity.run(entity.name, normalizedName, entity.entityType, migratedProject, entityUpdatedAt, entityCreatedAt);
+        const row = getEntityId.get(normalizedName) as { id: number } | undefined;
+        if (!row) {
+          // INSERT OR IGNORE skipped (collision with an earlier surface variant in
+          // the same JSONL file). Log it so the operator sees what happened, and
+          // skip the observations — they'd attach to the wrong row otherwise.
+          console.error(`WARNING: Skipped duplicate entity during migration: "${entity.name}" (normalizes to "${normalizedName}")`);
+          continue;
+        }
+        validNormalizedNames.add(normalizedName);
         for (const obs of entity.observations) {
           // obs is already a normalized Observation object (JsonlStore.readGraph() calls normalizeObservation).
           // Read metadata fields with defaults for legacy JSONL data that predates v1.1.
@@ -663,13 +852,17 @@ export class SqliteStore implements GraphStore {
         }
       }
       for (const rel of graph.relations) {
+        // Normalize the relation endpoints from display form (JSONL stores display)
+        // to the identity form (post-v8 relations table stores normalized).
+        const fromNorm = normalizeEntityName(rel.from);
+        const toNorm = normalizeEntityName(rel.to);
         // Application-level dangling-relation check (replaces dropped FK constraint).
-        if (!validEntityNames.has(rel.from) || !validEntityNames.has(rel.to)) {
+        if (!validNormalizedNames.has(fromNorm) || !validNormalizedNames.has(toNorm)) {
           console.error(`WARNING: Skipped dangling relation during migration: ${rel.from} -> ${rel.to} [${rel.relationType}] (entity not found)`);
           continue;
         }
         // INSERT OR IGNORE handles duplicate relations
-        insertRel.run(rel.from, rel.to, rel.relationType);
+        insertRel.run(fromNorm, toNorm, rel.relationType);
       }
     });
     txn();
@@ -840,18 +1033,22 @@ export class SqliteStore implements GraphStore {
     // Capture the current time once for all entities in this batch (consistent timestamps)
     const now = new Date().toISOString();
 
-    // Prepared statements are compiled once and reused -- faster than parsing per row
+    // Prepared statements are compiled once and reused -- faster than parsing per row.
+    // INSERT now writes both `name` (display, preserved as the caller supplied) and
+    // `normalized_name` (identity key, used by the partial unique index for collision detection).
     const insertEntity = this.db.prepare(
-      'INSERT OR IGNORE INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO entities (name, normalized_name, entity_type, project, updated_at, created_at) VALUES (?, ?, ?, ?, ?, ?)'
     );
-    // Filter superseded_at = '' so we only retrieve the active row, not historical
-    // soft-deleted rows that share the same name (allowed by the partial unique index).
+    // Lookups go through normalized_name now (the identity key). Filter superseded_at = ''
+    // so we only see the active row, not historical soft-deleted rows that may share
+    // the same normalized form (allowed by the partial unique index being WHERE active).
     const getEntityId = this.db.prepare(
-      `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
+      `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
-    // Look up existing entity's project for skip reporting -- active row only.
-    const getExistingProject = this.db.prepare(
-      `SELECT project FROM entities WHERE name = ? AND superseded_at = ''`
+    // For skip reporting: return the EXISTING display name and project so the caller can see
+    // which surface variant won when their input collided with a different one.
+    const getExistingForSkip = this.db.prepare(
+      `SELECT name AS existing_name, project FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
     // INSERT includes all three observation metadata columns (importance, context_layer, memory_type).
     // Schema v6 guarantees these columns exist. Defaults (3.0, NULL, NULL) match the column defaults.
@@ -866,25 +1063,37 @@ export class SqliteStore implements GraphStore {
     // it automatically rolls back. This is a better-sqlite3 feature (not raw SQL).
     const txn = this.db.transaction(() => {
       for (const e of entities) {
-        // INSERT OR IGNORE returns changes=0 if the name already exists (UNIQUE constraint)
-        const info = insertEntity.run(e.name, e.entityType, normalizedProject, now, now);
+        // Compute the identity key once per input. normalizeEntityName throws on
+        // empty/whitespace-only/separator-only names -- the throw aborts the
+        // transaction and surfaces a clean error to the caller.
+        const normalizedName = normalizeEntityName(e.name);
+
+        // INSERT OR IGNORE returns changes=0 if normalized_name already exists
+        // among ACTIVE rows (the partial unique index enforces this).
+        const info = insertEntity.run(e.name, normalizedName, e.entityType, normalizedProject, now, now);
         if (info.changes === 0) {
-          // Entity already exists -- report it as skipped with its existing project
-          const existing = getExistingProject.get(e.name) as { project: string | null } | undefined;
+          // Collision -- look up the existing winner so we can report both the
+          // input display form (caller's `name`) and the stored display form (`existingName`).
+          // These differ when the caller submitted a surface variant of an existing entity.
+          const existing = getExistingForSkip.get(normalizedName) as
+            | { existing_name: string; project: string | null }
+            | undefined;
           skipped.push({
             name: e.name,
             existingProject: existing?.project ?? null,
+            existingName: existing?.existing_name,
           });
           continue;
         }
 
-        // Get the auto-generated id for inserting observations
-        const row = getEntityId.get(e.name) as { id: number };
+        // Get the auto-generated id for inserting observations. Lookup uses
+        // the normalized form -- the row we just inserted is the active match.
+        const row = getEntityId.get(normalizedName) as { id: number };
         const observations: Observation[] = [];
 
         for (const obs of e.observations) {
           // createObservation() now accepts importance/contextLayer/memoryType params,
-          // but EntityInput observations are plain strings or Observation objects —
+          // but EntityInput observations are plain strings or Observation objects --
           // strings get defaults via createObservation(obs), objects pass through as-is
           const o = typeof obs === 'string' ? createObservation(obs) : obs;
           const obsInfo = insertObs.run(row.id, o.content, o.createdAt, o.importance, o.contextLayer, o.memoryType);
@@ -893,6 +1102,8 @@ export class SqliteStore implements GraphStore {
           }
         }
 
+        // The created Entity reports the DISPLAY name (e.name), not the normalized form.
+        // Display names are what callers see in subsequent reads.
         created.push({ name: e.name, entityType: e.entityType, observations, project: normalizedProject, updatedAt: now, createdAt: now });
       }
     });
@@ -902,9 +1113,11 @@ export class SqliteStore implements GraphStore {
     // Not awaited — the MCP response returns immediately after the sync transaction.
     // If the model isn't ready, syncEmbedding returns instantly and the sweep catches these later.
     for (const entity of created) {
+      // Lookup uses normalized_name (recomputed from the display name) so it
+      // matches the row we just inserted regardless of surface form.
       const entityRow = this.db.prepare(
-        `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
-      ).get(entity.name) as { id: number };
+        `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
+      ).get(normalizeEntityName(entity.name)) as { id: number };
       for (const obs of entity.observations) {
         const obsRow = this.db.prepare(
           `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
@@ -937,9 +1150,16 @@ export class SqliteStore implements GraphStore {
     // doesn't satisfy SQLite's FK target requirement. We now validate at the
     // application layer — only ACTIVE (non-soft-deleted) entities count as valid
     // endpoints, matching the previous semantics.
+    //
+    // Lookup goes through normalized_name (the identity key, post-v8). The query
+    // also returns the canonical display name so the result Relation reflects how
+    // the entity is actually stored, not whichever surface variant the caller
+    // happened to type. Two callers with different casings for the same entity
+    // get the same canonical Relation back.
     const findActive = this.db.prepare(
-      `SELECT 1 FROM entities WHERE name = ? AND superseded_at = ''`
+      `SELECT name FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
+    // INSERT stores the NORMALIZED form for from_entity / to_entity (post-v8).
     const insert = this.db.prepare(
       'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)'
     );
@@ -948,17 +1168,25 @@ export class SqliteStore implements GraphStore {
 
     const txn = this.db.transaction(() => {
       for (const r of relations) {
-        if (!findActive.get(r.from)) {
+        // normalizeEntityName throws on empty/separator-only — surfaces as a clean error.
+        const fromNorm = normalizeEntityName(r.from);
+        const toNorm = normalizeEntityName(r.to);
+        const fromRow = findActive.get(fromNorm) as { name: string } | undefined;
+        if (!fromRow) {
           throw new Error(`Relation references non-existent entity: ${r.from}`);
         }
-        if (!findActive.get(r.to)) {
+        const toRow = findActive.get(toNorm) as { name: string } | undefined;
+        if (!toRow) {
           throw new Error(`Relation references non-existent entity: ${r.to}`);
         }
-        const info = insert.run(r.from, r.to, r.relationType, now);
+        const info = insert.run(fromNorm, toNorm, r.relationType, now);
         if (info.changes > 0) {
+          // Return the CANONICAL display names from the entities table — not the
+          // surface variants the caller typed. This keeps the result consistent
+          // with what subsequent reads will return.
           results.push({
-            from: r.from,
-            to: r.to,
+            from: fromRow.name,
+            to: toRow.name,
             relationType: r.relationType,
             createdAt: now,
             supersededAt: '',
@@ -981,10 +1209,12 @@ export class SqliteStore implements GraphStore {
    * @throws Error if any entityName doesn't match an existing entity
    */
   async addObservations(observations: AddObservationInput[]): Promise<AddObservationResult[]> {
-    // Filter superseded_at = '' so soft-deleted entities are treated as nonexistent —
-    // matching hard-delete semantics: the entity is logically gone for new writes.
+    // Lookup goes through normalized_name (post-v8 identity key) so callers can
+    // pass any surface variant of the name. Filter superseded_at = '' so soft-deleted
+    // entities are treated as nonexistent — matching hard-delete semantics: the entity
+    // is logically gone for new writes.
     const findEntity = this.db.prepare(
-      `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
+      `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
     // INSERT includes all three metadata columns — schema v6 guarantees they exist
     const insertObs = this.db.prepare(
@@ -999,7 +1229,9 @@ export class SqliteStore implements GraphStore {
 
     const txn = this.db.transaction(() => {
       for (const o of observations) {
-        const row = findEntity.get(o.entityName) as { id: number } | undefined;
+        // normalizeEntityName throws on empty/separator-only — bubbles out as a clean error.
+        const normalizedName = normalizeEntityName(o.entityName);
+        const row = findEntity.get(normalizedName) as { id: number } | undefined;
         if (!row) {
           throw new Error(`Entity with name ${o.entityName} not found`);
         }
@@ -1035,9 +1267,10 @@ export class SqliteStore implements GraphStore {
     // Fire-and-forget embedding generation for newly added observations (best-effort).
     // Not awaited — the MCP response returns immediately after the sync transaction.
     for (const result of results) {
+      // Lookup uses normalized_name (recomputed from the entity name the caller passed).
       const entityRow = this.db.prepare(
-        `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
-      ).get(result.entityName) as { id: number } | undefined;
+        `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
+      ).get(normalizeEntityName(result.entityName)) as { id: number } | undefined;
       if (!entityRow) continue;
       for (const obs of result.addedObservations) {
         const obsRow = this.db.prepare(
@@ -1060,8 +1293,9 @@ export class SqliteStore implements GraphStore {
         for (const r of results) {
           if (r.addedObservations.length === 0) continue;
 
-          // Get the entity ID for similarity queries
-          const entityRow = findEntity.get(r.entityName) as { id: number } | undefined;
+          // Get the entity ID for similarity queries — findEntity is the
+          // already-prepared statement that takes normalized_name.
+          const entityRow = findEntity.get(normalizeEntityName(r.entityName)) as { id: number } | undefined;
           if (!entityRow) continue;
 
           const similar: SimilarObservation[] = [];
@@ -1151,8 +1385,9 @@ export class SqliteStore implements GraphStore {
    */
   async deleteEntities(entityNames: string[]): Promise<void> {
     // Look up only active entities — already-superseded ones are silently ignored.
+    // Lookup goes through normalized_name (post-v8 identity key).
     const findActiveEntity = this.db.prepare(
-      `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
+      `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
     // Soft-delete the entity row.
     const supersedeEntity = this.db.prepare(
@@ -1162,11 +1397,12 @@ export class SqliteStore implements GraphStore {
     const supersedeEntityObservations = this.db.prepare(
       `UPDATE observations SET superseded_at = ? WHERE entity_id = ? AND superseded_at = ''`
     );
-    // Soft-delete all active relations originating from this entity.
+    // Soft-delete all active relations originating from this entity. After v8,
+    // relations.from_entity holds the normalized form, so we bind the normalized name.
     const supersedeOutgoingRelations = this.db.prepare(
       `UPDATE relations SET superseded_at = ? WHERE from_entity = ? AND superseded_at = ''`
     );
-    // Soft-delete all active relations terminating at this entity.
+    // Soft-delete all active relations terminating at this entity (same normalization).
     const supersedeIncomingRelations = this.db.prepare(
       `UPDATE relations SET superseded_at = ? WHERE to_entity = ? AND superseded_at = ''`
     );
@@ -1174,12 +1410,21 @@ export class SqliteStore implements GraphStore {
     const txn = this.db.transaction(() => {
       const now = new Date().toISOString();
       for (const name of entityNames) {
-        const row = findActiveEntity.get(name) as { id: number } | undefined;
+        // deleteEntities is documented as idempotent — empty/separator-only names
+        // can't refer to anything that exists, so swallow the normalize error and
+        // treat as a silent miss instead of throwing out of the transaction.
+        let normalizedName: string;
+        try {
+          normalizedName = normalizeEntityName(name);
+        } catch {
+          continue;
+        }
+        const row = findActiveEntity.get(normalizedName) as { id: number } | undefined;
         if (!row) continue; // already soft-deleted or never existed
         supersedeEntity.run(now, row.id);
         supersedeEntityObservations.run(now, row.id);
-        supersedeOutgoingRelations.run(now, name);
-        supersedeIncomingRelations.run(now, name);
+        supersedeOutgoingRelations.run(now, normalizedName);
+        supersedeIncomingRelations.run(now, normalizedName);
       }
     });
     txn();
@@ -1192,11 +1437,12 @@ export class SqliteStore implements GraphStore {
    * @param deletions - Array of { entityName, contents: string[] }
    */
   async deleteObservations(deletions: DeleteObservationInput[]): Promise<void> {
-    // Filter superseded_at = '' so soft-deleted entities are treated as nonexistent —
-    // deleteObservations on a soft-deleted entity is a silent no-op (the observations
-    // are already retired as part of the soft-delete CASCADE).
+    // Lookup uses normalized_name (post-v8 identity key). Filter superseded_at = ''
+    // so soft-deleted entities are treated as nonexistent — deleteObservations on a
+    // soft-deleted entity is a silent no-op (the observations are already retired as
+    // part of the soft-delete CASCADE).
     const findEntity = this.db.prepare(
-      `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
+      `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
     const delObs = this.db.prepare(
       `DELETE FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
@@ -1210,7 +1456,15 @@ export class SqliteStore implements GraphStore {
 
     const txn = this.db.transaction(() => {
       for (const d of deletions) {
-        const row = findEntity.get(d.entityName) as { id: number } | undefined;
+        // deleteObservations is idempotent — empty/separator-only names can't refer
+        // to anything that exists, so swallow the normalize error and skip silently.
+        let normalizedName: string;
+        try {
+          normalizedName = normalizeEntityName(d.entityName);
+        } catch {
+          continue;
+        }
+        const row = findEntity.get(normalizedName) as { id: number } | undefined;
         if (!row) continue;
         let anyDeleted = false;
         for (const content of d.contents) {
@@ -1250,12 +1504,22 @@ export class SqliteStore implements GraphStore {
    * @param relations - Array of { from, to, relationType }
    */
   async deleteRelations(relations: RelationInput[]): Promise<void> {
+    // After v8, relations.from_entity / to_entity hold the NORMALIZED form.
+    // Bind normalized values so the WHERE matches what's actually stored.
     const del = this.db.prepare(
       `DELETE FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ? AND superseded_at = ''`
     );
     const txn = this.db.transaction(() => {
       for (const r of relations) {
-        del.run(r.from, r.to, r.relationType);
+        // deleteRelations is idempotent — bad names just don't match anything.
+        let fromNorm: string, toNorm: string;
+        try {
+          fromNorm = normalizeEntityName(r.from);
+          toNorm = normalizeEntityName(r.to);
+        } catch {
+          continue;
+        }
+        del.run(fromNorm, toNorm, r.relationType);
       }
     });
     txn();
@@ -1271,11 +1535,11 @@ export class SqliteStore implements GraphStore {
    * @throws Error if any entity is not found or oldContent doesn't match an active observation
    */
   async supersedeObservations(supersessions: SupersedeInput[]): Promise<void> {
-    // Prepared statement to find an active entity by name. Soft-deleted entities
-    // are excluded — supersession on a logically-removed entity throws "not found"
-    // (matching pre-soft-delete semantics for missing entities).
+    // Prepared statement to find an active entity by normalized identity key.
+    // Soft-deleted entities are excluded — supersession on a logically-removed
+    // entity throws "not found" (matching pre-soft-delete semantics for missing entities).
     const findEntity = this.db.prepare(
-      `SELECT id FROM entities WHERE name = ? AND superseded_at = ''`
+      `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
     // Find the active observation matching this entity + content.
     // SELECT includes metadata columns so we can carry them forward to the replacement.
@@ -1303,8 +1567,10 @@ export class SqliteStore implements GraphStore {
       const now = new Date().toISOString();
 
       for (const s of supersessions) {
-        // Look up the entity by name
-        const entityRow = findEntity.get(s.entityName) as { id: number } | undefined;
+        // Look up the entity by its normalized identity key.
+        // normalizeEntityName throws on empty/separator-only — bubbles out cleanly.
+        const normalizedName = normalizeEntityName(s.entityName);
+        const entityRow = findEntity.get(normalizedName) as { id: number } | undefined;
         if (!entityRow) {
           throw new Error(`Entity with name ${s.entityName} not found`);
         }
@@ -1342,7 +1608,8 @@ export class SqliteStore implements GraphStore {
     // Fire-and-forget embedding generation for replacement observations (best-effort).
     // Not awaited — the MCP response returns immediately after the sync transaction.
     for (const s of supersessions) {
-      const entityRow = findEntity.get(s.entityName) as { id: number } | undefined;
+      // findEntity is the prepared statement that takes normalized_name.
+      const entityRow = findEntity.get(normalizeEntityName(s.entityName)) as { id: number } | undefined;
       if (!entityRow) continue;
       const newObsRow = this.db.prepare(
         `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
@@ -1382,19 +1649,27 @@ export class SqliteStore implements GraphStore {
 
   /**
    * Same as temporalObsFilter but for the relations table.
-   * Uses 'r' alias prefix to avoid ambiguity in joined queries.
+   * Accepts an optional alias prefix so the helper can serve both joined queries
+   * (e.g., `relations r` -> pass alias `'r'`) and unaliased queries on the bare
+   * relations table (pass alias `''` or omit). Defaults to `''` (unaliased) to
+   * preserve the previous call signature.
    *
    * @param asOf - ISO 8601 UTC timestamp for point-in-time queries, or undefined for current
+   * @param alias - SQL alias for the relations table; pass `''` for unaliased queries
    * @returns Object with { clause: SQL string, params: bind values to append }
    * @throws Error if asOf is the empty string
    */
-  private temporalRelFilter(asOf?: string): { clause: string; params: string[] } {
+  private temporalRelFilter(
+    asOf?: string,
+    alias: string = '',
+  ): { clause: string; params: string[] } {
     if (asOf === '') {
       throw new Error('temporalRelFilter: asOf must be undefined or a valid ISO 8601 timestamp, not empty string');
     }
-    if (asOf === undefined) return { clause: `superseded_at = ''`, params: [] };
+    const prefix = alias ? `${alias}.` : '';
+    if (asOf === undefined) return { clause: `${prefix}superseded_at = ''`, params: [] };
     return {
-      clause: `created_at <= ? AND (superseded_at = '' OR superseded_at > ?)`,
+      clause: `${prefix}created_at <= ? AND (${prefix}superseded_at = '' OR ${prefix}superseded_at > ?)`,
       params: [asOf, asOf],
     };
   }
@@ -1428,40 +1703,46 @@ export class SqliteStore implements GraphStore {
 
   /**
    * Fetches full Entity objects for a set of entity rows, including their observations.
-   * Groups observation rows by entity name and assembles complete Entity objects.
+   * Groups observation rows by entity ID (not name) and assembles complete Entity objects.
+   *
+   * Why id-based grouping: post-v8 the same display `name` can appear on multiple
+   * entity rows (one active + soft-deleted historical rows under the same display
+   * form). Joining by name would over-fetch observations from soft-deleted rows.
+   * Joining by id is unambiguous regardless of display-name reuse.
+   *
    * Uses a single query per chunk to fetch all observations (avoids N+1 queries).
    * Chunks the IN clause to stay within SQLite's SQLITE_MAX_VARIABLE_NUMBER limit (default 999).
    *
-   * @param entityRows - Array of { name, entityType, project } from an entities query
+   * @param entityRows - Array of { id, name, entityType, project, updated_at, created_at } —
+   *                     id is REQUIRED so we can group observations unambiguously
    * @param asOf - Optional ISO 8601 UTC timestamp for point-in-time observation filtering
-   * @returns Entity array with observations attached
+   * @returns Entity array with observations attached, in the same order as the input rows
    */
-  private buildEntities(entityRows: { name: string; entityType: string; project: string | null; updated_at: string; created_at: string; id?: number }[], asOf?: string): Entity[] {
+  private buildEntities(entityRows: { id: number; name: string; entityType: string; project: string | null; updated_at: string; created_at: string }[], asOf?: string): Entity[] {
     if (entityRows.length === 0) return [];
 
-    const names = entityRows.map(e => e.name);
+    const ids = entityRows.map(e => e.id);
     // Build temporal filter for observations — controls which observations are included
     const obsFilter = this.temporalObsFilter(asOf);
 
-    // Group observations by entity name using a Map, fetching in chunks
+    // Group observations by entity_id using a Map, fetching in chunks
     // to avoid exceeding SQLite's parameter limit (default 999)
-    const obsMap = new Map<string, Observation[]>();
-    for (let i = 0; i < names.length; i += CHUNK_SIZE) {
-      const chunk = names.slice(i, i + CHUNK_SIZE);
+    const obsMap = new Map<number, Observation[]>();
+    for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+      const chunk = ids.slice(i, i + CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
 
       const obsRows = this.db.prepare(`
-        SELECT e.name AS entityName, o.content, o.created_at AS createdAt,
+        SELECT o.entity_id AS entityId, o.content, o.created_at AS createdAt,
                o.importance, o.context_layer, o.memory_type
         FROM observations o
-        JOIN entities e ON o.entity_id = e.id
-        WHERE e.name IN (${placeholders}) AND ${obsFilter.clause}
-      `).all(...chunk, ...obsFilter.params) as { entityName: string; content: string; createdAt: string;
+        WHERE o.entity_id IN (${placeholders}) AND ${obsFilter.clause}
+      `).all(...chunk, ...obsFilter.params) as { entityId: number; content: string; createdAt: string;
         importance: number; context_layer: string | null; memory_type: string | null }[];
 
       for (const o of obsRows) {
-        if (!obsMap.has(o.entityName)) obsMap.set(o.entityName, []);
-        obsMap.get(o.entityName)!.push({
+        if (!obsMap.has(o.entityId)) obsMap.set(o.entityId, []);
+        obsMap.get(o.entityId)!.push({
           content: o.content,
           createdAt: o.createdAt,
           importance: o.importance ?? 3.0,
@@ -1474,7 +1755,7 @@ export class SqliteStore implements GraphStore {
     return entityRows.map(e => ({
       name: e.name,
       entityType: e.entityType,
-      observations: obsMap.get(e.name) || [],
+      observations: obsMap.get(e.id) || [],
       project: e.project,
       updatedAt: e.updated_at,
       createdAt: e.created_at,
@@ -1482,35 +1763,75 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
-   * Fetches all active relations where at least one endpoint is in the given name set.
-   * Filters out invalidated relations (superseded_at != '').
+   * Fetches all relations where at least one endpoint is in the given name set.
+   * Filters out invalidated relations (superseded_at != '') unless asOf is set.
    * Chunks the IN clause to stay within SQLite's parameter limit.
    * Uses CHUNK_SIZE / 2 per chunk because each name appears twice (from OR to).
    *
-   * @param entityNames - Array of entity name strings
-   * @returns Active Relation array with from/to/relationType and temporal fields
+   * Post-v8 storage shape: relations.from_entity / to_entity store the NORMALIZED
+   * form, not the display form. This function:
+   *   1. Normalizes the input names so the IN-clause matches what's actually stored.
+   *   2. LEFT-JOINs entities (twice — once for each endpoint) to translate the
+   *      stored normalized form back into the canonical display name for the
+   *      Relation result. The JOIN filter `superseded_at = ''` picks the active
+   *      display variant when one exists.
+   *   3. Uses COALESCE to fall back to the normalized form if no active entity
+   *      row matches — defensive for historical / asOf reads where the cascading
+   *      soft-delete may leave a relation pointing at a normalized identity that
+   *      no longer has an active display form.
+   *
+   * Note on asOf: the JOIN currently always picks the *currently-active* display
+   * variant. For point-in-time recall, this means the displayed surface form may
+   * be the one in use today, even if a different surface form was canonical at
+   * asOf. The IDENTITY (normalized_name) is preserved either way — only the
+   * display form may lag. Acceptable trade-off; revisit if it becomes a bug.
+   *
+   * @param entityNames - Array of entity name strings (any surface form)
+   * @returns Relation array with from/to translated to canonical display names
    */
   private getConnectedRelations(entityNames: string[], asOf?: string): Relation[] {
     if (entityNames.length === 0) return [];
 
-    // Build temporal filter for relations — controls which relations are included
-    const relFilter = this.temporalRelFilter(asOf);
+    // Normalize input names so the IN-clause matches the stored identity form.
+    // Skip names that fail normalization — they can't refer to anything stored.
+    const normalizedNames: string[] = [];
+    for (const n of entityNames) {
+      try {
+        normalizedNames.push(normalizeEntityName(n));
+      } catch {
+        // Skip names that can't be normalized — they won't match anything anyway.
+      }
+    }
+    if (normalizedNames.length === 0) return [];
+
+    // Build temporal filter for relations — controls which relations are included.
+    // Pass alias 'r' so the emitted clause qualifies its column references; the
+    // query below LEFT JOINs `entities` twice (ef, et), and an unqualified
+    // `superseded_at` would be ambiguous between relations and entities columns.
+    const relFilter = this.temporalRelFilter(asOf, 'r');
 
     // Each name is bound twice (from_entity IN (...) OR to_entity IN (...)),
     // so use half the chunk size to stay within the parameter limit
     const halfChunk = Math.floor(CHUNK_SIZE / 2);
     const results: Relation[] = [];
 
-    for (let i = 0; i < entityNames.length; i += halfChunk) {
-      const chunk = entityNames.slice(i, i + halfChunk);
+    for (let i = 0; i < normalizedNames.length; i += halfChunk) {
+      const chunk = normalizedNames.slice(i, i + halfChunk);
       const placeholders = chunk.map(() => '?').join(',');
-      // Select temporal columns directly — schema v5 guarantees they exist.
-      // Temporal filter controls whether we see active-only or point-in-time.
+      // LEFT JOIN entities twice (once per endpoint) to translate normalized form
+      // back to display name. COALESCE returns the normalized form if the JOIN
+      // misses (defensive against orphan relations or historical reads).
       const rows = this.db.prepare(`
-        SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType,
-               created_at AS createdAt, superseded_at AS supersededAt
-        FROM relations
-        WHERE (from_entity IN (${placeholders}) OR to_entity IN (${placeholders}))
+        SELECT
+          COALESCE(ef.name, r.from_entity) AS "from",
+          COALESCE(et.name, r.to_entity)   AS "to",
+          r.relation_type AS relationType,
+          r.created_at    AS createdAt,
+          r.superseded_at AS supersededAt
+        FROM relations r
+        LEFT JOIN entities ef ON ef.normalized_name = r.from_entity AND ef.superseded_at = ''
+        LEFT JOIN entities et ON et.normalized_name = r.to_entity   AND et.superseded_at = ''
+        WHERE (r.from_entity IN (${placeholders}) OR r.to_entity IN (${placeholders}))
           AND ${relFilter.clause}
       `).all(...chunk, ...chunk, ...relFilter.params) as Relation[];
       results.push(...rows);
@@ -1660,11 +1981,22 @@ export class SqliteStore implements GraphStore {
 
     // Unscoped + unpaginated: return all active relations (backward compatible with original behavior).
     // When asOf is set, apply temporal filter; otherwise filter by superseded_at = ''.
-    const relFilter = this.temporalRelFilter(asOf);
+    // LEFT JOIN entities twice to translate stored normalized form back to display
+    // names (post-v8 storage shape). COALESCE falls back to the normalized form if
+    // no active entity row matches. Pass alias 'r' so the temporal filter qualifies
+    // its column references and doesn't collide with the JOINed entities.superseded_at.
+    const relFilter = this.temporalRelFilter(asOf, 'r');
     const relations = this.db.prepare(
-      `SELECT from_entity AS "from", to_entity AS "to", relation_type AS relationType,
-              created_at AS createdAt, superseded_at AS supersededAt
-       FROM relations WHERE ${relFilter.clause}`
+      `SELECT
+          COALESCE(ef.name, r.from_entity) AS "from",
+          COALESCE(et.name, r.to_entity)   AS "to",
+          r.relation_type AS relationType,
+          r.created_at    AS createdAt,
+          r.superseded_at AS supersededAt
+       FROM relations r
+       LEFT JOIN entities ef ON ef.normalized_name = r.from_entity AND ef.superseded_at = ''
+       LEFT JOIN entities et ON et.normalized_name = r.to_entity   AND et.superseded_at = ''
+       WHERE ${relFilter.clause}`
     ).all(...relFilter.params) as Relation[];
 
     return { entities, relations, nextCursor, totalCount };
@@ -1929,9 +2261,26 @@ export class SqliteStore implements GraphStore {
   async openNodes(names: string[], projectId?: string, asOf?: string): Promise<KnowledgeGraph> {
     if (names.length === 0) return { entities: [], relations: [] };
 
+    // Step 1: normalize the input names so we can look them up against the
+    // partial unique index on `normalized_name`. Surface variants supplied by
+    // the caller (case differences, hyphens, etc.) all collapse to the same
+    // identity key. We swallow normalize errors here because openNodes is
+    // a read operation — bad input names just match nothing, they don't throw.
+    const normalizedNames: string[] = [];
+    for (const n of names) {
+      try {
+        normalizedNames.push(normalizeEntityName(n));
+      } catch {
+        // skip — malformed name can't refer to anything stored
+      }
+    }
+    if (normalizedNames.length === 0) return { entities: [], relations: [] };
+
     // Chunk the IN clause to stay under SQLite's SQLITE_MAX_VARIABLE_NUMBER limit (999).
     // Safe via MCP (Zod .max(100) on names array) but needed for direct callers with 900+ names.
-    type EntityRow = { name: string; entityType: string; project: string | null; updated_at: string; created_at: string };
+    // We SELECT id so buildEntities can use id-based JOINs (display names can be
+    // ambiguous after soft-delete: an active row may share `name` with historical rows).
+    type EntityRow = { id: number; name: string; entityType: string; project: string | null; updated_at: string; created_at: string };
     let entityRows: EntityRow[] = [];
     // projectId arrives pre-normalized from normalizeProjectId() in index.ts
     const normalizedProject = projectId;
@@ -1940,20 +2289,20 @@ export class SqliteStore implements GraphStore {
     // active filter. When asOf is set, the entity must have existed at that time.
     const entFilter = this.temporalEntFilter(asOf, '');
 
-    for (let i = 0; i < names.length; i += CHUNK_SIZE) {
-      const chunk = names.slice(i, i + CHUNK_SIZE);
+    for (let i = 0; i < normalizedNames.length; i += CHUNK_SIZE) {
+      const chunk = normalizedNames.slice(i, i + CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
 
       if (normalizedProject) {
         const rows = this.db.prepare(
-          `SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities
-           WHERE name IN (${placeholders}) AND ${entFilter.clause} AND (project = ? OR project IS NULL)`
+          `SELECT id, name, entity_type AS entityType, project, updated_at, created_at FROM entities
+           WHERE normalized_name IN (${placeholders}) AND ${entFilter.clause} AND (project = ? OR project IS NULL)`
         ).all(...chunk, ...entFilter.params, normalizedProject) as EntityRow[];
         entityRows.push(...rows);
       } else {
         const rows = this.db.prepare(
-          `SELECT name, entity_type AS entityType, project, updated_at, created_at FROM entities
-           WHERE name IN (${placeholders}) AND ${entFilter.clause}`
+          `SELECT id, name, entity_type AS entityType, project, updated_at, created_at FROM entities
+           WHERE normalized_name IN (${placeholders}) AND ${entFilter.clause}`
         ).all(...chunk, ...entFilter.params) as EntityRow[];
         entityRows.push(...rows);
       }
@@ -1962,17 +2311,22 @@ export class SqliteStore implements GraphStore {
     const entities = this.buildEntities(entityRows, asOf);
 
     // When project-filtered, use AND logic for relations (both endpoints in result set);
-    // when unfiltered, use OR logic (at least one endpoint matches) for backward compat
+    // when unfiltered, use OR logic (at least one endpoint matches) for backward compat.
+    // We pass the canonical display names returned by the entity rows; getConnectedRelations
+    // will re-normalize them for the actual lookup against relations.from_entity/to_entity.
+    const displayNames = entityRows.map(e => e.name);
     if (projectId) {
-      const entityNames = new Set(entityRows.map(e => e.name));
-      const allRelations = this.getConnectedRelations(entityRows.map(e => e.name), asOf);
+      const entityNameSet = new Set(displayNames);
+      const allRelations = this.getConnectedRelations(displayNames, asOf);
+      // r.from / r.to are already display-form (COALESCE'd from the LEFT JOIN inside
+      // getConnectedRelations) so set membership against displayNames is correct.
       const filteredRelations = allRelations.filter(r =>
-        entityNames.has(r.from) && entityNames.has(r.to)
+        entityNameSet.has(r.from) && entityNameSet.has(r.to)
       );
       return { entities, relations: filteredRelations };
     }
 
-    const relations = this.getConnectedRelations(entityRows.map(e => e.name), asOf);
+    const relations = this.getConnectedRelations(displayNames, asOf);
     return { entities, relations };
   }
 
@@ -2003,7 +2357,9 @@ export class SqliteStore implements GraphStore {
    */
   async invalidateRelations(relations: InvalidateRelationInput[]): Promise<number> {
     const now = new Date().toISOString();
-    // Only update active relations (superseded_at = '') — already-invalidated are skipped
+    // After v8, relations.from_entity / to_entity hold the NORMALIZED form, so
+    // bind normalized values to match what's actually stored.
+    // Only update active relations (superseded_at = '') — already-invalidated are skipped.
     const invalidate = this.db.prepare(
       `UPDATE relations SET superseded_at = ?
        WHERE from_entity = ? AND to_entity = ? AND relation_type = ? AND superseded_at = ''`
@@ -2011,7 +2367,15 @@ export class SqliteStore implements GraphStore {
     let totalChanged = 0;
     const txn = this.db.transaction(() => {
       for (const r of relations) {
-        const result = invalidate.run(now, r.from, r.to, r.relationType);
+        // Idempotent — bad names just match nothing.
+        let fromNorm: string, toNorm: string;
+        try {
+          fromNorm = normalizeEntityName(r.from);
+          toNorm = normalizeEntityName(r.to);
+        } catch {
+          continue;
+        }
+        const result = invalidate.run(now, fromNorm, toNorm, r.relationType);
         totalChanged += result.changes;
       }
     });
@@ -2031,15 +2395,27 @@ export class SqliteStore implements GraphStore {
   async entityTimeline(entityName: string, projectId?: string): Promise<EntityTimelineResult | null> {
     const normalizedProject = projectId ?? null;
 
-    // Find ALL entity rows with this name. After v7 (soft-delete), a name can
-    // legitimately have multiple rows: at most one active row plus any number of
-    // historical soft-deleted rows. Order them so the active row (if any) comes
-    // first; otherwise the most recently soft-deleted row. This is what we use
-    // for entity-level metadata. The timeline aggregates observations across
-    // ALL incarnations of the name.
+    // Normalize the input entity name into its canonical identity key. The timeline
+    // aggregates across all surface variants of the same name (e.g. 'Dustin Space',
+    // 'dustin-space', 'DustinSpace' all collapse to 'dustinspace'). If the caller
+    // supplies an unparseable name, treat it as "no such entity" — read operations
+    // are idempotent.
+    let normalizedName: string;
+    try {
+      normalizedName = normalizeEntityName(entityName);
+    } catch {
+      return null;
+    }
+
+    // Find ALL entity rows with this normalized name. After v7 (soft-delete), the
+    // same identity key can legitimately have multiple rows: at most one active row
+    // plus any number of historical soft-deleted rows. Order them so the active row
+    // (if any) comes first; otherwise the most recently soft-deleted row. This is
+    // what we use for entity-level metadata. The timeline aggregates observations
+    // across ALL incarnations of the identity key.
     let entitySql = `SELECT id, name, entity_type, project, updated_at, created_at, superseded_at
-                     FROM entities WHERE name = ?`;
-    const params: (string | null)[] = [entityName];
+                     FROM entities WHERE normalized_name = ?`;
+    const params: (string | null)[] = [normalizedName];
     if (normalizedProject) {
       // Include entities belonging to this project OR global entities (project IS NULL)
       entitySql += ' AND (project = ? OR project IS NULL)';
@@ -2082,12 +2458,24 @@ export class SqliteStore implements GraphStore {
 
     // Fetch ALL relations (active AND superseded) involving this entity.
     // Unlike getConnectedRelations() which filters active only, this returns everything.
+    // After v8, relations.from_entity / to_entity store the NORMALIZED form, so
+    // bind the normalized name. LEFT JOIN entities twice (once per endpoint) to
+    // translate the stored normalized form back to the canonical display name.
+    // COALESCE falls back to the normalized form if no active entity row matches
+    // (e.g. the related entity has been soft-deleted with no active replacement).
     const relRows = this.db.prepare(`
-      SELECT from_entity, to_entity, relation_type, created_at, superseded_at
-      FROM relations
-      WHERE from_entity = ? OR to_entity = ?
-      ORDER BY created_at ASC
-    `).all(entityName, entityName) as {
+      SELECT
+        COALESCE(ef.name, r.from_entity) AS from_entity,
+        COALESCE(et.name, r.to_entity)   AS to_entity,
+        r.relation_type,
+        r.created_at,
+        r.superseded_at
+      FROM relations r
+      LEFT JOIN entities ef ON ef.normalized_name = r.from_entity AND ef.superseded_at = ''
+      LEFT JOIN entities et ON et.normalized_name = r.to_entity   AND et.superseded_at = ''
+      WHERE r.from_entity = ? OR r.to_entity = ?
+      ORDER BY r.created_at ASC
+    `).all(normalizedName, normalizedName) as {
       from_entity: string; to_entity: string; relation_type: string;
       created_at: string; superseded_at: string;
     }[];

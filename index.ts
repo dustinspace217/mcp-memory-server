@@ -13,6 +13,7 @@ import { fileURLToPath } from 'url';
 import type { GraphStore } from './types.js';
 import { JsonlStore, migrateJsonToJsonl } from './jsonl-store.js';
 import { SqliteStore } from './sqlite-store.js';
+import { normalizeEntityName } from './normalize-name.js';
 
 // --- Store configuration ---
 // Determines which backend to use and where to store data.
@@ -87,8 +88,39 @@ const ObservationSchema = z.object({
   memoryType: z.string().nullable().describe("Memory type tag (e.g., 'decision', 'preference', 'fact'). null = unclassified"),
 });
 
+/**
+ * Reusable Zod schema for entity name fields supplied to MUTATION tools
+ * (create_entities, create_relations, add_observations, supersede_observations).
+ *
+ * Beyond the basic .min(1)/.max(500) length check, this enforces that the name
+ * normalizes to a non-empty identity key. Without this refinement, names like
+ * '---' or '. . .' would pass Zod validation but throw inside the store layer
+ * when it computes `normalized_name` — producing an opaque
+ * "Entity name has no content after normalization" error from the bottom of
+ * the call stack instead of a clean validation error at the tool boundary.
+ *
+ * Idempotent delete tools and read tools deliberately do NOT use this schema —
+ * the store layer treats unnormalizable names as "no such entity" and silently
+ * skips them, preserving the idempotent delete contract.
+ */
+const EntityNameInputSchema = z.string().min(1).max(500).refine(
+  // refine() runs the predicate after .min/.max pass; returning false makes
+  // the field fail validation with the message below.
+  (name) => {
+    try {
+      normalizeEntityName(name);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  {
+    message: "Entity name must contain at least one non-separator character. Names that consist only of whitespace, hyphens, underscores, dots, slashes, backslashes, or colons (e.g. '---', '. . .') are rejected because they collapse to an empty identity key.",
+  }
+);
+
 const EntityInputSchema = z.object({
-  name: z.string().min(1).max(500).describe("The name of the entity"),
+  name: EntityNameInputSchema.describe("The name of the entity"),
   entityType: z.string().min(1).max(500).describe("The type of the entity"),
   observations: z.array(z.string().min(1).max(5000)).max(100).describe("An array of observation contents associated with the entity"),
 });
@@ -104,9 +136,11 @@ const EntityOutputSchema = z.object({
 
 // Input schema for creating/deleting relations — just the 3 identifying fields.
 // Callers don't provide temporal fields (those are system-managed).
+// from / to use EntityNameInputSchema so the boundary rejects names that would
+// collapse to an empty identity key inside the store.
 const RelationInputSchema = z.object({
-  from: z.string().min(1).max(500).describe("The name of the entity where the relation starts"),
-  to: z.string().min(1).max(500).describe("The name of the entity where the relation ends"),
+  from: EntityNameInputSchema.describe("The name of the entity where the relation starts"),
+  to: EntityNameInputSchema.describe("The name of the entity where the relation ends"),
   relationType: z.string().min(1).max(500).describe("The type of the relation")
 });
 
@@ -225,7 +259,9 @@ server.registerTool(
     description: "Add new observations to existing entities in the knowledge graph",
     inputSchema: {
       observations: z.array(z.object({
-        entityName: z.string().min(1).max(500).describe("The name of the entity to add the observations to"),
+        // EntityNameInputSchema rejects names that would collapse to empty (e.g. '---')
+        // at the boundary, so the store layer never sees them.
+        entityName: EntityNameInputSchema.describe("The name of the entity to add the observations to"),
         contents: z.array(z.string().min(1).max(5000)).max(100).describe("An array of observation contents to add"),
         importances: z.array(z.number().min(1).max(5)).max(100).optional()
           .describe("Parallel array of importance scores (1.0-5.0) matching contents. Omit for default 3.0."),
@@ -324,7 +360,9 @@ server.registerTool(
     description: "Atomically replace observations on entities. Retires the old observation and inserts the new one in a single transaction. Use this instead of delete+add when an observation's content has changed (e.g., updated status, count, or signature).",
     inputSchema: {
       supersessions: z.array(z.object({
-        entityName: z.string().min(1).max(500).describe("The entity whose observation to supersede"),
+        // EntityNameInputSchema rejects names that would collapse to empty (e.g. '---')
+        // at the boundary, so the store layer never sees them.
+        entityName: EntityNameInputSchema.describe("The entity whose observation to supersede"),
         oldContent: z.string().min(1).max(5000).describe("The exact text of the active observation to retire"),
         newContent: z.string().min(1).max(5000).describe("The replacement observation text"),
       })).max(100),

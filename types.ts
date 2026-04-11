@@ -184,10 +184,21 @@ export type AddObservationResult = {
 };
 
 /** An entity that was skipped during createEntities because its name
- *  already exists (possibly in a different project). */
+ *  already exists (possibly in a different project, or under a different
+ *  surface form that normalizes to the same identity key). */
 export type SkippedEntity = {
+  /** The display name as supplied by the caller. */
   name: string;
+  /** The owning project of the existing entity (null = global). */
   existingProject: string | null;
+  /**
+   * The display name of the existing entity that the input collided with.
+   * Will equal `name` for exact-match collisions. Differs when the input
+   * was a surface variant (e.g. 'Dustin-Space') and the existing entity
+   * is stored under a different display form (e.g. 'dustin-space').
+   * Optional so callers built against older versions still work.
+   */
+  existingName?: string;
 };
 
 /** Return type for createEntities. Reports both created entities and

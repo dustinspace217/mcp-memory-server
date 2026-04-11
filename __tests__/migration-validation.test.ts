@@ -625,12 +625,16 @@ describe('Migration safety validation', () => {
     const sqliteStore = new SqliteStore(dbPath);
     await sqliteStore.init();
 
-    // Verify schema_version is now 7
+    // Verify schema_version is at least 7 — init() runs every pending migration
+    // in sequence, so a v6 DB ends up at whatever the current schema version is
+    // (which may be > 7). This test only validates the v6→v7 step; additional
+    // migrations (e.g. v7→v8) are covered by their own dedicated tests below.
     const db2 = new Database(dbPath);
     const version = (db2.prepare(`SELECT version FROM schema_version`).get() as { version: number }).version;
-    expect(version).toBe(7);
+    expect(version).toBeGreaterThanOrEqual(7);
 
-    // Verify new column exists with correct default
+    // Verify v6→v7 added the superseded_at column with the correct default.
+    // This column survives all later migrations intact.
     const v7Cols = db2.prepare(`PRAGMA table_info(entities)`).all() as { name: string; dflt_value: string | null; notnull: number }[];
     const supersededCol = v7Cols.find(c => c.name === 'superseded_at');
     expect(supersededCol).toBeDefined();
@@ -638,16 +642,19 @@ describe('Migration safety validation', () => {
     expect(supersededCol!.dflt_value).toBe(`''`);
     expect(supersededCol!.notnull).toBe(1); // NOT NULL
 
-    // Verify the partial unique index exists
+    // Verify a partial unique index is enforcing active-row identity.
+    // In v7 that index is idx_entities_name_active (on `name`); in v8+ it's
+    // idx_entities_normalized_active (on `normalized_name`). Both implement
+    // the same semantics — only one should exist at any version. Accept
+    // whichever is currently present so this test stays forward-compatible.
     const indexes = db2.prepare(`PRAGMA index_list(entities)`).all() as { name: string; unique: number; partial: number }[];
-    const partialIdx = indexes.find(i => i.name === 'idx_entities_name_active');
-    expect(partialIdx).toBeDefined();
-    expect(partialIdx!.unique).toBe(1);
-    expect(partialIdx!.partial).toBe(1);
+    const activeIdentityIdx = indexes.find(
+      i => (i.name === 'idx_entities_name_active' || i.name === 'idx_entities_normalized_active') && i.unique === 1 && i.partial === 1
+    );
+    expect(activeIdentityIdx, 'A partial unique index on the active-row identity column should exist').toBeDefined();
 
-    // Verify the original UNIQUE(name) constraint was dropped (table rebuild).
-    // After the rebuild, only the new partial index should enforce active-name uniqueness.
-    // Confirm by checking that all entity rows survived and have superseded_at = ''.
+    // Verify the entities table rebuild preserved all rows with the display
+    // name intact. Display names are never rewritten by any migration.
     const rows = db2.prepare(`SELECT name, superseded_at FROM entities ORDER BY name`).all() as { name: string; superseded_at: string }[];
     expect(rows).toHaveLength(2);
     expect(rows[0].name).toBe('Alpha');
@@ -655,22 +662,297 @@ describe('Migration safety validation', () => {
     expect(rows[1].name).toBe('Beta');
     expect(rows[1].superseded_at).toBe('');
 
-    // FK integrity: relations row still references existing entity names after the rebuild
-    const rel = db2.prepare(`SELECT from_entity, to_entity FROM relations`).get() as { from_entity: string; to_entity: string };
-    expect(rel.from_entity).toBe('Alpha');
-    expect(rel.to_entity).toBe('Beta');
-
-    // Observations also still attached
+    // Observations attached to Alpha survived the entity table rebuild.
     const obsCount = (db2.prepare(`SELECT COUNT(*) as c FROM observations`).get() as { c: number }).c;
     expect(obsCount).toBe(1);
 
     db2.close();
 
-    // Verify data round-trips through SqliteStore.readGraph()
+    // Verify data round-trips through SqliteStore.readGraph(). This is the
+    // end-to-end check — regardless of how relations are stored internally
+    // (display form in v7, normalized form in v8+), readGraph() must return
+    // the display names. Relation 'Alpha' → 'Beta' must survive intact.
     const graph = await sqliteStore.readGraph();
     expect(graph.entities).toHaveLength(2);
+    expect(graph.entities.map(e => e.name).sort()).toEqual(['Alpha', 'Beta']);
     expect(graph.relations).toHaveLength(1);
+    expect(graph.relations[0].from).toBe('Alpha');
+    expect(graph.relations[0].to).toBe('Beta');
+    expect(graph.relations[0].relationType).toBe('links');
 
     await sqliteStore.close();
+  });
+
+  it('should migrate v7 → v8: add normalized_name + rewrite relations to normalized form', async () => {
+    // Create a v7 database directly using better-sqlite3, then verify that
+    // SqliteStore auto-migrates it to v8 (entity name normalization Layer 1):
+    //   - adds normalized_name column, backfilled via normalizeEntityName()
+    //   - rewrites relations.from_entity / to_entity from display to normalized form
+    //   - drops idx_entities_name_active (partial unique on display name)
+    //   - creates idx_entities_normalized_active (partial unique on normalized_name)
+    //   - bumps schema_version to 8
+    const id = Date.now();
+    dbPath = path.join(testDir, `test-v7-to-v8-${id}.db`);
+    jsonlPath = path.join(testDir, `nonexistent-${id}.jsonl`); // not used, just for cleanup
+
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
+
+    // Build v7 schema using individual prepare/run statements (security hook
+    // false-positive workaround — see comment at line 451 above).
+    db.prepare(`CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL)`).run();
+    db.prepare(`INSERT INTO schema_version (id, version) VALUES (1, 7)`).run();
+
+    // entities table (v7 schema — has superseded_at, NO normalized_name).
+    // Note: no inline UNIQUE(name) constraint — v7 uses the partial index below
+    // (idx_entities_name_active) to enforce active-name uniqueness, which
+    // allows multiple soft-deleted rows with the same name.
+    db.prepare(`CREATE TABLE entities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      project TEXT,
+      updated_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+      created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+      superseded_at TEXT NOT NULL DEFAULT ''
+    )`).run();
+
+    // v7 partial unique index on display name (active rows only) — this
+    // is the index the migration is expected to drop.
+    db.prepare(`CREATE UNIQUE INDEX idx_entities_name_active ON entities(name) WHERE superseded_at = ''`).run();
+
+    // observations table (v6+ schema — has importance/context_layer/memory_type)
+    db.prepare(`CREATE TABLE observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      superseded_at TEXT NOT NULL DEFAULT '',
+      importance REAL NOT NULL DEFAULT 3.0,
+      context_layer TEXT,
+      memory_type TEXT,
+      UNIQUE(entity_id, content, superseded_at)
+    )`).run();
+
+    // relations table (v7 schema — FK references to entities(name) were DROPPED
+    // in v6→v7 because entities.name no longer has a full UNIQUE constraint
+    // after the partial-index swap. See sqlite-store.ts v6→v7 block for the
+    // full rationale; the practical upshot is that v7 relations.from_entity /
+    // to_entity are plain TEXT with no FK clause.)
+    db.prepare(`CREATE TABLE relations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_entity TEXT NOT NULL,
+      to_entity TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      UNIQUE(from_entity, to_entity, relation_type, superseded_at)
+    )`).run();
+
+    // Seed test data with surface-variant-style names (mixed case + separators).
+    // These should collapse to normalized forms:
+    //   'Dustin Space'   → 'dustinspace'
+    //   'voice-assistant' → 'voiceassistant'
+    //   'phase_b_task_3' → 'phasebtask3'
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, NULL, ?, ?)`).run('Dustin Space', 'project', now, now);
+    db.prepare(`INSERT INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, NULL, ?, ?)`).run('voice-assistant', 'project', now, now);
+    db.prepare(`INSERT INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, NULL, ?, ?)`).run('phase_b_task_3', 'task', now, now);
+
+    // Seed a soft-deleted historical row with the same display name as an
+    // active one — the backfill must populate normalized_name for it too,
+    // but it must NOT be considered by the collision check (which filters
+    // superseded_at = '').
+    const oldTs = '2026-01-01T00:00:00.000Z';
+    db.prepare(`INSERT INTO entities (name, entity_type, project, updated_at, created_at, superseded_at) VALUES (?, ?, NULL, ?, ?, ?)`).run('Dustin Space', 'project', oldTs, oldTs, oldTs);
+
+    // Add an observation so we can verify it round-trips via readGraph().
+    const dustinId = (db.prepare(`SELECT id FROM entities WHERE name = ? AND superseded_at = ''`).get('Dustin Space') as { id: number }).id;
+    db.prepare(`INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)`).run(dustinId, 'a dustin-space observation', now);
+
+    // Seed relations using DISPLAY form (this is what v7 stored). The
+    // migration must rewrite these to normalized form.
+    db.prepare(`INSERT INTO relations (from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)`).run('Dustin Space', 'voice-assistant', 'references', now);
+    db.prepare(`INSERT INTO relations (from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)`).run('voice-assistant', 'phase_b_task_3', 'blocks', now);
+
+    // Verify v7 has NO normalized_name column before migration.
+    const v7Cols = db.prepare(`PRAGMA table_info(entities)`).all() as { name: string }[];
+    expect(v7Cols.map(c => c.name)).not.toContain('normalized_name');
+
+    // Verify v7 relations still hold the display form.
+    const v7Rels = db.prepare(`SELECT from_entity, to_entity FROM relations ORDER BY id`).all() as { from_entity: string; to_entity: string }[];
+    expect(v7Rels[0]).toEqual({ from_entity: 'Dustin Space', to_entity: 'voice-assistant' });
+    expect(v7Rels[1]).toEqual({ from_entity: 'voice-assistant', to_entity: 'phase_b_task_3' });
+
+    db.close();
+
+    // Open with SqliteStore — should auto-migrate v7 → v8.
+    const sqliteStore = new SqliteStore(dbPath);
+    await sqliteStore.init();
+
+    // Verify schema_version is now 8.
+    const db2 = new Database(dbPath);
+    const version = (db2.prepare(`SELECT version FROM schema_version`).get() as { version: number }).version;
+    expect(version).toBe(8);
+
+    // Verify normalized_name column was added with NOT NULL constraint.
+    const v8Cols = db2.prepare(`PRAGMA table_info(entities)`).all() as { name: string; dflt_value: string | null; notnull: number }[];
+    const normalizedCol = v8Cols.find(c => c.name === 'normalized_name');
+    expect(normalizedCol).toBeDefined();
+    expect(normalizedCol!.notnull).toBe(1);
+
+    // Verify normalized_name was backfilled for every row (active + soft-deleted).
+    const backfilled = db2.prepare(`SELECT name, normalized_name, superseded_at FROM entities ORDER BY id`).all() as { name: string; normalized_name: string; superseded_at: string }[];
+    expect(backfilled).toHaveLength(4); // 3 active + 1 soft-deleted
+    expect(backfilled[0]).toMatchObject({ name: 'Dustin Space',    normalized_name: 'dustinspace',    superseded_at: '' });
+    expect(backfilled[1]).toMatchObject({ name: 'voice-assistant', normalized_name: 'voiceassistant', superseded_at: '' });
+    expect(backfilled[2]).toMatchObject({ name: 'phase_b_task_3',  normalized_name: 'phasebtask3',    superseded_at: '' });
+    // Soft-deleted row also backfilled, but keeps its soft-delete timestamp.
+    expect(backfilled[3]).toMatchObject({ name: 'Dustin Space',    normalized_name: 'dustinspace' });
+    expect(backfilled[3].superseded_at).not.toBe('');
+
+    // Verify the OLD partial unique index on name was dropped.
+    const indexes = db2.prepare(`PRAGMA index_list(entities)`).all() as { name: string; unique: number; partial: number }[];
+    const oldIdx = indexes.find(i => i.name === 'idx_entities_name_active');
+    expect(oldIdx).toBeUndefined();
+
+    // Verify the NEW partial unique index on normalized_name was created.
+    const newIdx = indexes.find(i => i.name === 'idx_entities_normalized_active');
+    expect(newIdx).toBeDefined();
+    expect(newIdx!.unique).toBe(1);
+    expect(newIdx!.partial).toBe(1);
+    // Index column is normalized_name (not name).
+    const newIdxCols = db2.prepare(`PRAGMA index_info(idx_entities_normalized_active)`).all() as { name: string }[];
+    expect(newIdxCols.map(c => c.name)).toEqual(['normalized_name']);
+
+    // Verify relations were rewritten to NORMALIZED form.
+    const v8Rels = db2.prepare(`SELECT from_entity, to_entity, relation_type FROM relations ORDER BY id`).all() as { from_entity: string; to_entity: string; relation_type: string }[];
+    expect(v8Rels).toHaveLength(2);
+    expect(v8Rels[0]).toEqual({ from_entity: 'dustinspace',    to_entity: 'voiceassistant', relation_type: 'references' });
+    expect(v8Rels[1]).toEqual({ from_entity: 'voiceassistant', to_entity: 'phasebtask3',    relation_type: 'blocks' });
+
+    // Observation count unchanged by the migration.
+    const obsCount = (db2.prepare(`SELECT COUNT(*) AS c FROM observations`).get() as { c: number }).c;
+    expect(obsCount).toBe(1);
+
+    db2.close();
+
+    // Round-trip through SqliteStore.readGraph(): entities should return
+    // display names, and relations should return display names (translated
+    // from their stored normalized form via the LEFT JOIN + COALESCE path
+    // in getConnectedRelations / buildEntities).
+    const graph = await sqliteStore.readGraph();
+    // Only active entities are exposed via readGraph (the soft-deleted
+    // historical row is filtered out).
+    expect(graph.entities).toHaveLength(3);
+    const names = graph.entities.map(e => e.name).sort();
+    expect(names).toEqual(['Dustin Space', 'phase_b_task_3', 'voice-assistant']);
+
+    // Observation on Dustin Space survived.
+    const dustin = graph.entities.find(e => e.name === 'Dustin Space')!;
+    expect(dustin.observations).toHaveLength(1);
+    expect(dustin.observations[0].content).toBe('a dustin-space observation');
+
+    // Relations return DISPLAY names via the COALESCE translation layer.
+    expect(graph.relations).toHaveLength(2);
+    const rel1 = graph.relations.find(r => r.relationType === 'references')!;
+    expect(rel1.from).toBe('Dustin Space');
+    expect(rel1.to).toBe('voice-assistant');
+    const rel2 = graph.relations.find(r => r.relationType === 'blocks')!;
+    expect(rel2.from).toBe('voice-assistant');
+    expect(rel2.to).toBe('phase_b_task_3');
+
+    await sqliteStore.close();
+  });
+
+  it('should abort v7 → v8 migration when two active entities normalize to the same key', async () => {
+    // Seed a v7 database with two active entities whose display names
+    // collapse to the same normalized form ('dustin-space' and 'Dustin_Space'
+    // both → 'dustinspace'). The migration must abort with a structured
+    // error BEFORE touching the schema, so the database stays at v7 and
+    // the caller can resolve the collision manually before retrying.
+    const id = Date.now();
+    dbPath = path.join(testDir, `test-v7-to-v8-collision-${id}.db`);
+    jsonlPath = path.join(testDir, `nonexistent-${id}.jsonl`); // not used, just for cleanup
+
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
+
+    db.prepare(`CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL)`).run();
+    db.prepare(`INSERT INTO schema_version (id, version) VALUES (1, 7)`).run();
+
+    db.prepare(`CREATE TABLE entities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      project TEXT,
+      updated_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+      created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+      superseded_at TEXT NOT NULL DEFAULT ''
+    )`).run();
+    db.prepare(`CREATE UNIQUE INDEX idx_entities_name_active ON entities(name) WHERE superseded_at = ''`).run();
+
+    db.prepare(`CREATE TABLE observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      superseded_at TEXT NOT NULL DEFAULT '',
+      importance REAL NOT NULL DEFAULT 3.0,
+      context_layer TEXT,
+      memory_type TEXT,
+      UNIQUE(entity_id, content, superseded_at)
+    )`).run();
+
+    db.prepare(`CREATE TABLE relations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_entity TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+      to_entity TEXT NOT NULL REFERENCES entities(name) ON DELETE CASCADE ON UPDATE CASCADE,
+      relation_type TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      UNIQUE(from_entity, to_entity, relation_type, superseded_at)
+    )`).run();
+
+    // Two entities with distinct display names but the same normalized form.
+    // v7's partial unique index is on display name, so this is legal in v7.
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, NULL, ?, ?)`).run('dustin-space', 'project', now, now);
+    db.prepare(`INSERT INTO entities (name, entity_type, project, updated_at, created_at) VALUES (?, ?, NULL, ?, ?)`).run('Dustin_Space', 'project', now, now);
+
+    db.close();
+
+    // Open with SqliteStore — migration should ABORT with a collision error.
+    const sqliteStore = new SqliteStore(dbPath);
+    await expect(sqliteStore.init()).rejects.toThrow(/collision/i);
+    // Ensure the error message names the colliding display forms and the
+    // key they collapse to, so the operator knows exactly what to fix.
+    await expect(sqliteStore.init()).rejects.toThrow(/dustin-space/);
+    await expect(sqliteStore.init()).rejects.toThrow(/Dustin_Space/);
+    await expect(sqliteStore.init()).rejects.toThrow(/dustinspace/);
+
+    // The transaction should have rolled back: schema_version still at 7,
+    // no normalized_name column, no idx_entities_normalized_active index.
+    const db3 = new Database(dbPath);
+    const version = (db3.prepare(`SELECT version FROM schema_version`).get() as { version: number }).version;
+    expect(version).toBe(7);
+
+    const cols = db3.prepare(`PRAGMA table_info(entities)`).all() as { name: string }[];
+    expect(cols.map(c => c.name)).not.toContain('normalized_name');
+
+    const indexes = db3.prepare(`PRAGMA index_list(entities)`).all() as { name: string }[];
+    expect(indexes.map(i => i.name)).not.toContain('idx_entities_normalized_active');
+    // Old v7 index should still be present — nothing was dropped.
+    expect(indexes.map(i => i.name)).toContain('idx_entities_name_active');
+
+    db3.close();
+
+    // sqliteStore.close() is safe to call even after a failed init (the
+    // underlying Database handle was opened before the transaction threw).
+    try { await sqliteStore.close(); } catch { /* ignore */ }
   });
 });

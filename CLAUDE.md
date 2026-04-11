@@ -78,6 +78,15 @@ The server is split across 6 source files:
 - `readGraphFingerprint()` / `searchNodesFingerprint()`: build query fingerprints using null byte (`\0`) separator to prevent collision when projectId/query contains delimiter characters
 - Constants: `DEFAULT_PAGE_SIZE = 40`, `MAX_PAGE_SIZE = 100`
 
+### `normalize-name.ts` (~80 lines)
+- `normalizeEntityName(input: string): string` — Layer 1 entity-name normalizer used as the identity key throughout the store
+- Deterministic, no semantic understanding: trim → Unicode NFC → lowercase → strip separators (`/[\s\-_/.\\:]+/g`) → reject empty
+- Why NFC (not NFKC): NFC preserves visual identity. NFKC would collapse typographic forms like `ﬁ → fi` and `Ⅸ → IX`, destroying information when the user genuinely meant the ligature or roman numeral.
+- Callers: `SqliteStore` mutation/lookup paths (entities + relation endpoints) and `index.ts` tool boundary handlers — surface variants like `Dustin-Space`, `dustin/space`, `DUSTIN SPACE`, and `dustinspace` all map to the same identity key `dustinspace`.
+- Display form is preserved in the `entities.name` column (see `sqlite-store.ts`); this module only produces the identity key.
+- Turkish dotted-I caveat: `toLowerCase()` uses default locale — `İ` → `i̇` (i + combining dot). Acceptable for English-dominant projects; documented limitation.
+- Throws `Error` on empty input or input that normalizes to empty (e.g. whitespace-only or separator-only name).
+
 ### `embedding.ts` (~155 lines)
 - `EmbeddingPipeline` class: wraps `@huggingface/transformers` for local ONNX embedding generation
 - `VectorState` type: `{ status: 'loading' } | { status: 'ready'; pipeline } | { status: 'failed'; error; failedAt } | { status: 'unavailable' }` — logged at every transition
@@ -101,10 +110,12 @@ The server is split across 6 source files:
 - In-memory cursor-based pagination with entity name as tiebreaker
 - Imports cursor utilities from `cursor.ts`
 
-### `sqlite-store.ts` (~1750 lines)
+### `sqlite-store.ts` (~2500 lines)
 - `SqliteStore` class: SQLite backend using `better-sqlite3`
 - Implements the `GraphStore` interface
-- **Schema version tracking**: `schema_version` table with `CHECK(id=1)` single-row constraint. Versions 1–5 tracked. Legacy databases detected via column existence heuristics and assigned an initial version. All migrations run in sequence on startup.
+- **Schema version tracking**: `schema_version` table with `CHECK(id=1)` single-row constraint. Versions 1–8 tracked. Legacy databases detected via column existence heuristics and assigned an initial version. All migrations run in sequence on startup.
+- **Entity name normalization (v8)**: `entities.normalized_name` is the identity key (lowercased + NFC + separators stripped, produced by `normalize-name.ts`). `entities.name` preserves the original display form the user typed. All lookups and uniqueness constraints use `normalized_name`; tool output surfaces `name`. Partial unique index `idx_entities_normalized_active ON entities(normalized_name) WHERE superseded_at = ''` enforces one active identity per normalized key.
+- **Relations store normalized endpoints (v8)**: `relations.from_entity` and `relations.to_entity` hold the normalized identity keys — not display names — so lookups work regardless of which surface variant the caller used. `readGraph()` and `searchNodes()` translate endpoints back to display form via `LEFT JOIN entities ON ... COALESCE(e.name, r.from_entity)` so output always shows the user's original capitalization/separators. v6→v7 migration drops the FK clause from `relations.from_entity`/`to_entity` (the underlying `entities.name` UNIQUE constraint is now partial, and partial unique indexes don't qualify as FK targets in SQLite); integrity is enforced by the v8 migration's explicit orphan check and the tool-boundary normalization.
 - `project TEXT` nullable column on entities table — `NULL` means global (visible to all projects)
 - `updated_at` and `created_at` columns on entities table (sentinel default for legacy data, backfilled from observation timestamps during migration in a transaction)
 - `superseded_at TEXT NOT NULL DEFAULT ''` on observations — empty string sentinel means active, ISO timestamp means superseded. `UNIQUE(entity_id, content, superseded_at)` constraint. All queries filter `WHERE superseded_at = ''` to exclude retired observations.
@@ -182,15 +193,29 @@ The server is split across 6 source files:
 - **vec0 is brute-force KNN** — at current scale (~1500 observations), sub-millisecond. At ~50,000+, consider switching to ANN index (sqlite-vec supports IVF).
 - **Pagination sorts by `updatedAt`, not semantic relevance** — vector search improves recall (finding entities LIKE would miss) but does not affect ranking.
 
-## Tests (310 total across 7 test files)
-- `__tests__/knowledge-graph.test.ts` (236 tests) — parameterized suite (`describe.each`) running shared behavioral tests against both `JsonlStore` and `SqliteStore`, covering all CRUD operations, deduplication, composite key safety, search, edge cases, observation timestamps, normalizeObservation validation, atomic writes (JSONL), idempotent delete edge cases, project filtering, cursor-based pagination, supersedeObservations, temporal relations (createdAt/supersededAt on relations, invalidateRelations, entityTimeline), similarity check, totalCount accuracy. Plus JSONL-specific and SQLite-specific tests.
-- `__tests__/mcp-tools.test.ts` (35 tests) — integration tests for MCP tool handlers including invalidate_relations and entity_timeline tools
+## Schema Migrations
+Database schema is versioned in the single-row `schema_version` table (CHECK constraint enforces one row). Migrations run in sequence on startup in `sqlite-store.ts`; each one is idempotent and wrapped in a transaction except where noted.
+
+- **v1→v2:** Baseline schema for initial entity/observation/relation tables.
+- **v2→v3:** `project TEXT` nullable column on entities (NULL = global).
+- **v3→v4:** `updated_at` / `created_at` columns on entities with observation-timestamp backfill in a single transaction.
+- **v4→v5:** Temporal relations — `created_at` + `superseded_at` on relations with `UNIQUE(from_entity, to_entity, relation_type, superseded_at)`. Table-rebuild migration.
+- **v5→v6:** Observation metadata — `importance REAL DEFAULT 3.0`, `context_layer TEXT NULL`, `memory_type TEXT NULL` on observations.
+- **v6→v7:** Soft-delete on entities — `superseded_at TEXT NOT NULL DEFAULT ''` column, partial unique index `idx_entities_name_active ON entities(name) WHERE superseded_at = ''`. FK clauses on `relations.from_entity`/`to_entity` are dropped in this migration because partial unique indexes don't qualify as FK targets in SQLite.
+- **v7→v8:** Entity name normalization — adds `normalized_name` column on entities (the identity key), rewrites `relations.from_entity`/`to_entity` to normalized form, drops `idx_entities_name_active`, creates `idx_entities_normalized_active ON entities(normalized_name) WHERE superseded_at = ''`. Collision check before index creation aborts the migration (rollback) if two active rows normalize to the same key, naming both display forms and the collision key. Wrapped with `PRAGMA foreign_keys = OFF/ON` (outside the transaction) to tolerate historical databases that arrived at v7 with stale FK clauses still attached; integrity is enforced by an explicit orphan check inside the migration.
+
+## Tests (444 total across 8 test files)
+- `__tests__/knowledge-graph.test.ts` (311 tests) — parameterized suite (`describe.each`) running shared behavioral tests against both `JsonlStore` and `SqliteStore`, covering all CRUD operations, deduplication, composite key safety, search, edge cases, observation timestamps, normalizeObservation validation, atomic writes (JSONL), idempotent delete edge cases, project filtering, cursor-based pagination, supersedeObservations, temporal relations (createdAt/supersededAt on relations, invalidateRelations, entityTimeline), similarity check, totalCount accuracy, entity name normalization behavioral tests. Plus JSONL-specific and SQLite-specific tests (including `entity name normalization (Layer 1)` block exercising surface variants on create/read/delete/supersede/invalidate/timeline).
+- `__tests__/mcp-tools.test.ts` (71 tests) — integration tests for MCP tool handlers including invalidate_relations, entity_timeline, and normalization at the tool boundary
+- `__tests__/normalize-name.test.ts` (17 tests) — unit tests for `normalizeEntityName()`: NFC equivalence, case fold, separator stripping, Turkish dotted-I behavior, empty/whitespace/separator-only rejection
 - `__tests__/file-path.test.ts` (16 tests) — `StoreConfig` return type, extension routing (.jsonl / .db / .sqlite / default), and legacy .json→.jsonl migration
 - `__tests__/migration.test.ts` (5 tests) — JSONL→SQLite auto-migration: data transfer, .jsonl.bak rename, idempotency when .db already exists, empty JSONL file handling
-- `__tests__/migration-validation.test.ts` (10 tests) — schema version tracking and migration validation across versions 1–5
+- `__tests__/migration-validation.test.ts` (14 tests) — schema version tracking and migration validation across versions 1–8, including v7→v8 forward-migration test (display preservation + relation rewrite) and collision-abort test (two active entities normalizing to same key → rollback)
 - `__tests__/vector-search.test.ts` (4 tests) — vector state reporting, MEMORY_VECTOR_SEARCH=off degradation, LIKE fallback while loading, superseded observations excluded from LIKE search
-- `__tests__/vector-integration.test.ts` (4 tests) — end-to-end tests with real embedding model: semantic search, LIKE+vector dedup, superseded observation exclusion, similarExisting check. Skip with `SKIP_VECTOR_INTEGRATION=1`.
+- `__tests__/vector-integration.test.ts` (6 tests) — end-to-end tests with real embedding model: semantic search, LIKE+vector dedup, superseded observation exclusion, similarExisting check, as_of recovery of superseded matches, soft-deleted entity exclusion. Skip with `SKIP_VECTOR_INTEGRATION=1`.
 - `__tests__/smoke-test-vec.ts` — one-off script (not a vitest test) validating sqlite-vec + better-sqlite3 + @huggingface/transformers compatibility on this platform
+
+**Test pool discipline:** The suite runs in two commands. Pool 1 (non-vector, 438 tests): `MEMORY_VECTOR_SEARCH=off SKIP_VECTOR_INTEGRATION=1 npx vitest run --exclude '**/vector-integration.test.ts'`. Pool 2 (vector integration, 6 tests): `MEMORY_VECTOR_SEARCH=on npx vitest run __tests__/vector-integration.test.ts --pool=forks --poolOptions.forks.singleFork=true`. See `feedback_local_llm_test_pool_discipline.md` for the reasoning (the local ONNX model load must be isolated and single-fork to avoid hard-reboots).
 
 ## Version History
 - **v1.0.0** — Temporal relations (superseded_at on relations, invalidate_relations + entity_timeline tools), similarity check on addObservations, schema version tracking (versions 1–5), graceful shutdown, totalCount fix, JSONL backend deprecated

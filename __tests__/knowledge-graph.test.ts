@@ -739,12 +739,17 @@ describe.each<[string, string, StoreFactory]>([
 			await store.deleteEntities(['Hub']);
 
 			const db = rawDb(store);
+			// Raw SQL queries must use the NORMALIZED form of the name as of v8:
+			// entities.normalized_name holds the identity key, and relations
+			// .from_entity / to_entity now store normalized form (translated back
+			// to display form only at the readGraph/openNodes boundary). The
+			// display name 'Hub' normalizes to 'hub'.
 			const entityTs = (db.prepare(
-				`SELECT superseded_at FROM entities WHERE name = ?`
-			).get('Hub') as { superseded_at: string }).superseded_at;
+				`SELECT superseded_at FROM entities WHERE normalized_name = ? AND name = ?`
+			).get('hub', 'Hub') as { superseded_at: string }).superseded_at;
 			const relTs = db.prepare(
 				`SELECT superseded_at FROM relations WHERE from_entity = ? OR to_entity = ?`
-			).all('Hub', 'Hub') as { superseded_at: string }[];
+			).all('hub', 'hub') as { superseded_at: string }[];
 
 			expect(relTs).toHaveLength(2);
 			for (const r of relTs) {
@@ -1206,7 +1211,11 @@ describe.each<[string, string, StoreFactory]>([
 			);
 			expect(result.created).toHaveLength(0);
 			expect(result.skipped).toHaveLength(1);
-			expect(result.skipped[0]).toEqual({ name: 'Shared', existingProject: 'project-a' });
+			// Use toMatchObject (not toEqual) because `existingName` is an
+			// optional field on SkippedEntity — SqliteStore always populates it
+			// (v1.1 normalization work), JsonlStore omits it. This shared test
+			// runs against both backends.
+			expect(result.skipped[0]).toMatchObject({ name: 'Shared', existingProject: 'project-a' });
 		});
 
 		it('should filter readGraph by project + globals', async () => {
@@ -2675,10 +2684,11 @@ describe('SqliteStore-specific', () => {
 			conn.close();
 
 			expect(row).toBeDefined();
-			// Fresh databases should be at version 7 (v7 added soft-delete on entities
-			// via superseded_at + partial unique index, and rebuilt the relations table
-			// without the FK clause to coexist with the partial unique index).
-			expect(row!.version).toBe(7);
+			// Fresh databases should be at version 8. v7 added soft-delete on entities
+			// via superseded_at + partial unique index. v8 added the `normalized_name`
+			// identity-key column with a partial unique index, and converted relations
+			// to store their endpoints in normalized form.
+			expect(row!.version).toBe(8);
 		});
 	});
 
@@ -3253,5 +3263,240 @@ describe('SqliteStore-specific', () => {
 		expect(await store.invalidateRelations([
 			{ from: 'M', to: 'N', relationType: 'phantom' },
 		])).toBe(0);
+	});
+
+	// ----------------------------------------------------------
+	// Layer 1 entity name normalization (Phase B Task 3b, schema v8)
+	//
+	// Why these tests exist:
+	//   The store collapses surface variants of the same conceptual name
+	//   ('Dustin Space', 'dustin-space', 'dustin_space', 'DUSTINSPACE')
+	//   into a single identity key via the `normalized_name` column. The
+	//   first surface form to be inserted "wins" the display name; later
+	//   surface variants of the same identity collide rather than create
+	//   parallel entities. These tests pin that behavior across every
+	//   mutation and read path, so a future regression can't silently
+	//   reintroduce duplicate entities.
+	// ----------------------------------------------------------
+	describe('entity name normalization (Layer 1)', () => {
+		it('collapses surface variants to a single entity (first write wins on display form)', async () => {
+			const result = await store.createEntities([
+				{ name: 'Dustin Space', entityType: 'project', observations: ['initial'] },
+				{ name: 'dustin-space', entityType: 'project', observations: ['variant 2'] },
+				{ name: 'DUSTIN_SPACE', entityType: 'project', observations: ['variant 3'] },
+			]);
+
+			// Only the first one is created — the other two collapse to the same identity.
+			expect(result.created).toHaveLength(1);
+			expect(result.created[0].name).toBe('Dustin Space');
+			expect(result.skipped).toHaveLength(2);
+
+			// The skipped entries report which display form is the existing winner.
+			// `name` is the input form, `existingName` is the stored display form.
+			for (const s of result.skipped) {
+				expect(s.existingName).toBe('Dustin Space');
+				expect(s.existingProject).toBeNull();
+			}
+
+			// Read-back via readGraph confirms exactly one row with the original display form.
+			const graph = await store.readGraph();
+			expect(graph.entities).toHaveLength(1);
+			expect(graph.entities[0].name).toBe('Dustin Space');
+			expect(graph.entities[0].observations).toHaveLength(1);
+			expect(graph.entities[0].observations[0].content).toBe('initial');
+		});
+
+		it('addObservations finds the entity by any surface variant', async () => {
+			await store.createEntities([
+				{ name: 'Dustin Space', entityType: 'project', observations: ['o1'] },
+			]);
+
+			// Pass a DIFFERENT surface form than the one used at create time.
+			// The store should still find and update the same entity.
+			await store.addObservations([
+				{ entityName: 'dustin-space', contents: ['o2'] },
+			]);
+			await store.addObservations([
+				{ entityName: 'DUSTIN_SPACE', contents: ['o3'] },
+			]);
+
+			const graph = await store.readGraph();
+			expect(graph.entities).toHaveLength(1);
+			expect(graph.entities[0].name).toBe('Dustin Space');
+			const contents = graph.entities[0].observations.map(o => o.content).sort();
+			expect(contents).toEqual(['o1', 'o2', 'o3']);
+		});
+
+		it('createRelations resolves both endpoints by any surface variant and returns canonical display names', async () => {
+			await store.createEntities([
+				{ name: 'Dustin Space', entityType: 'project', observations: [] },
+				{ name: 'voice assistant', entityType: 'project', observations: [] },
+			]);
+
+			const created = await store.createRelations([
+				// Use SURFACE VARIANTS that don't match the stored display forms exactly.
+				{ from: 'dustin_space', to: 'Voice-Assistant', relationType: 'related' },
+			]);
+
+			// The store returns the CANONICAL display names from entities.name,
+			// not the variant supplied by the caller.
+			expect(created).toHaveLength(1);
+			expect(created[0].from).toBe('Dustin Space');
+			expect(created[0].to).toBe('voice assistant');
+			expect(created[0].relationType).toBe('related');
+
+			// Subsequent reads also return display names, not normalized form.
+			const graph = await store.readGraph();
+			expect(graph.relations).toHaveLength(1);
+			expect(graph.relations[0].from).toBe('Dustin Space');
+			expect(graph.relations[0].to).toBe('voice assistant');
+		});
+
+		it('openNodes accepts any surface variant and returns canonical entities + relations', async () => {
+			await store.createEntities([
+				{ name: 'Dustin Space', entityType: 'project', observations: ['hi'] },
+				{ name: 'voice assistant', entityType: 'project', observations: ['hello'] },
+			]);
+			await store.createRelations([
+				{ from: 'Dustin Space', to: 'voice assistant', relationType: 'related' },
+			]);
+
+			// Look up using surface variants.
+			const graph = await store.openNodes(['DUSTINSPACE', 'voice-assistant']);
+
+			expect(graph.entities).toHaveLength(2);
+			const names = graph.entities.map(e => e.name).sort();
+			expect(names).toEqual(['Dustin Space', 'voice assistant']);
+
+			expect(graph.relations).toHaveLength(1);
+			expect(graph.relations[0].from).toBe('Dustin Space');
+			expect(graph.relations[0].to).toBe('voice assistant');
+		});
+
+		it('searchNodes finds entities created with one surface form when query matches another', async () => {
+			await store.createEntities([
+				{ name: 'Dustin Space', entityType: 'project', observations: ['has photos'] },
+			]);
+
+			// LIKE search is substring-based on the stored display form, so
+			// querying with the original casing/spacing finds the entity.
+			const result = await store.searchNodes('Dustin');
+			expect(result.entities).toHaveLength(1);
+			expect(result.entities[0].name).toBe('Dustin Space');
+		});
+
+		it('deleteEntities accepts any surface variant', async () => {
+			await store.createEntities([
+				{ name: 'Dustin Space', entityType: 'project', observations: ['o1'] },
+				{ name: 'voice assistant', entityType: 'project', observations: ['o2'] },
+			]);
+
+			// Delete using a different surface variant than the one created.
+			await store.deleteEntities(['dustin-space']);
+
+			const graph = await store.readGraph();
+			expect(graph.entities).toHaveLength(1);
+			expect(graph.entities[0].name).toBe('voice assistant');
+		});
+
+		it('deleteEntities is idempotent on unparseable names', async () => {
+			await store.createEntities([
+				{ name: 'survivor', entityType: 'test', observations: [] },
+			]);
+
+			// All of these collapse to empty after normalization, so they
+			// can't refer to anything stored. Idempotent contract: silent skip.
+			await expect(
+				store.deleteEntities(['---', '. . .', '   ', '_ _ _'])
+			).resolves.toBeUndefined();
+
+			const graph = await store.readGraph();
+			expect(graph.entities).toHaveLength(1);
+			expect(graph.entities[0].name).toBe('survivor');
+		});
+
+		it('supersedeObservations accepts any surface variant', async () => {
+			await store.createEntities([
+				{ name: 'Dustin Space', entityType: 'project', observations: ['old fact'] },
+			]);
+
+			// Use a surface variant for the supersession target.
+			await store.supersedeObservations([
+				{ entityName: 'DUSTIN-SPACE', oldContent: 'old fact', newContent: 'new fact' },
+			]);
+
+			const graph = await store.readGraph();
+			expect(graph.entities[0].observations).toHaveLength(1);
+			expect(graph.entities[0].observations[0].content).toBe('new fact');
+		});
+
+		it('invalidateRelations accepts any surface variant for from/to', async () => {
+			await store.createEntities([
+				{ name: 'A One', entityType: 'test', observations: [] },
+				{ name: 'B Two', entityType: 'test', observations: [] },
+			]);
+			await store.createRelations([
+				{ from: 'A One', to: 'B Two', relationType: 'connected' },
+			]);
+
+			// Invalidate using surface variants — should still match.
+			const changed = await store.invalidateRelations([
+				{ from: 'a-one', to: 'b_two', relationType: 'connected' },
+			]);
+			expect(changed).toBe(1);
+
+			const graph = await store.readGraph();
+			expect(graph.relations).toHaveLength(0);
+		});
+
+		it('entityTimeline accepts any surface variant and returns display-form relations', async () => {
+			await store.createEntities([
+				{ name: 'Dustin Space', entityType: 'project', observations: ['fact 1'] },
+				{ name: 'voice assistant', entityType: 'project', observations: ['fact 2'] },
+			]);
+			await store.createRelations([
+				{ from: 'Dustin Space', to: 'voice assistant', relationType: 'related' },
+			]);
+
+			// Look up the timeline using a surface variant.
+			const timeline = await store.entityTimeline('dustin-space');
+			expect(timeline).not.toBeNull();
+			expect(timeline!.name).toBe('Dustin Space');
+			// Observations come back active.
+			expect(timeline!.observations.some(o => o.content === 'fact 1' && o.status === 'active')).toBe(true);
+			// Relations come back with display names from the LEFT JOIN COALESCE,
+			// not the stored normalized form.
+			expect(timeline!.relations).toHaveLength(1);
+			expect(timeline!.relations[0].from).toBe('Dustin Space');
+			expect(timeline!.relations[0].to).toBe('voice assistant');
+		});
+
+		it('createEntities throws on names that normalize to empty', async () => {
+			// '---' trims non-empty but strips to empty inside normalizeEntityName,
+			// triggering its second guard. The throw aborts the transaction.
+			await expect(
+				store.createEntities([
+					{ name: '---', entityType: 'test', observations: [] },
+				])
+			).rejects.toThrow(/no content after normalization|cannot be empty/);
+		});
+
+		it('NFC unicode equivalents collapse to the same identity', async () => {
+			// 'café' in two byte forms: precomposed (single 'é' codepoint) and
+			// decomposed ('e' + combining acute accent U+0301).
+			const precomposed = 'caf\u00e9';      // 'é' as one codepoint
+			const decomposed = 'cafe\u0301';      // 'e' + combining acute
+
+			const result = await store.createEntities([
+				{ name: precomposed, entityType: 'place', observations: ['p1'] },
+				{ name: decomposed,  entityType: 'place', observations: ['p2'] },
+			]);
+
+			// NFC normalization makes both collapse to the same identity key.
+			expect(result.created).toHaveLength(1);
+			expect(result.skipped).toHaveLength(1);
+			// First write wins on display form.
+			expect(result.created[0].name).toBe(precomposed);
+		});
 	});
 });
