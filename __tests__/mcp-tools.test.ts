@@ -24,6 +24,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { z } from 'zod';
 import { SqliteStore } from '../sqlite-store.js';
+import { normalizeEntityName } from '../normalize-name.js';
 import type { GraphStore } from '../types.js';
 
 // Resolve the directory containing this test file — used for building temp file paths
@@ -56,13 +57,30 @@ function normalizeProjectId(projectId?: string): string | undefined {
 // ----------------------------------------------------------
 // Replicate Zod schemas from index.ts for validation testing
 // ----------------------------------------------------------
-// These mirror the schemas defined in index.ts lines 82-147.
-// We replicate them rather than importing because they're module-scoped
-// (not exported) in index.ts.
+// These mirror the schemas defined in index.ts. We replicate them rather than
+// importing because they're module-scoped (not exported) in index.ts.
+// IMPORTANT: Keep these in sync with production schemas (#60). When modifying
+// schemas in index.ts, update the matching schema here too.
+
+// EntityNameInputSchema — write-path name validator. Uses .refine() to reject
+// names that normalize to empty (e.g. '---'). Must match index.ts production schema.
+const EntityNameInputSchema = z.string().min(1).max(500).refine(
+	(name) => {
+		try {
+			normalizeEntityName(name);
+			return true;
+		} catch {
+			return false;
+		}
+	},
+	{
+		message: "Entity name must contain at least one non-separator character.",
+	}
+);
 
 /** Schema for a single entity in create_entities input — name, type, and observation strings */
 const EntityInputSchema = z.object({
-	name: z.string().min(1).max(500).describe("The name of the entity"),
+	name: EntityNameInputSchema.describe("The name of the entity"),
 	entityType: z.string().min(1).max(500).describe("The type of the entity"),
 	observations: z.array(z.string().min(1).max(5000)).max(100)
 		.describe("An array of observation contents associated with the entity"),
@@ -1247,6 +1265,191 @@ describe('MCP Tool Handler Integration', () => {
 			expect(result.skipped).toHaveLength(1);
 			expect(result.skipped[0].name).toBe('Singleton');
 			expect(result.skipped[0].existingProject).toBe('projectx');
+		});
+
+		it('skipped entry includes existingName for surface-variant collision feedback (#58)', async () => {
+			// Create an entity with display form "Dustin Space"
+			await store.createEntities([
+				{ name: 'Dustin Space', entityType: 'project', observations: ['first'] },
+			]);
+
+			// Attempt to create a surface variant — should be skipped with existingName
+			const result = await store.createEntities([
+				{ name: 'dustin-space', entityType: 'project', observations: ['second'] },
+			]);
+
+			expect(result.skipped).toHaveLength(1);
+			expect(result.skipped[0].name).toBe('dustin-space');
+			// This is the critical field — #58 was that Zod stripped it from output
+			expect(result.skipped[0].existingName).toBe('Dustin Space');
+		});
+	});
+
+	// ----------------------------------------------------------
+	// Section 10: Boundary validation — write vs. delete asymmetry (#57)
+	// ----------------------------------------------------------
+	describe('write vs. delete boundary validation', () => {
+
+		it('create_entities rejects names that normalize to empty (write-path)', () => {
+			// Write operations use EntityNameInputSchema with .refine()
+			const result = CreateEntitiesInputSchema.safeParse({
+				entities: [{ name: '---', entityType: 'test', observations: [] }],
+			});
+			expect(result.success).toBe(false);
+		});
+
+		it('delete_relations accepts names that normalize to empty (idempotent delete)', () => {
+			// Delete operations use RelationBaseSchema (no .refine()) — unnormalizable
+			// names are treated as "no such relation" and silently skipped.
+			// This mirrors the production delete_relations input schema.
+			const DeleteRelationsSchema = z.object({
+				relations: z.array(z.object({
+					from: z.string().min(1).max(500),
+					to: z.string().min(1).max(500),
+					relationType: z.string().min(1).max(500),
+				})).max(100),
+			});
+
+			// '---' is a valid string (passes .min(1)) but normalizes to empty.
+			// Delete should accept it, not reject it.
+			const result = DeleteRelationsSchema.safeParse({
+				relations: [{ from: '---', to: 'EntityB', relationType: 'knows' }],
+			});
+			expect(result.success).toBe(true);
+		});
+
+		it('set_observation_metadata rejects entity names that normalize to empty', () => {
+			// set_observation_metadata is a write-path tool — it uses EntityNameInputSchema
+			// with .refine() to reject separator-only names.
+			const SetObservationMetadataInputSchema = z.object({
+				updates: z.array(z.object({
+					entityName: EntityNameInputSchema,
+					content: z.string().min(1).max(5000),
+					importance: z.number().min(1).max(5).optional(),
+					contextLayer: z.enum(['L0', 'L1']).nullable().optional(),
+					memoryType: z.string().max(50).nullable().optional(),
+				})).min(1).max(100),
+			});
+
+			// '---' normalizes to empty → .refine() rejects it
+			const result = SetObservationMetadataInputSchema.safeParse({
+				updates: [{ entityName: '---', content: 'anything', importance: 3.0 }],
+			});
+			expect(result.success).toBe(false);
+		});
+
+		it('set_observation_metadata rejects importance outside 1-5 range', () => {
+			const SetObservationMetadataInputSchema = z.object({
+				updates: z.array(z.object({
+					entityName: EntityNameInputSchema,
+					content: z.string().min(1).max(5000),
+					importance: z.number().min(1).max(5).optional(),
+					contextLayer: z.enum(['L0', 'L1']).nullable().optional(),
+					memoryType: z.string().max(50).nullable().optional(),
+				})).min(1).max(100),
+			});
+
+			// importance: 0.5 is below the min(1) constraint
+			const tooLow = SetObservationMetadataInputSchema.safeParse({
+				updates: [{ entityName: 'TestEntity', content: 'obs', importance: 0.5 }],
+			});
+			expect(tooLow.success).toBe(false);
+
+			// importance: 6.0 is above the max(5) constraint
+			const tooHigh = SetObservationMetadataInputSchema.safeParse({
+				updates: [{ entityName: 'TestEntity', content: 'obs', importance: 6.0 }],
+			});
+			expect(tooHigh.success).toBe(false);
+		});
+
+		it('set_observation_metadata rejects invalid contextLayer values', () => {
+			const SetObservationMetadataInputSchema = z.object({
+				updates: z.array(z.object({
+					entityName: EntityNameInputSchema,
+					content: z.string().min(1).max(5000),
+					importance: z.number().min(1).max(5).optional(),
+					contextLayer: z.enum(['L0', 'L1']).nullable().optional(),
+					memoryType: z.string().max(50).nullable().optional(),
+				})).min(1).max(100),
+			});
+
+			// 'L2' is not a valid enum value — L2 is the default (null), not an explicit layer
+			const result = SetObservationMetadataInputSchema.safeParse({
+				updates: [{ entityName: 'TestEntity', content: 'obs', contextLayer: 'L2' }],
+			});
+			expect(result.success).toBe(false);
+		});
+
+		it('set_observation_metadata accepts null contextLayer (demote to L2)', () => {
+			const SetObservationMetadataInputSchema = z.object({
+				updates: z.array(z.object({
+					entityName: EntityNameInputSchema,
+					content: z.string().min(1).max(5000),
+					importance: z.number().min(1).max(5).optional(),
+					contextLayer: z.enum(['L0', 'L1']).nullable().optional(),
+					memoryType: z.string().max(50).nullable().optional(),
+				})).min(1).max(100),
+			});
+
+			// null is valid — it means "demote to on-demand (L2)"
+			const result = SetObservationMetadataInputSchema.safeParse({
+				updates: [{ entityName: 'TestEntity', content: 'obs', contextLayer: null }],
+			});
+			expect(result.success).toBe(true);
+		});
+
+		it('get_summary rejects limit below 1', () => {
+			// Mirrors the Zod schema from index.ts for get_summary input validation
+			const GetSummaryInputSchema = z.object({
+				projectId: z.string().trim().min(1).max(500).optional(),
+				excludeContextLayers: z.boolean().optional(),
+				limit: z.number().int().min(1).max(100).optional(),
+			});
+
+			const result = GetSummaryInputSchema.safeParse({ limit: 0 });
+			expect(result.success).toBe(false);
+		});
+
+		it('get_summary rejects limit above 100', () => {
+			const GetSummaryInputSchema = z.object({
+				projectId: z.string().trim().min(1).max(500).optional(),
+				excludeContextLayers: z.boolean().optional(),
+				limit: z.number().int().min(1).max(100).optional(),
+			});
+
+			const result = GetSummaryInputSchema.safeParse({ limit: 150 });
+			expect(result.success).toBe(false);
+		});
+
+		it('get_summary accepts valid input with all optional fields', () => {
+			const GetSummaryInputSchema = z.object({
+				projectId: z.string().trim().min(1).max(500).optional(),
+				excludeContextLayers: z.boolean().optional(),
+				limit: z.number().int().min(1).max(100).optional(),
+			});
+
+			const result = GetSummaryInputSchema.safeParse({
+				projectId: 'myproject',
+				excludeContextLayers: true,
+				limit: 10,
+			});
+			expect(result.success).toBe(true);
+		});
+
+		it('create_relations rejects names that normalize to empty (write-path)', () => {
+			// create_relations uses RelationInputSchema with .refine()
+			const CreateRelationsSchema = z.object({
+				relations: z.array(z.object({
+					from: EntityNameInputSchema,
+					to: EntityNameInputSchema,
+					relationType: z.string().min(1).max(500),
+				})).max(100),
+			});
+
+			const result = CreateRelationsSchema.safeParse({
+				relations: [{ from: '---', to: 'EntityB', relationType: 'knows' }],
+			});
+			expect(result.success).toBe(false);
 		});
 	});
 });

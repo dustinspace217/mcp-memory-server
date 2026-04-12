@@ -208,6 +208,74 @@ export type CreateEntitiesResult = {
   skipped: SkippedEntity[];
 };
 
+/** Input for set_observation_metadata tool: update importance, context layer, and/or
+ *  memory type on an existing active observation without superseding it.
+ *  The observation is identified by (entityName, content) — content is the exact match.
+ *  At least one of importance, contextLayer, or memoryType should be provided. */
+export interface SetObservationMetadataInput {
+  entityName: string;
+  content: string;              // identifies the target observation by exact match
+  importance?: number;          // 1.0-5.0; only updated if provided
+  contextLayer?: string | null; // 'L0', 'L1', or null (demote to L2); only updated if key is present
+  memoryType?: string | null;   // free-form tag or null (unclassified); only updated if key is present
+}
+
+/** A single observation in a context layer response. L0 observations omit updatedAt
+ *  (they're identity/rules, timestamps aren't relevant). L1 observations include it
+ *  so the caller can gauge freshness. */
+export interface ContextLayerObservation {
+  entityName: string;
+  content: string;
+  importance: number;
+  memoryType: string | null;
+  updatedAt?: string;   // present on L1, omitted on L0
+}
+
+/** Return type for getContextLayers(). Observations grouped by layer,
+ *  with a rough token estimate (chars / 4) so hooks can budget.
+ *  L0 and L1 arrays are sorted by importance DESC within each layer. */
+export interface ContextLayersResult {
+  L0: ContextLayerObservation[];
+  L1: ContextLayerObservation[];
+  tokenEstimate: number;
+}
+
+/** A single observation in a summary response. Includes entityName, memoryType,
+ *  and updatedAt for context. */
+export interface SummaryObservation {
+  entityName: string;
+  content: string;
+  importance: number;
+  memoryType: string | null;
+  updatedAt: string;
+}
+
+/** A recently-updated entity in a summary response. Includes observation count
+ *  so the caller can gauge entity richness. */
+export interface SummaryEntity {
+  name: string;
+  entityType: string;
+  observationCount: number;
+  updatedAt: string;
+}
+
+/** Aggregate stats for the knowledge graph. */
+export interface SummaryStats {
+  totalEntities: number;
+  totalObservations: number;
+  totalRelations: number;
+  projectCount: number;
+}
+
+/** Return type for getSummary(). Provides an overview snapshot designed
+ *  for session-start briefings: top observations by importance, recently
+ *  updated entities, and aggregate stats. */
+export interface SummaryResult {
+  topObservations: SummaryObservation[];
+  recentEntities: SummaryEntity[];
+  stats: SummaryStats;
+}
+
 /** Input for supersede_observations tool: replace one observation with another on an entity. */
 export interface SupersedeInput {
   entityName: string;
@@ -292,6 +360,26 @@ export interface GraphStore {
   listProjects(): Promise<string[]>;
   /** Returns full timeline for an entity (all observations and relations, active + superseded). */
   entityTimeline(entityName: string, projectId?: string): Promise<EntityTimelineResult | null>;
+  /** Returns a concise summary snapshot: top observations by importance, recently updated
+   *  entities, and aggregate stats. Designed for session-start briefings.
+   *  @param projectId - Optional project scope. When set, includes project + global entities.
+   *  @param excludeContextLayers - When true, excludes L0/L1 observations (for dedup with getContextLayers).
+   *  @param limit - Max top observations to return (default 20).
+   *  @returns SummaryResult with topObservations, recentEntities, and stats */
+  getSummary(projectId?: string, excludeContextLayers?: boolean, limit?: number): Promise<Readonly<SummaryResult>>;
+  /** Returns L0 and L1 observations for a project, sorted by layer then importance DESC.
+   *  Enforces soft token budgets (~100 tokens for L0, ~800 for L1). When observations
+   *  exceed the budget, the response is truncated to the most important ones.
+   *  @param projectId - Optional project scope. When set, includes project + global entities.
+   *  @param layers - Which layers to return. Defaults to ['L0', 'L1'].
+   *  @returns ContextLayersResult with L0 and L1 arrays plus tokenEstimate */
+  getContextLayers(projectId?: string, layers?: string[]): Promise<Readonly<ContextLayersResult>>;
+  /** Updates metadata (importance, contextLayer, memoryType) on existing active observations
+   *  in-place. Does not change content, timestamps, or embeddings. Throws if entity not found.
+   *  Idempotent — returns 0 if the observation content isn't found (not an error).
+   *  @param updates - Array of SetObservationMetadataInput identifying observations and new metadata
+   *  @returns Number of observations actually updated */
+  setObservationMetadata(updates: SetObservationMetadataInput[]): Promise<number>;
 }
 
 /**

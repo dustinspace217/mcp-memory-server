@@ -135,9 +135,18 @@ const EntityOutputSchema = z.object({
 });
 
 // Input schema for creating/deleting relations — just the 3 identifying fields.
-// Callers don't provide temporal fields (those are system-managed).
-// from / to use EntityNameInputSchema so the boundary rejects names that would
-// collapse to an empty identity key inside the store.
+// Base relation field schema — no .refine() validation. Used for:
+//   1. Output schemas (stored data may include historical names that predate validation)
+//   2. Idempotent delete operations (unnormalizable names → "no such relation" → skip)
+const RelationBaseSchema = z.object({
+  from: z.string().min(1).max(500).describe("The name of the entity where the relation starts"),
+  to: z.string().min(1).max(500).describe("The name of the entity where the relation ends"),
+  relationType: z.string().min(1).max(500).describe("The type of the relation")
+});
+
+// Write-path input schema — from / to use EntityNameInputSchema so the boundary
+// rejects names that would collapse to an empty identity key inside the store.
+// Only used by create_relations (and anywhere else that creates new relations).
 const RelationInputSchema = z.object({
   from: EntityNameInputSchema.describe("The name of the entity where the relation starts"),
   to: EntityNameInputSchema.describe("The name of the entity where the relation ends"),
@@ -147,7 +156,8 @@ const RelationInputSchema = z.object({
 // Output schema for relations returned by queries — includes system-managed temporal fields.
 // createdAt: ISO 8601 UTC when the relation was established (sentinel for legacy data).
 // supersededAt: '' = active, ISO timestamp = invalidated.
-const RelationOutputSchema = RelationInputSchema.extend({
+// Built on RelationBaseSchema (no .refine()) so historical data passes output validation (#57).
+const RelationOutputSchema = RelationBaseSchema.extend({
   createdAt: z.string().describe("ISO 8601 UTC timestamp when relation was created, or sentinel for legacy data"),
   supersededAt: z.string().describe("'' = active, ISO timestamp = invalidated"),
 });
@@ -178,10 +188,14 @@ export function normalizeProjectId(projectId?: string): string | undefined {
   return normalized || undefined;
 }
 
-// Schema for entities that were skipped during create_entities (name collision)
+// Schema for entities that were skipped during create_entities (name collision).
+// existingName reports which display form the input collided with — important when
+// the input was a surface variant (e.g. 'Dustin-Space' → collides with 'dustin-space').
+// Without this, Zod strips the field from the MCP output (issue #58).
 const SkippedEntitySchema = z.object({
   name: z.string(),
   existingProject: z.string().nullable(),
+  existingName: z.string().optional(),
 });
 
 // Pagination output schema — included in read_graph and search_nodes responses.
@@ -341,7 +355,9 @@ server.registerTool(
   {
     title: "Delete Relations",
     description: "Delete multiple relations from the knowledge graph",
-    inputSchema: { relations: z.array(RelationInputSchema).max(100).describe("An array of relations to delete") },
+    // Uses RelationBaseSchema (no .refine()) — delete is idempotent, so unnormalizable
+    // names are treated as "no such relation" and silently skipped (#57).
+    inputSchema: { relations: z.array(RelationBaseSchema).max(100).describe("An array of relations to delete") },
     outputSchema: { success: z.boolean(), message: z.string() }
   },
   async ({ relations }) => {
@@ -479,7 +495,12 @@ server.registerTool(
         relationType: z.string().min(1).max(500).describe("The type of the relation"),
       })).min(1).max(100).describe("Relations to invalidate"),
     },
-    outputSchema: { success: z.boolean(), message: z.string() }
+    outputSchema: {
+      success: z.boolean(),
+      message: z.string(),
+      invalidated: z.number().describe("Number of relations actually invalidated"),
+      requested: z.number().describe("Number of relations in the input"),
+    }
   },
   async ({ relations }) => {
     const changed = await store.invalidateRelations(relations);
@@ -537,6 +558,152 @@ server.registerTool(
     }
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      structuredContent: result as unknown as Record<string, unknown>,
+    };
+  }
+);
+
+server.registerTool(
+  "set_observation_metadata",
+  {
+    title: "Set Observation Metadata",
+    description: "Updates importance, context layer, and/or memory type on existing observations " +
+      "without superseding them. Preserves the observation's identity, timestamps, and embeddings. " +
+      "Use this to promote observations to L0/L1, adjust importance, or tag memory type. " +
+      "Observations are identified by (entityName, content) exact match.",
+    inputSchema: {
+      updates: z.array(z.object({
+        // EntityNameInputSchema (with .refine()) — write-path validation rejects names
+        // that normalize to empty. The entity must exist; throwing on not-found is correct.
+        entityName: EntityNameInputSchema.describe("The entity owning the observation"),
+        content: z.string().min(1).max(5000).describe("Exact content of the observation to update"),
+        importance: z.number().min(1).max(5).optional()
+          .describe("Importance score 1.0-5.0. Only updated if provided."),
+        contextLayer: z.enum(['L0', 'L1']).nullable().optional()
+          .describe("'L0' = always loaded, 'L1' = session start, null = demote to on-demand (L2). Only updated if key present."),
+        memoryType: z.string().max(50).nullable().optional()
+          .describe("Memory type tag (e.g. 'decision','preference','fact','problem','procedure'). null = unclassified. Only updated if key present."),
+      })).min(1).max(100).describe("Observations to update"),
+    },
+    outputSchema: {
+      updated: z.number().describe("Number of observations actually updated"),
+    }
+  },
+  async ({ updates }) => {
+    const count = await store.setObservationMetadata(updates);
+    const message = count === updates.length
+      ? `Updated metadata on ${count} observation(s).`
+      : `Updated ${count} of ${updates.length} observation(s) (${updates.length - count} not found).`;
+    return {
+      content: [{ type: "text" as const, text: message }],
+      structuredContent: { updated: count },
+    };
+  }
+);
+
+server.registerTool(
+  "get_context_layers",
+  {
+    title: "Get Context Layers",
+    description: "Returns L0 and L1 observations — the 'push' layers that should be restored at session " +
+      "start or after compaction. L0 (~100 token budget) holds core identity and rules that rarely change. " +
+      "L1 (~800 token budget) holds active project context loaded at session start. Observations are " +
+      "sorted by importance (highest first) and truncated at the token budget. Call this from SessionStart " +
+      "and PostCompact hooks to automatically restore critical context.",
+    inputSchema: {
+      projectId: ProjectIdSchema,
+      layers: z.array(z.enum(['L0', 'L1'])).optional()
+        .describe("Which layers to return. Defaults to ['L0', 'L1']. Pass ['L0'] for identity-only."),
+    },
+    outputSchema: {
+      L0: z.array(z.object({
+        entityName: z.string(),
+        content: z.string(),
+        importance: z.number(),
+        memoryType: z.string().nullable(),
+      })).describe("Core identity and rules (always loaded)"),
+      L1: z.array(z.object({
+        entityName: z.string(),
+        content: z.string(),
+        importance: z.number(),
+        memoryType: z.string().nullable(),
+        updatedAt: z.string().optional(),
+      })).describe("Session-start context (active work and decisions)"),
+      tokenEstimate: z.number().describe("Approximate token count (chars / 4)"),
+    }
+  },
+  async ({ projectId, layers }) => {
+    const normalizedProject = normalizeProjectId(projectId);
+    const result = await store.getContextLayers(normalizedProject, layers);
+
+    // Build a human-readable summary for the text content.
+    const l0Count = result.L0.length;
+    const l1Count = result.L1.length;
+    const parts = [];
+    if (l0Count > 0) parts.push(`${l0Count} L0 observation(s)`);
+    if (l1Count > 0) parts.push(`${l1Count} L1 observation(s)`);
+    const summary = parts.length > 0
+      ? `Context layers: ${parts.join(', ')} (~${result.tokenEstimate} tokens)`
+      : 'No L0 or L1 observations found.';
+
+    return {
+      content: [{ type: "text" as const, text: summary }],
+      structuredContent: result as unknown as Record<string, unknown>,
+    };
+  }
+);
+
+server.registerTool(
+  "get_summary",
+  {
+    title: "Get Summary",
+    description: "Returns a concise knowledge graph snapshot for session-start briefings: " +
+      "top observations ranked by importance (then recency), recently updated entities with " +
+      "observation counts, and aggregate stats (totals for entities, observations, relations, projects). " +
+      "Use excludeContextLayers to avoid double-counting observations already loaded by get_context_layers.",
+    inputSchema: {
+      projectId: ProjectIdSchema,
+      excludeContextLayers: z.boolean().optional()
+        .describe("When true, excludes L0/L1 observations from topObservations (to deduplicate with get_context_layers). Default false."),
+      limit: z.number().int().min(1).max(100).optional()
+        .describe("Max number of top observations to return. Default 20."),
+    },
+    outputSchema: {
+      topObservations: z.array(z.object({
+        entityName: z.string(),
+        content: z.string(),
+        importance: z.number(),
+        memoryType: z.string().nullable(),
+        updatedAt: z.string(),
+      })).describe("Highest-importance observations, sorted by importance DESC then recency DESC"),
+      recentEntities: z.array(z.object({
+        name: z.string(),
+        entityType: z.string(),
+        observationCount: z.number(),
+        updatedAt: z.string(),
+      })).describe("5 most recently updated entities with their observation counts"),
+      stats: z.object({
+        totalEntities: z.number(),
+        totalObservations: z.number(),
+        totalRelations: z.number(),
+        projectCount: z.number(),
+      }).describe("Aggregate counts across the knowledge graph"),
+    }
+  },
+  async ({ projectId, excludeContextLayers, limit }) => {
+    const normalizedProject = normalizeProjectId(projectId);
+    const result = await store.getSummary(normalizedProject, excludeContextLayers, limit);
+
+    // Build a human-readable summary for the text content.
+    const obsCount = result.topObservations.length;
+    const entCount = result.recentEntities.length;
+    const { totalEntities, totalObservations, totalRelations, projectCount } = result.stats;
+    const text = `Summary: ${obsCount} top observation(s), ${entCount} recent entit${entCount === 1 ? 'y' : 'ies'}. ` +
+      `Graph totals: ${totalEntities} entities, ${totalObservations} observations, ` +
+      `${totalRelations} relations across ${projectCount} project(s).`;
+
+    return {
+      content: [{ type: "text" as const, text }],
       structuredContent: result as unknown as Record<string, unknown>,
     };
   }

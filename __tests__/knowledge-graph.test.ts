@@ -2264,6 +2264,321 @@ describe.each<[string, string, StoreFactory]>([
 			expect(graph.relations[0].relationType).toBe('knows');
 		});
 	});
+
+	// ----------------------------------------------------------
+	// getContextLayers (v1.1 Task 7)
+	//
+	// Why these tests exist:
+	//   The get_context_layers tool is the "push" mechanism that restores
+	//   critical context at session start / after compaction. Tests verify
+	//   layer filtering, importance sorting, project scoping, L1 token budget
+	//   truncation, and the token estimate calculation. Both backends
+	//   support this method (JSONL filters in-memory, SQLite queries).
+	// ----------------------------------------------------------
+	describe('getContextLayers', () => {
+
+		it('returns empty result when no observations have context layers', async () => {
+			await store.createEntities([
+				{ name: 'Plain', entityType: 'concept', observations: ['no layer assigned'] },
+			]);
+
+			const result = await store.getContextLayers();
+			expect(result.L0).toHaveLength(0);
+			expect(result.L1).toHaveLength(0);
+			expect(result.tokenEstimate).toBe(0);
+		});
+
+		it('returns L0 and L1 observations sorted by importance DESC', async () => {
+			// Create entities with observations, then use addObservations with
+			// metadata to set context layers. Since the shared suite can't call
+			// setObservationMetadata (JSONL throws), we use the Observation object
+			// form in createEntities to set contextLayer directly.
+			await store.createEntities([
+				{
+					name: 'RulesEntity', entityType: 'system',
+					observations: [
+						{ content: 'low importance rule', createdAt: new Date().toISOString(), importance: 2.0, contextLayer: 'L0', memoryType: null },
+						{ content: 'high importance rule', createdAt: new Date().toISOString(), importance: 5.0, contextLayer: 'L0', memoryType: null },
+					],
+				},
+				{
+					name: 'ProjectEntity', entityType: 'project',
+					observations: [
+						{ content: 'active work item', createdAt: new Date().toISOString(), importance: 3.0, contextLayer: 'L1', memoryType: 'milestone' },
+						{ content: 'critical decision', createdAt: new Date().toISOString(), importance: 4.5, contextLayer: 'L1', memoryType: 'decision' },
+					],
+				},
+			]);
+
+			const result = await store.getContextLayers();
+
+			// L0 should have 2 observations, sorted by importance DESC.
+			expect(result.L0).toHaveLength(2);
+			expect(result.L0[0].content).toBe('high importance rule');
+			expect(result.L0[0].importance).toBe(5.0);
+			expect(result.L0[1].content).toBe('low importance rule');
+
+			// L1 should have 2 observations, sorted by importance DESC.
+			expect(result.L1).toHaveLength(2);
+			expect(result.L1[0].content).toBe('critical decision');
+			expect(result.L1[0].importance).toBe(4.5);
+			expect(result.L1[0].memoryType).toBe('decision');
+			expect(result.L1[1].content).toBe('active work item');
+
+			// L1 observations include updatedAt, L0 observations do not.
+			expect(result.L1[0].updatedAt).toBeDefined();
+			expect(result.L0[0].updatedAt).toBeUndefined();
+
+			// Token estimate should be positive.
+			expect(result.tokenEstimate).toBeGreaterThan(0);
+		});
+
+		it('filters by requested layers', async () => {
+			await store.createEntities([
+				{
+					name: 'Mixed', entityType: 'system',
+					observations: [
+						{ content: 'l0 obs', createdAt: new Date().toISOString(), importance: 5.0, contextLayer: 'L0', memoryType: null },
+						{ content: 'l1 obs', createdAt: new Date().toISOString(), importance: 3.0, contextLayer: 'L1', memoryType: null },
+					],
+				},
+			]);
+
+			// Request only L0.
+			const l0Only = await store.getContextLayers(undefined, ['L0']);
+			expect(l0Only.L0).toHaveLength(1);
+			expect(l0Only.L1).toHaveLength(0);
+
+			// Request only L1.
+			const l1Only = await store.getContextLayers(undefined, ['L1']);
+			expect(l1Only.L0).toHaveLength(0);
+			expect(l1Only.L1).toHaveLength(1);
+		});
+
+		it('respects project scoping (includes project + global)', async () => {
+			await store.createEntities([
+				{
+					name: 'GlobalRule', entityType: 'system',
+					observations: [
+						{ content: 'global rule', createdAt: new Date().toISOString(), importance: 5.0, contextLayer: 'L0', memoryType: null },
+					],
+				},
+			]);
+			await store.createEntities([
+				{
+					name: 'ProjectData', entityType: 'project',
+					observations: [
+						{ content: 'project context', createdAt: new Date().toISOString(), importance: 4.0, contextLayer: 'L1', memoryType: null },
+					],
+				},
+			], 'myproject');
+			await store.createEntities([
+				{
+					name: 'OtherProject', entityType: 'project',
+					observations: [
+						{ content: 'other context', createdAt: new Date().toISOString(), importance: 4.0, contextLayer: 'L1', memoryType: null },
+					],
+				},
+			], 'otherproject');
+
+			// Query with 'myproject' — should see GlobalRule (global) + ProjectData, not OtherProject.
+			const result = await store.getContextLayers('myproject');
+			expect(result.L0).toHaveLength(1);
+			expect(result.L0[0].content).toBe('global rule');
+			expect(result.L1).toHaveLength(1);
+			expect(result.L1[0].content).toBe('project context');
+		});
+
+		it('excludes L2 (null context_layer) observations', async () => {
+			await store.createEntities([
+				{
+					name: 'MixedLayers', entityType: 'concept',
+					observations: [
+						{ content: 'l0 obs', createdAt: new Date().toISOString(), importance: 5.0, contextLayer: 'L0', memoryType: null },
+						{ content: 'l2 default obs', createdAt: new Date().toISOString(), importance: 3.0, contextLayer: null, memoryType: null },
+					],
+				},
+			]);
+
+			const result = await store.getContextLayers();
+			// Only the L0 observation should appear — L2 (null) is excluded.
+			expect(result.L0).toHaveLength(1);
+			expect(result.L1).toHaveLength(0);
+		});
+
+		it('truncates L1 at character budget', async () => {
+			// Create an entity with many L1 observations that collectively exceed
+			// the ~3200 char budget. Each observation is ~200 chars + entity name.
+			const longContent = 'A'.repeat(190);
+			const observations = [];
+			for (let i = 0; i < 20; i++) {
+				observations.push({
+					content: `${longContent} #${i}`,
+					createdAt: new Date().toISOString(),
+					importance: 3.0,
+					contextLayer: 'L1' as const,
+					memoryType: null,
+				});
+			}
+
+			await store.createEntities([
+				{ name: 'BudgetTest', entityType: 'concept', observations },
+			]);
+
+			const result = await store.getContextLayers();
+
+			// 20 observations * ~200 chars each = ~4000 chars. Budget is ~3200.
+			// Should be truncated — fewer than 20 L1 observations returned.
+			expect(result.L1.length).toBeLessThan(20);
+			expect(result.L1.length).toBeGreaterThan(0);
+		});
+	});
+
+	// getSummary (v1.1 Task 9)
+	// Tests the session-start briefing snapshot — parameterized across both backends
+	// since JSONL supports this via in-memory scanning.
+	describe('getSummary', () => {
+		it('returns empty result for empty graph', async () => {
+			const result = await store.getSummary();
+			expect(result.topObservations).toEqual([]);
+			expect(result.recentEntities).toEqual([]);
+			expect(result.stats).toEqual({
+				totalEntities: 0,
+				totalObservations: 0,
+				totalRelations: 0,
+				projectCount: 0,
+			});
+		});
+
+		it('sorts topObservations by importance DESC then recency DESC', async () => {
+			// Create entities with observations at varying importance levels
+			await store.createEntities([
+				{ name: 'Low', entityType: 'concept', observations: [
+					{ content: 'low importance', createdAt: '2026-01-01T00:00:00.000Z', importance: 1.0, contextLayer: null, memoryType: null },
+				] },
+				{ name: 'High', entityType: 'concept', observations: [
+					{ content: 'high importance', createdAt: '2026-01-01T00:00:00.000Z', importance: 5.0, contextLayer: null, memoryType: null },
+				] },
+				{ name: 'Medium', entityType: 'concept', observations: [
+					{ content: 'medium importance', createdAt: '2026-01-02T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: null },
+				] },
+				{ name: 'MediumOlder', entityType: 'concept', observations: [
+					{ content: 'medium older', createdAt: '2026-01-01T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: null },
+				] },
+			]);
+
+			const result = await store.getSummary();
+
+			// High (5.0) first, then Medium (3.0, newer) and MediumOlder (3.0, older), then Low (1.0)
+			expect(result.topObservations.length).toBe(4);
+			expect(result.topObservations[0].content).toBe('high importance');
+			expect(result.topObservations[0].importance).toBe(5.0);
+			expect(result.topObservations[1].content).toBe('medium importance');
+			expect(result.topObservations[3].content).toBe('low importance');
+		});
+
+		it('returns recently updated entities with observation counts', async () => {
+			// Create some entities, second one with multiple observations
+			await store.createEntities([
+				{ name: 'Single', entityType: 'test', observations: ['one obs'] },
+				{ name: 'Multi', entityType: 'test', observations: ['obs1', 'obs2', 'obs3'] },
+			]);
+
+			const result = await store.getSummary();
+
+			// Both entities should appear in recentEntities
+			expect(result.recentEntities.length).toBe(2);
+			// Find each entity by name to check observationCount
+			const single = result.recentEntities.find(e => e.name === 'Single');
+			const multi = result.recentEntities.find(e => e.name === 'Multi');
+			expect(single).toBeDefined();
+			expect(single!.observationCount).toBe(1);
+			expect(multi).toBeDefined();
+			expect(multi!.observationCount).toBe(3);
+		});
+
+		it('respects limit parameter for topObservations', async () => {
+			// Create 5 entities with observations
+			const entities = [];
+			for (let i = 0; i < 5; i++) {
+				entities.push({
+					name: `Entity${i}`, entityType: 'concept',
+					observations: [`obs for entity ${i}`],
+				});
+			}
+			await store.createEntities(entities);
+
+			const result = await store.getSummary(undefined, undefined, 2);
+
+			// Should only return 2 top observations even though 5 exist
+			expect(result.topObservations.length).toBe(2);
+			// Stats should still reflect the full graph
+			expect(result.stats.totalEntities).toBe(5);
+			expect(result.stats.totalObservations).toBe(5);
+		});
+
+		it('filters by project scope', async () => {
+			// Create entities in different projects and globally
+			await store.createEntities([
+				{ name: 'InProject', entityType: 'test', observations: ['project obs'] },
+			], 'myproject');
+			await store.createEntities([
+				{ name: 'Global', entityType: 'test', observations: ['global obs'] },
+			]);
+			await store.createEntities([
+				{ name: 'Other', entityType: 'test', observations: ['other obs'] },
+			], 'otherproject');
+
+			const result = await store.getSummary('myproject');
+
+			// Should see InProject + Global, NOT Other
+			const obsEntities = result.topObservations.map(o => o.entityName);
+			expect(obsEntities).toContain('InProject');
+			expect(obsEntities).toContain('Global');
+			expect(obsEntities).not.toContain('Other');
+		});
+
+		it('excludeContextLayers omits L0/L1 observations', async () => {
+			// Create observations at different context layers
+			await store.createEntities([
+				{ name: 'Mixed', entityType: 'concept', observations: [
+					{ content: 'always loaded', createdAt: '2026-01-01T00:00:00.000Z', importance: 5.0, contextLayer: 'L0', memoryType: null },
+					{ content: 'session start', createdAt: '2026-01-01T00:00:00.000Z', importance: 4.0, contextLayer: 'L1', memoryType: null },
+					{ content: 'on demand', createdAt: '2026-01-01T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: null },
+				] },
+			]);
+
+			// Without excludeContextLayers — all 3 observations
+			const full = await store.getSummary();
+			expect(full.topObservations.length).toBe(3);
+
+			// With excludeContextLayers — only the null (L2/on-demand) observation
+			const filtered = await store.getSummary(undefined, true);
+			expect(filtered.topObservations.length).toBe(1);
+			expect(filtered.topObservations[0].content).toBe('on demand');
+		});
+
+		it('returns correct aggregate stats', async () => {
+			// Build a small graph with known counts
+			await store.createEntities([
+				{ name: 'A', entityType: 'test', observations: ['a1', 'a2'] },
+				{ name: 'B', entityType: 'test', observations: ['b1'] },
+			], 'proj1');
+			await store.createEntities([
+				{ name: 'C', entityType: 'test', observations: ['c1'] },
+			], 'proj2');
+			await store.createRelations([
+				{ from: 'A', to: 'B', relationType: 'knows' },
+			]);
+
+			const result = await store.getSummary();
+
+			expect(result.stats.totalEntities).toBe(3);
+			expect(result.stats.totalObservations).toBe(4);
+			expect(result.stats.totalRelations).toBe(1);
+			expect(result.stats.projectCount).toBe(2);
+		});
+	});
 });
 
 // ============================================================
@@ -3266,6 +3581,241 @@ describe('SqliteStore-specific', () => {
 	});
 
 	// ----------------------------------------------------------
+	// setObservationMetadata (v1.1 Task 8)
+	//
+	// Why these tests exist:
+	//   The set_observation_metadata tool updates importance, context_layer,
+	//   and memory_type on existing active observations WITHOUT superseding
+	//   them. It preserves content, timestamps, and embeddings. These tests
+	//   cover each metadata field independently, multi-field updates, error
+	//   cases (entity not found, observation not found), and entity name
+	//   resolution via surface variants (normalized_name).
+	// ----------------------------------------------------------
+	describe('setObservationMetadata', () => {
+
+		it('updates importance without changing content or timestamps', async () => {
+			// Create an entity with a known observation.
+			await store.createEntities([
+				{ name: 'MetaTest', entityType: 'concept', observations: ['first fact'] },
+			]);
+
+			// Capture the original observation to compare timestamps later.
+			const before = await store.readGraph();
+			const obsBefore = before.entities[0].observations[0];
+			expect(obsBefore.importance).toBe(3.0); // default importance
+
+			// Bump importance to 5.0 (critical).
+			const updated = await store.setObservationMetadata([
+				{ entityName: 'MetaTest', content: 'first fact', importance: 5.0 },
+			]);
+			expect(updated).toBe(1);
+
+			// Read back and verify: importance changed, content and createdAt untouched.
+			const after = await store.readGraph();
+			const obsAfter = after.entities[0].observations[0];
+			expect(obsAfter.importance).toBe(5.0);
+			expect(obsAfter.content).toBe('first fact');
+			expect(obsAfter.createdAt).toBe(obsBefore.createdAt);
+		});
+
+		it('promotes an observation to L0 context layer', async () => {
+			await store.createEntities([
+				{ name: 'LayerTest', entityType: 'concept', observations: ['core identity'] },
+			]);
+
+			// Default context_layer is null (L2, on-demand).
+			const before = await store.readGraph();
+			expect(before.entities[0].observations[0].contextLayer).toBeNull();
+
+			// Promote to L0 (always loaded).
+			const updated = await store.setObservationMetadata([
+				{ entityName: 'LayerTest', content: 'core identity', contextLayer: 'L0' },
+			]);
+			expect(updated).toBe(1);
+
+			const after = await store.readGraph();
+			expect(after.entities[0].observations[0].contextLayer).toBe('L0');
+		});
+
+		it('demotes an observation from L1 to L2 (null)', async () => {
+			await store.createEntities([
+				{ name: 'DemoteTest', entityType: 'concept', observations: ['session data'] },
+			]);
+
+			// First promote to L1.
+			await store.setObservationMetadata([
+				{ entityName: 'DemoteTest', content: 'session data', contextLayer: 'L1' },
+			]);
+			const promoted = await store.readGraph();
+			expect(promoted.entities[0].observations[0].contextLayer).toBe('L1');
+
+			// Now demote back to L2 by passing contextLayer: null explicitly.
+			const updated = await store.setObservationMetadata([
+				{ entityName: 'DemoteTest', content: 'session data', contextLayer: null },
+			]);
+			expect(updated).toBe(1);
+
+			const after = await store.readGraph();
+			expect(after.entities[0].observations[0].contextLayer).toBeNull();
+		});
+
+		it('sets memory type tag', async () => {
+			await store.createEntities([
+				{ name: 'TypeTest', entityType: 'concept', observations: ['a decision we made'] },
+			]);
+
+			const updated = await store.setObservationMetadata([
+				{ entityName: 'TypeTest', content: 'a decision we made', memoryType: 'decision' },
+			]);
+			expect(updated).toBe(1);
+
+			const after = await store.readGraph();
+			expect(after.entities[0].observations[0].memoryType).toBe('decision');
+		});
+
+		it('updates multiple fields in a single call', async () => {
+			await store.createEntities([
+				{ name: 'MultiField', entityType: 'concept', observations: ['important rule'] },
+			]);
+
+			const updated = await store.setObservationMetadata([{
+				entityName: 'MultiField',
+				content: 'important rule',
+				importance: 4.5,
+				contextLayer: 'L1',
+				memoryType: 'preference',
+			}]);
+			expect(updated).toBe(1);
+
+			const after = await store.readGraph();
+			const obs = after.entities[0].observations[0];
+			expect(obs.importance).toBe(4.5);
+			expect(obs.contextLayer).toBe('L1');
+			expect(obs.memoryType).toBe('preference');
+		});
+
+		it('throws when entity is not found', async () => {
+			// No entities created — "Ghost" doesn't exist.
+			await expect(
+				store.setObservationMetadata([
+					{ entityName: 'Ghost', content: 'anything', importance: 2.0 },
+				])
+			).rejects.toThrow(/not found/);
+		});
+
+		it('returns 0 when observation content is not found on existing entity', async () => {
+			await store.createEntities([
+				{ name: 'MissingObs', entityType: 'concept', observations: ['real content'] },
+			]);
+
+			// Ask to update an observation that doesn't exist on this entity.
+			const updated = await store.setObservationMetadata([
+				{ entityName: 'MissingObs', content: 'nonexistent content', importance: 5.0 },
+			]);
+			expect(updated).toBe(0);
+		});
+
+		it('resolves entity name via surface variant (normalized_name lookup)', async () => {
+			// Create under one surface form.
+			await store.createEntities([
+				{ name: 'My Project', entityType: 'project', observations: ['launched'] },
+			]);
+
+			// Update using a different surface form — should find the same entity
+			// via normalized_name lookup (both normalize to "myproject").
+			const updated = await store.setObservationMetadata([
+				{ entityName: 'my-project', content: 'launched', importance: 4.0 },
+			]);
+			expect(updated).toBe(1);
+
+			const after = await store.readGraph();
+			expect(after.entities[0].observations[0].importance).toBe(4.0);
+		});
+
+		it('bumps entity updated_at when observations are modified', async () => {
+			await store.createEntities([
+				{ name: 'TimestampBump', entityType: 'concept', observations: ['data point'] },
+			]);
+
+			const before = await store.readGraph();
+			const updatedAtBefore = before.entities[0].updatedAt;
+
+			// Small delay so timestamps differ.
+			await new Promise(resolve => setTimeout(resolve, 10));
+
+			await store.setObservationMetadata([
+				{ entityName: 'TimestampBump', content: 'data point', importance: 1.0 },
+			]);
+
+			const after = await store.readGraph();
+			const updatedAtAfter = after.entities[0].updatedAt;
+
+			// Entity updated_at should have been bumped.
+			expect(updatedAtAfter > updatedAtBefore).toBe(true);
+		});
+
+		it('does not bump entity updated_at when no observations match', async () => {
+			await store.createEntities([
+				{ name: 'NoBump', entityType: 'concept', observations: ['real'] },
+			]);
+
+			const before = await store.readGraph();
+			const updatedAtBefore = before.entities[0].updatedAt;
+
+			await store.setObservationMetadata([
+				{ entityName: 'NoBump', content: 'nonexistent', importance: 1.0 },
+			]);
+
+			const after = await store.readGraph();
+			expect(after.entities[0].updatedAt).toBe(updatedAtBefore);
+		});
+
+		it('skips superseded observations (only updates active ones)', async () => {
+			await store.createEntities([
+				{ name: 'SupersededMeta', entityType: 'concept', observations: ['old fact'] },
+			]);
+
+			// Supersede the observation — "old fact" is now retired.
+			await store.supersedeObservations([
+				{ entityName: 'SupersededMeta', oldContent: 'old fact', newContent: 'new fact' },
+			]);
+
+			// Try to update metadata on the superseded observation — should get 0.
+			const updated = await store.setObservationMetadata([
+				{ entityName: 'SupersededMeta', content: 'old fact', importance: 5.0 },
+			]);
+			expect(updated).toBe(0);
+
+			// The active observation should still have default importance.
+			const graph = await store.readGraph();
+			const obs = graph.entities[0].observations[0];
+			expect(obs.content).toBe('new fact');
+			expect(obs.importance).toBe(3.0);
+		});
+
+		it('handles batch updates across multiple entities', async () => {
+			await store.createEntities([
+				{ name: 'BatchA', entityType: 'concept', observations: ['fact a'] },
+				{ name: 'BatchB', entityType: 'concept', observations: ['fact b'] },
+			]);
+
+			const updated = await store.setObservationMetadata([
+				{ entityName: 'BatchA', content: 'fact a', importance: 5.0, contextLayer: 'L0' },
+				{ entityName: 'BatchB', content: 'fact b', memoryType: 'fact' },
+			]);
+			expect(updated).toBe(2);
+
+			const graph = await store.readGraph();
+			const entityA = graph.entities.find(e => e.name === 'BatchA')!;
+			const entityB = graph.entities.find(e => e.name === 'BatchB')!;
+
+			expect(entityA.observations[0].importance).toBe(5.0);
+			expect(entityA.observations[0].contextLayer).toBe('L0');
+			expect(entityB.observations[0].memoryType).toBe('fact');
+		});
+	});
+
+	// ----------------------------------------------------------
 	// Layer 1 entity name normalization (Phase B Task 3b, schema v8)
 	//
 	// Why these tests exist:
@@ -3479,6 +4029,71 @@ describe('SqliteStore-specific', () => {
 					{ name: '---', entityType: 'test', observations: [] },
 				])
 			).rejects.toThrow(/no content after normalization|cannot be empty/);
+		});
+
+		it('searchNodes matches by normalized_name when display name differs (#55)', async () => {
+			// Create an entity whose display name is "Dustin-Space" — the
+			// normalized form is "dustinspace". Searching for "dustinspace"
+			// should hit the normalized_name column even though that substring
+			// does not appear in the display name.
+			await store.createEntities([
+				{ name: 'Dustin-Space', entityType: 'project', observations: ['the main site'] },
+			]);
+
+			// Search by the raw normalized form — should match via normalized_name LIKE
+			const result1 = await store.searchNodes('dustinspace');
+			expect(result1.entities).toHaveLength(1);
+			expect(result1.entities[0].name).toBe('Dustin-Space');
+
+			// Search by a variant that normalizes the same — "dustin space"
+			// The LIKE on display name would match (contains "dustin" and "space")
+			// but test with exact normalized form to prove the column is searched.
+			const result2 = await store.searchNodes('dustinspace');
+			expect(result2.entities.length).toBeGreaterThanOrEqual(1);
+			expect(result2.entities[0].name).toBe('Dustin-Space');
+
+			// Search by a prefix that only appears in the normalized form —
+			// "dustins" appears in "dustinspace" but not in "Dustin-Space" (hyphen breaks it)
+			const result3 = await store.searchNodes('dustins');
+			expect(result3.entities).toHaveLength(1);
+			expect(result3.entities[0].name).toBe('Dustin-Space');
+		});
+
+		it('searchNodes matches surface variant queries against normalized_name (#55)', async () => {
+			// A query like "DUSTIN SPACE" should match entity "Dustin-Space" because
+			// both normalize to "dustinspace". The query is normalized and matched
+			// against the normalized_name column.
+			await store.createEntities([
+				{ name: 'Dustin-Space', entityType: 'project', observations: ['astrophotography site'] },
+				{ name: 'unrelated', entityType: 'other', observations: ['nothing to do with dustin'] },
+			]);
+
+			// Query with different separator style — should still find it via normalized match.
+			const result = await store.searchNodes('DUSTIN SPACE');
+			const names = result.entities.map(e => e.name);
+			expect(names).toContain('Dustin-Space');
+		});
+
+		it('openNodes includes relations when both active endpoints are in the result set (#55 regression)', async () => {
+			// Two entities with a relation, both active, project-scoped.
+			// This is the baseline — should always work. Including it as
+			// a regression pin so any future entityNameSet changes don't
+			// break the happy path.
+			await store.createEntities([
+				{ name: 'Service-A', entityType: 'service', observations: ['runs on port 3000'], project: 'myproj' },
+				{ name: 'Service-B', entityType: 'service', observations: ['runs on port 4000'], project: 'myproj' },
+			]);
+			await store.createRelations([
+				{ from: 'Service-A', to: 'Service-B', relationType: 'calls' },
+			]);
+
+			// Open both entities in project scope
+			const result = await store.openNodes(['Service-A', 'Service-B'], 'myproj');
+			expect(result.entities).toHaveLength(2);
+			// The relation should be included — both endpoints are in the result set.
+			expect(result.relations).toHaveLength(1);
+			expect(result.relations[0].from).toBe('Service-A');
+			expect(result.relations[0].to).toBe('Service-B');
 		});
 
 		it('NFC unicode equivalents collapse to the same identity', async () => {

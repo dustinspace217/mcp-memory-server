@@ -47,7 +47,7 @@ This section exists so any future Claude session opening this project sees the *
 
 The server is split across 6 source files:
 
-### `types.ts` (~225 lines)
+### `types.ts` (~330 lines)
 - Defines the `Entity`, `Relation`, `KnowledgeGraph`, and `Observation` types
 - `RelationInput` type: 3-field input (from, to, relationType) for creating/deleting relations — callers never construct temporal fields
 - `Relation` type: 5-field output (from, to, relationType, createdAt, supersededAt) — temporal fields are system-managed
@@ -57,6 +57,8 @@ The server is split across 6 source files:
 - `CreateEntitiesResult` and `SkippedEntity` types — collision reporting when entity names already exist
 - `PaginationParams`, `PaginatedKnowledgeGraph`, `InvalidCursorError` types for cursor-based pagination
 - `SupersedeInput` type: `{ entityName, oldContent, newContent }` for observation supersede operations
+- `SetObservationMetadataInput` type: `{ entityName, content, importance?, contextLayer?, memoryType? }` — updates metadata on active observations without superseding. Uses `'key in object'` checks to distinguish "omitted" from "explicitly null".
+- `ContextLayerObservation` and `ContextLayersResult` types — return types for `getContextLayers()`. L0 observations omit `updatedAt`, L1 includes it. `tokenEstimate` is chars / 4.
 - `TimelineObservation`, `TimelineRelation`, `EntityTimelineResult` types for full entity history (active + superseded items with computed `status` field)
 - `SimilarObservation` type: `{ content, similarity }` returned when newly added observations are semantically close to existing ones (cosine > 0.85)
 - `AddObservationResult` includes optional `similarExisting?: SimilarObservation[]` for similarity warnings
@@ -66,6 +68,9 @@ The server is split across 6 source files:
 - `invalidateRelations(relations: InvalidateRelationInput[])` — marks relations as superseded (idempotent)
 - `entityTimeline(entityName, projectId?)` — returns full history including superseded observations and invalidated relations
 - `supersedeObservations(supersessions: SupersedeInput[])` method on `GraphStore` — atomically retires old observations and inserts replacements
+- `getContextLayers(projectId?, layers?)` method on `GraphStore` — returns L0/L1 observations with token budget enforcement
+- `getSummary(projectId?, excludeContextLayers?, limit?)` method on `GraphStore` — returns session-start briefing snapshot: top observations by importance, recently updated entities, aggregate stats
+- `setObservationMetadata(updates: SetObservationMetadataInput[])` method on `GraphStore` — updates importance/contextLayer/memoryType in-place on active observations; returns count updated
 - Updated `GraphStore.readGraph` and `GraphStore.searchNodes` signatures accept `PaginationParams` and return `PaginatedKnowledgeGraph`
 - `Observation` type: `{ content: string; createdAt: string }` — each observation carries an ISO 8601 UTC timestamp (or `'unknown'` for data migrated from old string format)
 
@@ -96,10 +101,11 @@ The server is split across 6 source files:
 - `EMBEDDING_DIM = 384` constant (matches all-MiniLM-L6-v2 output dimensionality)
 - Model: `Xenova/all-MiniLM-L6-v2` ONNX — ~23MB download on first use, cached thereafter
 
-### `jsonl-store.ts` (~655 lines) — DEPRECATED
+### `jsonl-store.ts` (~700 lines) — DEPRECATED
 - `JsonlStore` class: JSONL flat-file backend — **deprecated**, maintained only for environments without C build tools
-- Does NOT support: vector search, temporal relations, entity timeline, invalidate_relations, similarity check
-- `invalidateRelations()` and `entityTimeline()` throw "not supported in JSONL backend"
+- Does NOT support: vector search, temporal relations, entity timeline, invalidate_relations, similarity check, setObservationMetadata
+- `invalidateRelations()`, `entityTimeline()`, and `setObservationMetadata()` throw "not supported in JSONL backend"
+- `getContextLayers()` IS supported — filters observations in-memory (no vector search or index needed)
 - Implements the `GraphStore` interface
 - Optional `project` field on entity JSONL lines (`null`/missing = global)
 - `updatedAt` and `createdAt` fields serialized/deserialized with sentinel fallback for legacy files
@@ -110,7 +116,7 @@ The server is split across 6 source files:
 - In-memory cursor-based pagination with entity name as tiebreaker
 - Imports cursor utilities from `cursor.ts`
 
-### `sqlite-store.ts` (~2500 lines)
+### `sqlite-store.ts` (~2650 lines)
 - `SqliteStore` class: SQLite backend using `better-sqlite3`
 - Implements the `GraphStore` interface
 - **Schema version tracking**: `schema_version` table with `CHECK(id=1)` single-row constraint. Versions 1–8 tracked. Legacy databases detected via column existence heuristics and assigned an initial version. All migrations run in sequence on startup.
@@ -140,8 +146,8 @@ The server is split across 6 source files:
 - Cursor-based keyset pagination on `(updated_at DESC, id DESC)` — imports cursor utilities from `cursor.ts`
 - `openNodes` uses IN-clause chunking (CHUNK_SIZE=900) for consistency with other methods
 
-### `index.ts` (~543 lines)
-- Entry point: registers 13 MCP tools via `server.registerTool()`
+### `index.ts` (~760 lines)
+- Entry point: registers 16 MCP tools via `server.registerTool()`
 - `StoreConfig` type and `ensureMemoryFilePath()`: resolves the storage path from `MEMORY_FILE_PATH` env var and returns which store class to use
   - `.jsonl` extension → `JsonlStore`
   - `.db` or `.sqlite` extension → `SqliteStore`
@@ -158,6 +164,9 @@ The server is split across 6 source files:
 - `supersede_observations` tool atomically retires old observations and inserts replacements via `store.supersedeObservations()`
 - `invalidate_relations` tool marks relations as superseded (idempotent — ignores already-invalidated)
 - `entity_timeline` tool returns full history of an entity (active + superseded observations and relations with computed status field)
+- `set_observation_metadata` tool updates importance, context layer, and/or memory type on existing active observations without superseding them. Resolves entity names via normalized_name lookup. Returns count of observations updated.
+- `get_context_layers` tool returns L0 and L1 observations sorted by importance DESC. Enforces soft token budgets (~100 tokens L0, ~800 tokens L1). Designed for SessionStart/PostCompact hooks. Supports project scoping and layer filtering.
+- `get_summary` tool returns a session-start briefing snapshot: top observations by importance DESC then recency DESC, 5 most recently updated entities with observation counts, and aggregate stats (total entities/observations/relations/projects). `excludeContextLayers` boolean omits L0/L1 observations for dedup with `get_context_layers`. `limit` caps top observations (default 20).
 - `add_observations` response includes optional `similarExisting` field with similarity warnings (cosine > 0.85)
 - `RelationInputSchema` (3-field input) and `RelationOutputSchema` (5-field with temporal columns) — separate schemas for input validation vs. output serialization
 - SIGINT/SIGTERM handlers call `store.shutdown()` for graceful embedding sweep termination before `store.close()`
@@ -204,9 +213,9 @@ Database schema is versioned in the single-row `schema_version` table (CHECK con
 - **v6→v7:** Soft-delete on entities — `superseded_at TEXT NOT NULL DEFAULT ''` column, partial unique index `idx_entities_name_active ON entities(name) WHERE superseded_at = ''`. FK clauses on `relations.from_entity`/`to_entity` are dropped in this migration because partial unique indexes don't qualify as FK targets in SQLite.
 - **v7→v8:** Entity name normalization — adds `normalized_name` column on entities (the identity key), rewrites `relations.from_entity`/`to_entity` to normalized form, drops `idx_entities_name_active`, creates `idx_entities_normalized_active ON entities(normalized_name) WHERE superseded_at = ''`. Collision check before index creation aborts the migration (rollback) if two active rows normalize to the same key, naming both display forms and the collision key. Wrapped with `PRAGMA foreign_keys = OFF/ON` (outside the transaction) to tolerate historical databases that arrived at v7 with stale FK clauses still attached; integrity is enforced by an explicit orphan check inside the migration.
 
-## Tests (444 total across 8 test files)
-- `__tests__/knowledge-graph.test.ts` (311 tests) — parameterized suite (`describe.each`) running shared behavioral tests against both `JsonlStore` and `SqliteStore`, covering all CRUD operations, deduplication, composite key safety, search, edge cases, observation timestamps, normalizeObservation validation, atomic writes (JSONL), idempotent delete edge cases, project filtering, cursor-based pagination, supersedeObservations, temporal relations (createdAt/supersededAt on relations, invalidateRelations, entityTimeline), similarity check, totalCount accuracy, entity name normalization behavioral tests. Plus JSONL-specific and SQLite-specific tests (including `entity name normalization (Layer 1)` block exercising surface variants on create/read/delete/supersede/invalidate/timeline).
-- `__tests__/mcp-tools.test.ts` (71 tests) — integration tests for MCP tool handlers including invalidate_relations, entity_timeline, and normalization at the tool boundary
+## Tests (496 total across 8 test files)
+- `__tests__/knowledge-graph.test.ts` (352 tests) — parameterized suite (`describe.each`) running shared behavioral tests against both `JsonlStore` and `SqliteStore`, covering all CRUD operations, deduplication, composite key safety, search, edge cases, observation timestamps, normalizeObservation validation, atomic writes (JSONL), idempotent delete edge cases, project filtering, cursor-based pagination, supersedeObservations, temporal relations (createdAt/supersededAt on relations, invalidateRelations, entityTimeline), similarity check, totalCount accuracy, entity name normalization behavioral tests, setObservationMetadata (importance/contextLayer/memoryType updates, entity not found, observation not found, surface variant lookup, timestamp bumps, superseded exclusion, batch updates), getContextLayers (empty result, importance sorting, layer filtering, project scoping, L2 exclusion, L1 token budget truncation), getSummary (empty result, importance+recency sorting, observation counts, limit param, project scoping, excludeContextLayers, aggregate stats). Plus JSONL-specific and SQLite-specific tests (including `entity name normalization (Layer 1)` block exercising surface variants on create/read/delete/supersede/invalidate/timeline).
+- `__tests__/mcp-tools.test.ts` (78 tests) — integration tests for MCP tool handlers including invalidate_relations, entity_timeline, normalization at the tool boundary, set_observation_metadata Zod schema validation (name normalization, importance range, contextLayer enum, null demotion), and get_summary Zod schema validation (limit range, valid input acceptance)
 - `__tests__/normalize-name.test.ts` (17 tests) — unit tests for `normalizeEntityName()`: NFC equivalence, case fold, separator stripping, Turkish dotted-I behavior, empty/whitespace/separator-only rejection
 - `__tests__/file-path.test.ts` (16 tests) — `StoreConfig` return type, extension routing (.jsonl / .db / .sqlite / default), and legacy .json→.jsonl migration
 - `__tests__/migration.test.ts` (5 tests) — JSONL→SQLite auto-migration: data transfer, .jsonl.bak rename, idempotency when .db already exists, empty JSONL file handling
@@ -215,7 +224,7 @@ Database schema is versioned in the single-row `schema_version` table (CHECK con
 - `__tests__/vector-integration.test.ts` (6 tests) — end-to-end tests with real embedding model: semantic search, LIKE+vector dedup, superseded observation exclusion, similarExisting check, as_of recovery of superseded matches, soft-deleted entity exclusion. Skip with `SKIP_VECTOR_INTEGRATION=1`.
 - `__tests__/smoke-test-vec.ts` — one-off script (not a vitest test) validating sqlite-vec + better-sqlite3 + @huggingface/transformers compatibility on this platform
 
-**Test pool discipline:** The suite runs in two commands. Pool 1 (non-vector, 438 tests): `MEMORY_VECTOR_SEARCH=off SKIP_VECTOR_INTEGRATION=1 npx vitest run --exclude '**/vector-integration.test.ts'`. Pool 2 (vector integration, 6 tests): `MEMORY_VECTOR_SEARCH=on npx vitest run __tests__/vector-integration.test.ts --pool=forks --poolOptions.forks.singleFork=true`. See `feedback_local_llm_test_pool_discipline.md` for the reasoning (the local ONNX model load must be isolated and single-fork to avoid hard-reboots).
+**Test pool discipline:** The suite runs in two commands. Pool 1 (non-vector, 490 tests): `MEMORY_VECTOR_SEARCH=off SKIP_VECTOR_INTEGRATION=1 npx vitest run --exclude '**/vector-integration.test.ts'`. Pool 2 (vector integration, 6 tests): `MEMORY_VECTOR_SEARCH=on npx vitest run __tests__/vector-integration.test.ts --pool=forks --poolOptions.forks.singleFork=true`. See `feedback_local_llm_test_pool_discipline.md` for the reasoning (the local ONNX model load must be isolated and single-fork to avoid hard-reboots).
 
 ## Version History
 - **v1.0.0** — Temporal relations (superseded_at on relations, invalidate_relations + entity_timeline tools), similarity check on addObservations, schema version tracking (versions 1–5), graceful shutdown, totalCount fix, JSONL backend deprecated

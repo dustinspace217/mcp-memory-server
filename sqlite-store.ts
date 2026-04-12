@@ -26,6 +26,12 @@ import {
   type PaginationParams,
   type PaginatedKnowledgeGraph,
   type SupersedeInput,
+  type SetObservationMetadataInput,
+  type ContextLayersResult,
+  type ContextLayerObservation,
+  type SummaryResult,
+  type SummaryObservation,
+  type SummaryEntity,
   type EntityTimelineResult,
   type TimelineObservation,
   type TimelineRelation,
@@ -350,10 +356,15 @@ export class SqliteStore implements GraphStore {
       //   the nature of the observation (e.g., 'decision', 'preference', 'fact',
       //   'problem', 'milestone', 'emotional'). Enables type-filtered queries.
       // All three are simple column additions with no table rebuild or data backfill.
-      this.db.prepare(`ALTER TABLE observations ADD COLUMN importance REAL NOT NULL DEFAULT 3.0`).run();
-      this.db.prepare(`ALTER TABLE observations ADD COLUMN context_layer TEXT DEFAULT NULL`).run();
-      this.db.prepare(`ALTER TABLE observations ADD COLUMN memory_type TEXT DEFAULT NULL`).run();
-      this.db.prepare('UPDATE schema_version SET version = 6').run();
+      // Wrapped in a transaction so a crash between ALTER TABLEs doesn't leave the
+      // schema half-migrated (columns added but version not bumped → next startup
+      // retries and hits "duplicate column" errors).
+      this.db.transaction(() => {
+        this.db.prepare(`ALTER TABLE observations ADD COLUMN importance REAL NOT NULL DEFAULT 3.0`).run();
+        this.db.prepare(`ALTER TABLE observations ADD COLUMN context_layer TEXT DEFAULT NULL`).run();
+        this.db.prepare(`ALTER TABLE observations ADD COLUMN memory_type TEXT DEFAULT NULL`).run();
+        this.db.prepare('UPDATE schema_version SET version = 6').run();
+      })();
       currentVersion = 6;
     }
 
@@ -396,54 +407,54 @@ export class SqliteStore implements GraphStore {
       // Each DDL statement uses this.db.prepare(...).run() individually rather than
       // a single multi-statement string — same workaround as in
       // __tests__/migration-validation.test.ts (see comment at line 451).
-      this.db.pragma('foreign_keys = OFF');
-      this.db.transaction(() => {
-        // Part 1: rebuild entities
-        this.db.prepare(`
-          CREATE TABLE entities_new (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            name          TEXT NOT NULL,
-            entity_type   TEXT NOT NULL,
-            project       TEXT,
-            updated_at    TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
-            created_at    TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
-            superseded_at TEXT NOT NULL DEFAULT ''
-          )
-        `).run();
-        this.db.prepare(`
-          INSERT INTO entities_new (id, name, entity_type, project, updated_at, created_at, superseded_at)
-          SELECT id, name, entity_type, project, updated_at, created_at, '' FROM entities
-        `).run();
-        this.db.prepare(`DROP TABLE entities`).run();
-        this.db.prepare(`ALTER TABLE entities_new RENAME TO entities`).run();
-        this.db.prepare(`
-          CREATE UNIQUE INDEX idx_entities_name_active ON entities(name) WHERE superseded_at = ''
-        `).run();
+      this.withForeignKeysDisabled(() => {
+        this.db.transaction(() => {
+          // Part 1: rebuild entities
+          this.db.prepare(`
+            CREATE TABLE entities_new (
+              id            INTEGER PRIMARY KEY AUTOINCREMENT,
+              name          TEXT NOT NULL,
+              entity_type   TEXT NOT NULL,
+              project       TEXT,
+              updated_at    TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+              created_at    TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+              superseded_at TEXT NOT NULL DEFAULT ''
+            )
+          `).run();
+          this.db.prepare(`
+            INSERT INTO entities_new (id, name, entity_type, project, updated_at, created_at, superseded_at)
+            SELECT id, name, entity_type, project, updated_at, created_at, '' FROM entities
+          `).run();
+          this.db.prepare(`DROP TABLE entities`).run();
+          this.db.prepare(`ALTER TABLE entities_new RENAME TO entities`).run();
+          this.db.prepare(`
+            CREATE UNIQUE INDEX idx_entities_name_active ON entities(name) WHERE superseded_at = ''
+          `).run();
 
-        // Part 2: rebuild relations to drop the FK references to entities(name).
-        // New schema preserves all columns and the UNIQUE composite, but the
-        // from_entity / to_entity columns are now plain TEXT with no FK clause.
-        this.db.prepare(`
-          CREATE TABLE relations_new (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_entity   TEXT NOT NULL,
-            to_entity     TEXT NOT NULL,
-            relation_type TEXT NOT NULL,
-            created_at    TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
-            superseded_at TEXT NOT NULL DEFAULT '',
-            UNIQUE(from_entity, to_entity, relation_type, superseded_at)
-          )
-        `).run();
-        this.db.prepare(`
-          INSERT INTO relations_new (id, from_entity, to_entity, relation_type, created_at, superseded_at)
-          SELECT id, from_entity, to_entity, relation_type, created_at, superseded_at FROM relations
-        `).run();
-        this.db.prepare(`DROP TABLE relations`).run();
-        this.db.prepare(`ALTER TABLE relations_new RENAME TO relations`).run();
+          // Part 2: rebuild relations to drop the FK references to entities(name).
+          // New schema preserves all columns and the UNIQUE composite, but the
+          // from_entity / to_entity columns are now plain TEXT with no FK clause.
+          this.db.prepare(`
+            CREATE TABLE relations_new (
+              id            INTEGER PRIMARY KEY AUTOINCREMENT,
+              from_entity   TEXT NOT NULL,
+              to_entity     TEXT NOT NULL,
+              relation_type TEXT NOT NULL,
+              created_at    TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}',
+              superseded_at TEXT NOT NULL DEFAULT '',
+              UNIQUE(from_entity, to_entity, relation_type, superseded_at)
+            )
+          `).run();
+          this.db.prepare(`
+            INSERT INTO relations_new (id, from_entity, to_entity, relation_type, created_at, superseded_at)
+            SELECT id, from_entity, to_entity, relation_type, created_at, superseded_at FROM relations
+          `).run();
+          this.db.prepare(`DROP TABLE relations`).run();
+          this.db.prepare(`ALTER TABLE relations_new RENAME TO relations`).run();
 
-        this.db.prepare('UPDATE schema_version SET version = 7').run();
-      })();
-      this.db.pragma('foreign_keys = ON');
+          this.db.prepare('UPDATE schema_version SET version = 7').run();
+        })();
+      });
       currentVersion = 7;
     }
 
@@ -487,9 +498,9 @@ export class SqliteStore implements GraphStore {
       // integrity we need is enforced explicitly by the orphan check in
       // Step 5 below. Pragma runs OUTSIDE the transaction (SQLite does not
       // allow `PRAGMA foreign_keys` inside an open transaction).
-      this.db.pragma('foreign_keys = OFF');
-      this.db.transaction(() => {
-        // Step 1: add the normalized_name column with empty default so
+      this.withForeignKeysDisabled(() => {
+        this.db.transaction(() => {
+          // Step 1: add the normalized_name column with empty default so
         // existing rows satisfy NOT NULL until the backfill runs.
         this.db.prepare(`ALTER TABLE entities ADD COLUMN normalized_name TEXT NOT NULL DEFAULT ''`).run();
 
@@ -519,23 +530,24 @@ export class SqliteStore implements GraphStore {
         // normalized form would violate the upcoming partial unique
         // index. Detect them now so the error is actionable instead of
         // an opaque SQLITE_CONSTRAINT failure on index creation.
-        // GROUP_CONCAT joins the colliding display names with '|' as
-        // separator (chosen because it's not in the separator strip set,
-        // so display names won't contain it accidentally).
+        // JSON_GROUP_ARRAY produces a proper JSON array of colliding names,
+        // avoiding the ambiguity of a delimited string (display names could
+        // contain any plain-text separator character).
         const collisions = this.db.prepare(`
           SELECT normalized_name,
-                 GROUP_CONCAT(name, '|') AS display_names,
+                 JSON_GROUP_ARRAY(name) AS display_names_json,
                  COUNT(*) AS cnt
           FROM entities
           WHERE superseded_at = ''
           GROUP BY normalized_name
           HAVING COUNT(*) > 1
-        `).all() as { normalized_name: string; display_names: string; cnt: number }[];
+        `).all() as { normalized_name: string; display_names_json: string; cnt: number }[];
 
         if (collisions.length > 0) {
-          const lines = collisions.map(c =>
-            `  - [${c.display_names.split('|').map(n => `"${n}"`).join(', ')}] all normalize to "${c.normalized_name}"`
-          );
+          const lines = collisions.map(c => {
+            const names = JSON.parse(c.display_names_json) as string[];
+            return `  - [${names.map(n => `"${n}"`).join(', ')}] all normalize to "${c.normalized_name}"`;
+          });
           throw new Error(
             `v7→v8 migration aborted: ${collisions.length} entity name collision(s) detected.\n` +
             `Resolve manually before retrying (rename or soft-delete one of each pair).\n` +
@@ -604,16 +616,9 @@ export class SqliteStore implements GraphStore {
             ON entities(normalized_name) WHERE superseded_at = ''
         `).run();
 
-        this.db.prepare('UPDATE schema_version SET version = 8').run();
-      })();
-      // Re-enable FKs after the rewrite. If any stale FK was still present
-      // on the relations table (see rationale at foreign_keys = OFF above),
-      // it would now be enforced — but the v7→v8 migration only rewrites
-      // relations.from_entity / to_entity to normalized form, and those
-      // values no longer match entities.name. In practice the FK is
-      // already absent on any db that went through the v6→v7 rebuild
-      // correctly; this pragma restores the session default either way.
-      this.db.pragma('foreign_keys = ON');
+          this.db.prepare('UPDATE schema_version SET version = 8').run();
+        })();
+      });
       currentVersion = 8;
     }
 
@@ -788,6 +793,29 @@ export class SqliteStore implements GraphStore {
    *
    * @param graph - KnowledgeGraph loaded from the JSONL file by JsonlStore.readGraph()
    */
+
+  /**
+   * Runs a callback with `PRAGMA foreign_keys = OFF`, restoring it to ON in a `finally`
+   * block so it's restored even if the callback throws. SQLite doesn't allow toggling
+   * this pragma inside an open transaction, so this wraps the toggle around the caller's
+   * transaction, not inside it.
+   *
+   * Used by table-rebuild migrations (v6→v7, v7→v8) that DROP/RENAME tables with
+   * historical FK references. Without the toggle, DROP TABLE entities would CASCADE
+   * into the relations table.
+   *
+   * @param fn - Function to execute with FKs disabled. Typically wraps a
+   *             `this.db.transaction(() => { ... })()` call.
+   */
+  private withForeignKeysDisabled(fn: () => void): void {
+    this.db.pragma('foreign_keys = OFF');
+    try {
+      fn();
+    } finally {
+      this.db.pragma('foreign_keys = ON');
+    }
+  }
+
   private migrateFromJsonl(graph: KnowledgeGraph): void {
     // Prepared statements are compiled once and reused for every row in the transaction.
     // Schema v8 added normalized_name as the identity key — every entity insert must populate it.
@@ -2047,17 +2075,40 @@ export class SqliteStore implements GraphStore {
     // Parameter binding order matches textual order in the statement.
     // SQL text order: JOIN ON (obsFilter) → WHERE entFilter → WHERE LIKE patterns → optional project.
     // SQL parameter binding follows textual order, so the params array must mirror it exactly.
+    //
+    // Four LIKE conditions: display name, normalized name, entity type, and observation content.
+    // The normalized pattern is built from the normalized query so that searching "dustinspace"
+    // matches an entity whose normalized_name is "dustinspace" even if its display name is
+    // "Dustin-Space". Try/catch handles queries that normalize to empty (e.g. pure separators)
+    // — in that case we skip the normalized column (it can't match anything useful).
+    let normalizedPattern: string | null = null;
+    try {
+      const normalizedQuery = normalizeEntityName(query);
+      normalizedPattern = `%${escapeLike(normalizedQuery)}%`;
+    } catch {
+      // Query is empty after normalization (e.g. all separators) — skip normalized_name match.
+    }
+
     const cteParams: (string | number)[] = [
       ...obsFilter.params,
       ...entFilter.params,
       pattern, pattern, pattern,
     ];
+    // Build the LIKE OR clause — always includes display name, entity type, and observation content.
+    // Conditionally adds normalized_name if the query normalizes to something non-empty.
+    let likeClause = '(e2.name LIKE ? ESCAPE \'\\\' OR e2.entity_type LIKE ? ESCAPE \'\\\' OR o.content LIKE ? ESCAPE \'\\\'';
+    if (normalizedPattern !== null) {
+      likeClause += ' OR e2.normalized_name LIKE ? ESCAPE \'\\\'';
+      cteParams.push(normalizedPattern);
+    }
+    likeClause += ')';
+
     let cteSql = `
       WITH matched_ids AS (
         SELECT DISTINCT e2.id FROM entities e2
         LEFT JOIN observations o ON o.entity_id = e2.id AND ${obsFilter.clause}
         WHERE ${entFilter.clause}
-          AND (e2.name LIKE ? ESCAPE '\\' OR e2.entity_type LIKE ? ESCAPE '\\' OR o.content LIKE ? ESCAPE '\\')
+          AND ${likeClause}
     `;
 
     if (normalizedProject) {
@@ -2316,10 +2367,21 @@ export class SqliteStore implements GraphStore {
     // will re-normalize them for the actual lookup against relations.from_entity/to_entity.
     const displayNames = entityRows.map(e => e.name);
     if (projectId) {
+      // Build the name set from both display names AND normalized names. This handles the
+      // COALESCE fallback in getConnectedRelations: when a relation endpoint's entity is
+      // soft-deleted, the LEFT JOIN misses and COALESCE returns the normalized form instead
+      // of the display form. Without the normalized form in the set, those relations would
+      // be silently dropped from project-scoped results (issue #55).
       const entityNameSet = new Set(displayNames);
+      for (const name of displayNames) {
+        try {
+          entityNameSet.add(normalizeEntityName(name));
+        } catch {
+          // Name can't be normalized — display form is already in the set.
+        }
+      }
       const allRelations = this.getConnectedRelations(displayNames, asOf);
-      // r.from / r.to are already display-form (COALESCE'd from the LEFT JOIN inside
-      // getConnectedRelations) so set membership against displayNames is correct.
+      // r.from / r.to are COALESCE(display, normalized) — check both forms via the set.
       const filteredRelations = allRelations.filter(r =>
         entityNameSet.has(r.from) && entityNameSet.has(r.to)
       );
@@ -2499,5 +2561,298 @@ export class SqliteStore implements GraphStore {
       observations,
       relations,
     };
+  }
+
+  /**
+   * Returns a concise summary snapshot for session-start briefings.
+   * Three sections: top observations by importance, recently updated entities,
+   * and aggregate stats.
+   *
+   * @param projectId - Optional project scope. Includes project + global entities.
+   * @param excludeContextLayers - When true, excludes L0/L1 observations to avoid
+   *   double-loading when used alongside getContextLayers(). Default false.
+   * @param limit - Max top observations to return (default 20, max 100).
+   * @returns SummaryResult with topObservations, recentEntities, and stats
+   */
+  async getSummary(projectId?: string, excludeContextLayers?: boolean, limit?: number): Promise<Readonly<SummaryResult>> {
+    const obsLimit = Math.min(Math.max(limit ?? 20, 1), 100);
+
+    // Build project filter clause — reused across all three queries.
+    const projectClause = projectId !== undefined
+      ? `AND (e.project = ? OR e.project IS NULL)`
+      : '';
+    const projectParams = projectId !== undefined ? [projectId] : [];
+
+    // Optional filter: exclude L0/L1 observations when caller already has them
+    // from get_context_layers (prevents double-loading).
+    const layerClause = excludeContextLayers
+      ? `AND o.context_layer IS NULL`
+      : '';
+
+    // -- 1. Top observations by importance DESC, then entity recency DESC --
+    const topObs = this.db.prepare(`
+      SELECT e.name AS entityName, o.content, o.importance, o.memory_type, e.updated_at
+      FROM observations o
+      JOIN entities e ON o.entity_id = e.id
+      WHERE o.superseded_at = ''
+        AND e.superseded_at = ''
+        ${layerClause}
+        ${projectClause}
+      ORDER BY o.importance DESC, e.updated_at DESC
+      LIMIT ?
+    `).all(...projectParams, obsLimit) as SummaryObservation[];
+
+    // Map DB column names to interface field names (memory_type → memoryType, updated_at → updatedAt).
+    const topObservations: SummaryObservation[] = topObs.map(row => ({
+      entityName: (row as any).entityName ?? (row as any).entityname,
+      content: row.content,
+      importance: row.importance,
+      memoryType: (row as any).memory_type ?? null,
+      updatedAt: (row as any).updated_at ?? (row as any).updatedAt ?? '',
+    }));
+
+    // -- 2. Recently updated entities (last 5) --
+    const entityProjectClause = projectId !== undefined
+      ? `AND (project = ? OR project IS NULL)`
+      : '';
+
+    const recentRows = this.db.prepare(`
+      SELECT name, entity_type, updated_at,
+        (SELECT COUNT(*) FROM observations WHERE entity_id = e.id AND superseded_at = '') AS obs_count
+      FROM entities e
+      WHERE superseded_at = ''
+        ${entityProjectClause}
+      ORDER BY updated_at DESC
+      LIMIT 5
+    `).all(...projectParams) as Array<{
+      name: string;
+      entity_type: string;
+      updated_at: string;
+      obs_count: number;
+    }>;
+
+    const recentEntities: SummaryEntity[] = recentRows.map(row => ({
+      name: row.name,
+      entityType: row.entity_type,
+      observationCount: row.obs_count,
+      updatedAt: row.updated_at,
+    }));
+
+    // -- 3. Aggregate stats --
+    // Use separate count queries — simple and efficient.
+    const entityCount = (this.db.prepare(
+      `SELECT COUNT(*) AS c FROM entities WHERE superseded_at = ''`
+    ).get() as { c: number }).c;
+
+    const obsCount = (this.db.prepare(
+      `SELECT COUNT(*) AS c FROM observations WHERE superseded_at = ''`
+    ).get() as { c: number }).c;
+
+    const relCount = (this.db.prepare(
+      `SELECT COUNT(*) AS c FROM relations WHERE superseded_at = ''`
+    ).get() as { c: number }).c;
+
+    const projectCount = (this.db.prepare(
+      `SELECT COUNT(DISTINCT project) AS c FROM entities WHERE superseded_at = '' AND project IS NOT NULL`
+    ).get() as { c: number }).c;
+
+    return {
+      topObservations,
+      recentEntities,
+      stats: {
+        totalEntities: entityCount,
+        totalObservations: obsCount,
+        totalRelations: relCount,
+        projectCount,
+      },
+    };
+  }
+
+  // -- Token budget constants for context layers (from spec §7) --
+  // L0 budget: ~100 tokens ≈ 400 chars. Core identity/rules — rarely changes.
+  // L1 budget: ~800 tokens ≈ 3200 chars. Session-start context — updated frequently.
+  private static readonly L0_CHAR_BUDGET = 400;
+  private static readonly L1_CHAR_BUDGET = 3200;
+
+  /**
+   * Returns L0 and L1 observations for a project, sorted by layer then importance DESC.
+   * Enforces soft token budgets: observations that would exceed the budget are truncated
+   * (most important ones kept). Designed to be called by SessionStart / PostCompact hooks.
+   *
+   * @param projectId - Optional project scope. When set, includes project + global entities.
+   * @param layers - Which layers to return. Defaults to ['L0', 'L1'].
+   * @returns ContextLayersResult with L0 and L1 arrays plus tokenEstimate
+   */
+  async getContextLayers(projectId?: string, layers?: string[]): Promise<Readonly<ContextLayersResult>> {
+    // Default to both layers if not specified.
+    const requestedLayers = new Set(layers ?? ['L0', 'L1']);
+
+    // Build the project filter — same pattern as readGraph: include project + global entities.
+    const projectClause = projectId !== undefined
+      ? `AND (e.project = ? OR e.project IS NULL)`
+      : '';
+    const projectParams = projectId !== undefined ? [projectId] : [];
+
+    // Build the layer filter — only query layers that were requested.
+    const layerValues = [...requestedLayers].filter(l => l === 'L0' || l === 'L1');
+    if (layerValues.length === 0) {
+      return { L0: [], L1: [], tokenEstimate: 0 };
+    }
+    const layerPlaceholders = layerValues.map(() => '?').join(', ');
+
+    // Single query: fetch all matching observations with their entity's display name
+    // and updated_at. Sorted by layer (L0 first) then importance DESC.
+    const rows = this.db.prepare(`
+      SELECT e.name AS entityName, o.content, o.importance, o.context_layer, o.memory_type, e.updated_at
+      FROM observations o
+      JOIN entities e ON o.entity_id = e.id
+      WHERE o.superseded_at = ''
+        AND e.superseded_at = ''
+        AND o.context_layer IN (${layerPlaceholders})
+        ${projectClause}
+      ORDER BY o.context_layer ASC, o.importance DESC, e.updated_at DESC
+    `).all(...layerValues, ...projectParams) as Array<{
+      entityName: string;
+      content: string;
+      importance: number;
+      context_layer: string;
+      memory_type: string | null;
+      updated_at: string;
+    }>;
+
+    // Partition into L0 and L1 arrays, applying character budgets.
+    const L0: ContextLayerObservation[] = [];
+    const L1: ContextLayerObservation[] = [];
+    let l0Chars = 0;
+    let l1Chars = 0;
+
+    for (const row of rows) {
+      const charCost = row.entityName.length + row.content.length;
+
+      if (row.context_layer === 'L0' && requestedLayers.has('L0')) {
+        // L0 observations always included — but track char count for token estimate.
+        l0Chars += charCost;
+        L0.push({
+          entityName: row.entityName,
+          content: row.content,
+          importance: row.importance,
+          memoryType: row.memory_type,
+          // L0 omits updatedAt per spec — these are identity/rules, not timestamped context.
+        });
+      } else if (row.context_layer === 'L1' && requestedLayers.has('L1')) {
+        // L1 observations truncated at budget — most important first (already sorted).
+        if (l1Chars + charCost > SqliteStore.L1_CHAR_BUDGET && L1.length > 0) {
+          // Budget exceeded — stop adding L1 observations. The first one always
+          // gets included even if it alone exceeds the budget (otherwise a single
+          // large observation would result in an empty L1).
+          continue;
+        }
+        l1Chars += charCost;
+        L1.push({
+          entityName: row.entityName,
+          content: row.content,
+          importance: row.importance,
+          memoryType: row.memory_type,
+          updatedAt: row.updated_at,
+        });
+      }
+    }
+
+    // Token estimate: rough chars / 4 approximation.
+    const totalChars = l0Chars + l1Chars;
+    const tokenEstimate = Math.ceil(totalChars / 4);
+
+    return { L0, L1, tokenEstimate };
+  }
+
+  /**
+   * Updates importance, context_layer, and/or memory_type on existing active
+   * observations in-place. Does NOT change content, timestamps, or embeddings —
+   * the observation's identity is preserved, which means the vec_observations row
+   * (keyed on content embedding) stays valid.
+   *
+   * The observation is identified by (entityName, content) where entityName is
+   * resolved via normalized_name (schema v8) so any surface variant works.
+   *
+   * Transaction-wrapped: all updates succeed or all fail. Entity's updated_at is
+   * bumped when any of its observations are modified.
+   *
+   * @param updates - Array of SetObservationMetadataInput. Each must have at least
+   *                  one of importance, contextLayer, or memoryType present.
+   * @returns Number of observations actually updated (0 if content not found)
+   * @throws Error if an entity name doesn't resolve to any active entity
+   */
+  async setObservationMetadata(updates: SetObservationMetadataInput[]): Promise<number> {
+    if (updates.length === 0) return 0;
+
+    let totalUpdated = 0;
+    const now = new Date().toISOString();
+
+    // Set of entity IDs whose updated_at needs bumping (deduped so we don't
+    // bump the same entity multiple times if multiple observations are updated).
+    const touchedEntityIds = new Set<number>();
+
+    this.db.transaction(() => {
+      for (const u of updates) {
+        // Resolve entity by normalized name — any surface variant works.
+        const normalizedName = normalizeEntityName(u.entityName);
+        const entity = this.db.prepare(
+          `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
+        ).get(normalizedName) as { id: number } | undefined;
+
+        if (!entity) {
+          throw new Error(`Entity with name ${u.entityName} not found`);
+        }
+
+        // Build dynamic SET clause — only include fields that were explicitly
+        // provided. We use 'key in object' checks (not !== undefined) so that
+        // passing contextLayer: null or memoryType: null explicitly sets them
+        // to NULL (demotes / unclassifies), while omitting the key entirely
+        // leaves the existing value untouched.
+        const setClauses: string[] = [];
+        const params: (string | number | null)[] = [];
+
+        if (u.importance !== undefined) {
+          setClauses.push('importance = ?');
+          params.push(u.importance);
+        }
+        if ('contextLayer' in u) {
+          setClauses.push('context_layer = ?');
+          params.push(u.contextLayer ?? null);
+        }
+        if ('memoryType' in u) {
+          setClauses.push('memory_type = ?');
+          params.push(u.memoryType ?? null);
+        }
+
+        // Nothing to update — skip this entry.
+        if (setClauses.length === 0) continue;
+
+        // Append the WHERE params: entity_id and content (exact match on active obs).
+        params.push(entity.id, u.content);
+
+        const result = this.db.prepare(
+          `UPDATE observations SET ${setClauses.join(', ')}
+           WHERE entity_id = ? AND content = ? AND superseded_at = ''`
+        ).run(...params);
+
+        totalUpdated += result.changes;
+        if (result.changes > 0) {
+          touchedEntityIds.add(entity.id);
+        }
+      }
+
+      // Bump updated_at on every entity that had at least one observation modified.
+      if (touchedEntityIds.size > 0) {
+        const updateEntity = this.db.prepare(
+          'UPDATE entities SET updated_at = ? WHERE id = ?'
+        );
+        for (const id of touchedEntityIds) {
+          updateEntity.run(now, id);
+        }
+      }
+    })();
+
+    return totalUpdated;
   }
 }

@@ -23,6 +23,12 @@ import {
   type PaginationParams,
   type PaginatedKnowledgeGraph,
   type SupersedeInput,
+  type SetObservationMetadataInput,
+  type ContextLayersResult,
+  type ContextLayerObservation,
+  type SummaryResult,
+  type SummaryObservation,
+  type SummaryEntity,
   type EntityTimelineResult,
   InvalidCursorError,
 } from './types.js';
@@ -536,6 +542,154 @@ export class JsonlStore implements GraphStore {
    */
   async entityTimeline(_entityName: string, _projectId?: string): Promise<EntityTimelineResult | null> {
     throw new Error('entity_timeline not supported in JSONL backend: migrate to SQLite');
+  }
+
+  /**
+   * Set observation metadata is not supported in the JSONL backend.
+   * This feature requires SQLite's observation metadata columns (importance,
+   * context_layer, memory_type) added in schema v6.
+   *
+   * @throws Error always -- JSONL backend does not support set_observation_metadata
+   */
+  async setObservationMetadata(_updates: SetObservationMetadataInput[]): Promise<number> {
+    throw new Error('set_observation_metadata not supported in JSONL backend: migrate to SQLite');
+  }
+
+  /**
+   * Returns a concise summary snapshot by scanning the in-memory graph.
+   * Three sections: top observations by importance, recently updated entities,
+   * and aggregate stats.
+   *
+   * @param projectId - Optional project scope. Includes project + global entities.
+   * @param excludeContextLayers - When true, excludes L0/L1 observations.
+   * @param limit - Max top observations to return (default 20, max 100).
+   * @returns SummaryResult with topObservations, recentEntities, and stats
+   */
+  async getSummary(projectId?: string, excludeContextLayers?: boolean, limit?: number): Promise<Readonly<SummaryResult>> {
+    const graph = await this.loadGraph();
+    const obsLimit = Math.min(Math.max(limit ?? 20, 1), 100);
+
+    // Filter entities by project scope (include project + global).
+    const entities = graph.entities.filter(e =>
+      projectId === undefined || e.project === null || e.project === projectId
+    );
+
+    // -- 1. Collect all matching observations --
+    const allObs: SummaryObservation[] = [];
+    for (const entity of entities) {
+      for (const obs of entity.observations) {
+        // Skip L0/L1 observations when excludeContextLayers is set.
+        if (excludeContextLayers && obs.contextLayer !== null) continue;
+
+        allObs.push({
+          entityName: entity.name,
+          content: obs.content,
+          importance: obs.importance,
+          memoryType: obs.memoryType,
+          updatedAt: entity.updatedAt,
+        });
+      }
+    }
+
+    // Sort by importance DESC, then entity recency DESC.
+    allObs.sort((a, b) => b.importance - a.importance || b.updatedAt.localeCompare(a.updatedAt));
+    const topObservations = allObs.slice(0, obsLimit);
+
+    // -- 2. Recently updated entities (last 5) --
+    const sortedEntities = [...entities].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const recentEntities: SummaryEntity[] = sortedEntities.slice(0, 5).map(e => ({
+      name: e.name,
+      entityType: e.entityType,
+      observationCount: e.observations.length,
+      updatedAt: e.updatedAt,
+    }));
+
+    // -- 3. Aggregate stats --
+    const totalRelations = graph.relations.length;
+    const allProjectEntities = graph.entities.filter(e => e.project !== null);
+    const projectSet = new Set(allProjectEntities.map(e => e.project));
+
+    return {
+      topObservations,
+      recentEntities,
+      stats: {
+        totalEntities: graph.entities.length,
+        totalObservations: graph.entities.reduce((sum, e) => sum + e.observations.length, 0),
+        totalRelations,
+        projectCount: projectSet.size,
+      },
+    };
+  }
+
+  // -- Token budget constants for context layers (from spec §7) --
+  private static readonly L0_CHAR_BUDGET = 400;
+  private static readonly L1_CHAR_BUDGET = 3200;
+
+  /**
+   * Returns L0 and L1 observations from the in-memory graph. Filters by project
+   * (including global entities) and applies soft token budgets. Works by scanning
+   * all entities and their observations — no index needed since the graph is in memory.
+   *
+   * @param projectId - Optional project scope. When set, includes project + global.
+   * @param layers - Which layers to return. Defaults to ['L0', 'L1'].
+   * @returns ContextLayersResult with L0 and L1 arrays plus tokenEstimate
+   */
+  async getContextLayers(projectId?: string, layers?: string[]): Promise<Readonly<ContextLayersResult>> {
+    const graph = await this.loadGraph();
+    const requestedLayers = new Set(layers ?? ['L0', 'L1']);
+
+    // Collect matching observations from all project-matching entities.
+    const rawL0: ContextLayerObservation[] = [];
+    const rawL1: ContextLayerObservation[] = [];
+
+    for (const entity of graph.entities) {
+      // Project filter: include if entity matches project OR is global.
+      if (projectId !== undefined && entity.project !== null && entity.project !== projectId) {
+        continue;
+      }
+
+      for (const obs of entity.observations) {
+        if (obs.contextLayer === 'L0' && requestedLayers.has('L0')) {
+          rawL0.push({
+            entityName: entity.name,
+            content: obs.content,
+            importance: obs.importance,
+            memoryType: obs.memoryType,
+          });
+        } else if (obs.contextLayer === 'L1' && requestedLayers.has('L1')) {
+          rawL1.push({
+            entityName: entity.name,
+            content: obs.content,
+            importance: obs.importance,
+            memoryType: obs.memoryType,
+            updatedAt: entity.updatedAt,
+          });
+        }
+      }
+    }
+
+    // Sort by importance DESC within each layer.
+    rawL0.sort((a, b) => b.importance - a.importance);
+    rawL1.sort((a, b) => b.importance - a.importance);
+
+    // Apply L1 char budget (L0 always included per spec).
+    const L0 = rawL0;
+    const L1: ContextLayerObservation[] = [];
+    let l1Chars = 0;
+
+    for (const obs of rawL1) {
+      const charCost = obs.entityName.length + obs.content.length;
+      if (l1Chars + charCost > JsonlStore.L1_CHAR_BUDGET && L1.length > 0) {
+        continue;
+      }
+      l1Chars += charCost;
+      L1.push(obs);
+    }
+
+    const l0Chars = L0.reduce((sum, o) => sum + o.entityName.length + o.content.length, 0);
+    const tokenEstimate = Math.ceil((l0Chars + l1Chars) / 4);
+
+    return { L0, L1, tokenEstimate };
   }
 
   /**
