@@ -281,7 +281,7 @@ server.registerTool(
           .describe("Parallel array of importance scores (1.0-5.0) matching contents. Omit for default 3.0."),
         contextLayers: z.array(z.enum(['L0', 'L1']).nullable()).max(100).optional()
           .describe("Parallel array of context layers matching contents. 'L0' = always loaded, 'L1' = session start, null = on-demand (L2). Omit for default null."),
-        memoryTypes: z.array(z.string().max(50).nullable()).max(100).optional()
+        memoryTypes: z.array(z.string().min(1).max(50).nullable()).max(100).optional()
           .describe("Parallel array of memory type tags matching contents. Recommended: 'decision','preference','fact','problem','milestone','emotional'. null = unclassified. Omit for default null."),
       })).max(100)
     },
@@ -581,23 +581,38 @@ server.registerTool(
           .describe("Importance score 1.0-5.0. Only updated if provided."),
         contextLayer: z.enum(['L0', 'L1']).nullable().optional()
           .describe("'L0' = always loaded, 'L1' = session start, null = demote to on-demand (L2). Only updated if key present."),
-        memoryType: z.string().max(50).nullable().optional()
+        memoryType: z.string().min(1).max(50).nullable().optional()
           .describe("Memory type tag (e.g. 'decision','preference','fact','problem','procedure'). null = unclassified. Only updated if key present."),
-      })).min(1).max(100).describe("Observations to update"),
+      }).refine(
+        // At least one metadata field must be provided — otherwise the update is a no-op
+        // and the caller gets a misleading "0 not found" response.
+        (obj) => obj.importance !== undefined || 'contextLayer' in obj || 'memoryType' in obj,
+        { message: "At least one of importance, contextLayer, or memoryType must be provided" }
+      )).min(1).max(100).describe("Observations to update"),
     },
     outputSchema: {
       updated: z.number().describe("Number of observations actually updated"),
     }
   },
   async ({ updates }) => {
-    const count = await store.setObservationMetadata(updates);
-    const message = count === updates.length
-      ? `Updated metadata on ${count} observation(s).`
-      : `Updated ${count} of ${updates.length} observation(s) (${updates.length - count} not found).`;
-    return {
-      content: [{ type: "text" as const, text: message }],
-      structuredContent: { updated: count },
-    };
+    try {
+      const count = await store.setObservationMetadata(updates);
+      const message = count === updates.length
+        ? `Updated metadata on ${count} observation(s).`
+        : `Updated ${count} of ${updates.length} observation(s) (${updates.length - count} not found).`;
+      return {
+        content: [{ type: "text" as const, text: message }],
+        structuredContent: { updated: count },
+      };
+    } catch (error: unknown) {
+      // Consistent with entity_timeline's not-found handling — return isError
+      // instead of letting the throw propagate to the MCP SDK's generic handler.
+      const msg = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: msg }],
+        isError: true,
+      };
+    }
   }
 );
 
@@ -659,7 +674,8 @@ server.registerTool(
     title: "Get Summary",
     description: "Returns a concise knowledge graph snapshot for session-start briefings: " +
       "top observations ranked by importance (then recency), recently updated entities with " +
-      "observation counts, and aggregate stats (totals for entities, observations, relations, projects). " +
+      "observation counts, and aggregate stats (graph-wide totals for entities, observations, relations, projects — " +
+      "stats are NOT scoped by projectId even when provided). " +
       "Use excludeContextLayers to avoid double-counting observations already loaded by get_context_layers.",
     inputSchema: {
       projectId: ProjectIdSchema,

@@ -2469,11 +2469,15 @@ describe.each<[string, string, StoreFactory]>([
 
 			const result = await store.getSummary();
 
-			// High (5.0) first, then Medium (3.0, newer) and MediumOlder (3.0, older), then Low (1.0)
+			// High (5.0) first, then the two mediums (3.0) in either order, then Low (1.0)
 			expect(result.topObservations.length).toBe(4);
 			expect(result.topObservations[0].content).toBe('high importance');
 			expect(result.topObservations[0].importance).toBe(5.0);
-			expect(result.topObservations[1].content).toBe('medium importance');
+			// Positions [1] and [2] are both importance 3.0 — order within same importance
+			// and same updatedAt (batch-created) is non-deterministic, so check set membership.
+			const middleContents = [result.topObservations[1].content, result.topObservations[2].content];
+			expect(middleContents).toContain('medium importance');
+			expect(middleContents).toContain('medium older');
 			expect(result.topObservations[3].content).toBe('low importance');
 		});
 
@@ -2577,6 +2581,28 @@ describe.each<[string, string, StoreFactory]>([
 			expect(result.stats.totalObservations).toBe(4);
 			expect(result.stats.totalRelations).toBe(1);
 			expect(result.stats.projectCount).toBe(2);
+		});
+
+		it('recentEntities are scoped by projectId', async () => {
+			// Create entities in two projects. Entity 'Global' has no project
+			// (null) so it should appear in any project-scoped query.
+			await store.createEntities([
+				{ name: 'ProjA-E1', entityType: 'test', observations: ['a1'] },
+			], 'projectA');
+			await store.createEntities([
+				{ name: 'ProjB-E1', entityType: 'test', observations: ['b1'] },
+			], 'projectB');
+			await store.createEntities([
+				{ name: 'Global', entityType: 'test', observations: ['g1'] },
+			]); // null project — global
+
+			// Scoped to projectA — should include ProjA-E1 + Global, NOT ProjB-E1
+			const result = await store.getSummary('projectA');
+			const recentNames = result.recentEntities.map(e => e.name);
+
+			expect(recentNames).toContain('ProjA-E1');
+			expect(recentNames).toContain('Global');
+			expect(recentNames).not.toContain('ProjB-E1');
 		});
 	});
 });
@@ -4112,6 +4138,121 @@ describe('SqliteStore-specific', () => {
 			expect(result.skipped).toHaveLength(1);
 			// First write wins on display form.
 			expect(result.created[0].name).toBe(precomposed);
+		});
+	});
+
+	// ----------------------------------------------------------
+	// getSummary — superseded observations excluded (#68)
+	//
+	// SQLite-specific because supersedeObservations() is only
+	// available on SqliteStore (JSONL backend throws).
+	// ----------------------------------------------------------
+	describe('getSummary exclusions', () => {
+		it('excludes superseded observations from topObservations', async () => {
+			// Create entity with two observations, then supersede one.
+			await store.createEntities([
+				{ name: 'SupTest', entityType: 'test', observations: ['old fact', 'current fact'] },
+			]);
+
+			// Supersede 'old fact' → 'replacement fact'
+			await store.supersedeObservations([
+				{ entityName: 'SupTest', oldContent: 'old fact', newContent: 'replacement fact' },
+			]);
+
+			const result = await store.getSummary();
+
+			// topObservations should contain 'current fact' and 'replacement fact'
+			// but NOT 'old fact' (it's been superseded).
+			const contents = result.topObservations.map(o => o.content);
+			expect(contents).toContain('current fact');
+			expect(contents).toContain('replacement fact');
+			expect(contents).not.toContain('old fact');
+		});
+
+		it('excludes soft-deleted entities from getSummary', async () => {
+			// Create two entities, soft-delete one, verify getSummary excludes it.
+			await store.createEntities([
+				{ name: 'Alive', entityType: 'test', observations: ['alive obs'] },
+				{ name: 'Deleted', entityType: 'test', observations: ['deleted obs'] },
+			]);
+
+			// Soft-delete 'Deleted' — sets superseded_at on entity + observations
+			await store.deleteEntities(['Deleted']);
+
+			const result = await store.getSummary();
+
+			// topObservations should only have 'alive obs' — not 'deleted obs'
+			const obsContents = result.topObservations.map(o => o.content);
+			expect(obsContents).toContain('alive obs');
+			expect(obsContents).not.toContain('deleted obs');
+
+			// recentEntities should only have 'Alive' — not 'Deleted'
+			const entityNames = result.recentEntities.map(e => e.name);
+			expect(entityNames).toContain('Alive');
+			expect(entityNames).not.toContain('Deleted');
+
+			// Stats should reflect the live state: 1 entity, 1 observation
+			expect(result.stats.totalEntities).toBe(1);
+			expect(result.stats.totalObservations).toBe(1);
+		});
+
+		it('excludes soft-deleted entities from getContextLayers', async () => {
+			// Create entity with L0 observation, soft-delete entity, verify it vanishes.
+			await store.createEntities([
+				{ name: 'L0Entity', entityType: 'test', observations: ['core rule'] },
+			]);
+			// Promote observation to L0 so it would appear in getContextLayers.
+			await store.setObservationMetadata([
+				{ entityName: 'L0Entity', content: 'core rule', contextLayer: 'L0', importance: 9.0 },
+			]);
+
+			// Verify it appears before deletion.
+			const before = await store.getContextLayers();
+			expect(before.L0.length).toBe(1);
+
+			// Soft-delete the entity.
+			await store.deleteEntities(['L0Entity']);
+
+			// getContextLayers should now return empty.
+			const after = await store.getContextLayers();
+			expect(after.L0.length).toBe(0);
+			expect(after.L1.length).toBe(0);
+		});
+	});
+
+	// ----------------------------------------------------------
+	// setObservationMetadata — batch atomicity (#68)
+	//
+	// SQLite-specific because setObservationMetadata() is only
+	// available on SqliteStore (JSONL backend throws).
+	// ----------------------------------------------------------
+	describe('setObservationMetadata atomicity', () => {
+		it('rolls back all updates when one entity in the batch is not found', async () => {
+			// Create one valid entity. The batch will update it AND reference a
+			// non-existent entity. The whole transaction should roll back.
+			await store.createEntities([
+				{ name: 'ValidEntity', entityType: 'test', observations: ['obs1'] },
+			]);
+
+			// Set initial importance so we can verify rollback.
+			await store.setObservationMetadata([
+				{ entityName: 'ValidEntity', content: 'obs1', importance: 5.0 },
+			]);
+
+			// This batch should fail: first update succeeds (ValidEntity exists),
+			// but second throws (NonExistent entity). Transaction rolls back.
+			await expect(
+				store.setObservationMetadata([
+					{ entityName: 'ValidEntity', content: 'obs1', importance: 9.0 },
+					{ entityName: 'NonExistent', content: 'anything', importance: 1.0 },
+				])
+			).rejects.toThrow(/not found/);
+
+			// After rollback, ValidEntity's importance should still be 5.0
+			// (the first update in the failing batch should NOT have persisted).
+			const graph = await store.readGraph();
+			const obs = graph.entities[0].observations[0];
+			expect(obs.importance).toBe(5.0);
 		});
 	});
 });

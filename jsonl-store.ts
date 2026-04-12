@@ -622,7 +622,8 @@ export class JsonlStore implements GraphStore {
   }
 
   // -- Token budget constants for context layers (from spec §7) --
-  private static readonly L0_CHAR_BUDGET = 400;
+  // L0 has no budget enforcement by design — core identity/rules always included.
+  // ~100 tokens is a guideline, not a hard cap.
   private static readonly L1_CHAR_BUDGET = 3200;
 
   /**
@@ -668,9 +669,12 @@ export class JsonlStore implements GraphStore {
       }
     }
 
-    // Sort by importance DESC within each layer.
-    rawL0.sort((a, b) => b.importance - a.importance);
-    rawL1.sort((a, b) => b.importance - a.importance);
+    // Sort by importance DESC, then recency DESC within each layer.
+    // Recency tiebreaker matches SQLite's ORDER BY o.importance DESC, e.updated_at DESC.
+    const byImportanceThenRecency = (a: ContextLayerObservation, b: ContextLayerObservation) =>
+      b.importance - a.importance || ((b as any).updatedAt ?? '').localeCompare((a as any).updatedAt ?? '');
+    rawL0.sort(byImportanceThenRecency);
+    rawL1.sort(byImportanceThenRecency);
 
     // Apply L1 char budget (L0 always included per spec).
     const L0 = rawL0;
@@ -680,7 +684,7 @@ export class JsonlStore implements GraphStore {
     for (const obs of rawL1) {
       const charCost = obs.entityName.length + obs.content.length;
       if (l1Chars + charCost > JsonlStore.L1_CHAR_BUDGET && L1.length > 0) {
-        continue;
+        break;  // Don't bin-pack — stop at the budget boundary to preserve importance ordering
       }
       l1Chars += charCost;
       L1.push(obs);

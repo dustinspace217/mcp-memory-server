@@ -2600,15 +2600,18 @@ export class SqliteStore implements GraphStore {
         ${projectClause}
       ORDER BY o.importance DESC, e.updated_at DESC
       LIMIT ?
-    `).all(...projectParams, obsLimit) as SummaryObservation[];
+    `).all(...projectParams, obsLimit) as Array<{
+      entityName: string; content: string; importance: number;
+      memory_type: string | null; updated_at: string;
+    }>;
 
-    // Map DB column names to interface field names (memory_type → memoryType, updated_at → updatedAt).
+    // Map DB column names (snake_case) to interface field names (camelCase).
     const topObservations: SummaryObservation[] = topObs.map(row => ({
-      entityName: (row as any).entityName ?? (row as any).entityname,
+      entityName: row.entityName,
       content: row.content,
       importance: row.importance,
-      memoryType: (row as any).memory_type ?? null,
-      updatedAt: (row as any).updated_at ?? (row as any).updatedAt ?? '',
+      memoryType: row.memory_type ?? null,
+      updatedAt: row.updated_at ?? '',
     }));
 
     // -- 2. Recently updated entities (last 5) --
@@ -2668,10 +2671,10 @@ export class SqliteStore implements GraphStore {
     };
   }
 
-  // -- Token budget constants for context layers (from spec §7) --
-  // L0 budget: ~100 tokens ≈ 400 chars. Core identity/rules — rarely changes.
+  // -- Token budget constant for context layers (from spec §7) --
   // L1 budget: ~800 tokens ≈ 3200 chars. Session-start context — updated frequently.
-  private static readonly L0_CHAR_BUDGET = 400;
+  // L0 has no budget enforcement by design: core identity/rules are always included
+  // regardless of size (~100 tokens is a guideline, not a hard cap).
   private static readonly L1_CHAR_BUDGET = 3200;
 
   /**
@@ -2742,10 +2745,11 @@ export class SqliteStore implements GraphStore {
       } else if (row.context_layer === 'L1' && requestedLayers.has('L1')) {
         // L1 observations truncated at budget — most important first (already sorted).
         if (l1Chars + charCost > SqliteStore.L1_CHAR_BUDGET && L1.length > 0) {
-          // Budget exceeded — stop adding L1 observations. The first one always
-          // gets included even if it alone exceeds the budget (otherwise a single
-          // large observation would result in an empty L1).
-          continue;
+          // Budget exceeded — stop adding L1 observations. Using break (not continue)
+          // ensures we don't bin-pack smaller lower-importance observations past a
+          // larger higher-importance one that didn't fit. The first one always gets
+          // included even if it alone exceeds the budget (the L1.length > 0 guard).
+          break;
         }
         l1Chars += charCost;
         L1.push({
@@ -2812,9 +2816,9 @@ export class SqliteStore implements GraphStore {
         const setClauses: string[] = [];
         const params: (string | number | null)[] = [];
 
-        if (u.importance !== undefined) {
+        if ('importance' in u) {
           setClauses.push('importance = ?');
-          params.push(u.importance);
+          params.push(u.importance!);
         }
         if ('contextLayer' in u) {
           setClauses.push('context_layer = ?');
