@@ -208,7 +208,7 @@ The server is split across 7 source files:
 ## Known Limitations
 - **Entity names are globally unique** across all projects — permanent architectural constraint because relations use entity names as foreign keys
 - **Project filtering is advisory, not a security boundary** — it scopes queries for convenience but does not enforce access control. Entity name collisions across projects are reported (not silently dropped), and global entities (project=null) are visible to all project-scoped queries by design.
-- **JSONL backend**: no file locking for concurrent access; no FK validation that relation endpoints reference existing entities
+- **JSONL backend**: deprecated — no file locking, no FK validation, no `as_of` queries, no entity soft-delete, no `entity_timeline`, no `set_observation_metadata`, no eviction. Maintained only for environments without C build tools.
 - **SQLite backend**: LIKE-based search is case-insensitive for ASCII only — non-ASCII Unicode characters (e.g. accented letters, CJK) may not match case-insensitively as expected
 - **Paginated relation coverage is incomplete** — relations are only included when both endpoints appear on the same page. Paginating through all pages and unioning results does not yield complete relation coverage. Use `open_nodes` for full relation context on specific entities.
 - **Cursor stability under mutation** — if an entity's `updatedAt` changes between page fetches (e.g., observations added), the entity may appear on two pages or be skipped. This is inherent to keyset pagination with a mutable sort key and is the correct tradeoff for a memory server (freshness > perfect enumeration). Note: SQLite gracefully continues past deleted cursor targets (keyset WHERE clause skips missing rows); JSONL throws `InvalidCursorError` if the cursor target entity was deleted between pages (strict findIndex match).
@@ -216,6 +216,9 @@ The server is split across 7 source files:
 - **Embedding latency on writes** — embedding generation is fire-and-forget after the sync transaction commits (does not block MCP response). Embedding may not be searchable until the next query (~5-15ms per observation).
 - **vec0 is brute-force KNN** — at current scale (~1500 observations), sub-millisecond. At ~50,000+, consider switching to ANN index (sqlite-vec supports IVF).
 - **Pagination sorts by `updatedAt`, not semantic relevance** — vector search improves recall (finding entities LIKE would miss) but does not affect ranking.
+- **Context layers are caller-managed** — the server stores `context_layer` values (L0/L1/null) but does not auto-assign or auto-promote observations. The caller (Claude hooks, tools) is responsible for classifying observations into tiers.
+- **`memory_type` is free-form** — any string is accepted; there is no server-side validation of allowed values. Convention enforcement is the caller's responsibility.
+- **Eviction is best-effort** — the eviction sweep runs at startup and every ~1000 writes. If the DB grows past the cap between checks (e.g., a single massive batch insert), it will be caught on the next check. The 1 GB default cap can be overridden via `MEMORY_SIZE_CAP_BYTES` env var.
 
 ## Schema Migrations
 Database schema is versioned in the single-row `schema_version` table (CHECK constraint enforces one row). Migrations run in sequence on startup in `sqlite-store.ts`; each one is idempotent and wrapped in a transaction except where noted.
@@ -244,6 +247,7 @@ Database schema is versioned in the single-row `schema_version` table (CHECK con
 **Test pool discipline:** The suite runs in two commands. Pool 1 (non-vector, 514 tests): `MEMORY_VECTOR_SEARCH=off SKIP_VECTOR_INTEGRATION=1 npx vitest run --exclude '**/vector-integration.test.ts'`. Pool 2 (vector integration, 6 tests): `MEMORY_VECTOR_SEARCH=on npx vitest run __tests__/vector-integration.test.ts --pool=forks --poolOptions.forks.singleFork=true`. See `feedback_local_llm_test_pool_discipline.md` for the reasoning (the local ONNX model load must be isolated and single-fork to avoid hard-reboots).
 
 ## Version History
+- **v1.1.0** — Observation metadata (importance, context_layer, memory_type), point-in-time `as_of` queries, entity soft-delete, entity name normalization (Layer 1, schema v7-v8), `set_observation_metadata` / `get_context_layers` / `get_summary` tools, four-tier eviction with LRU shield (schema v9, `evict.ts`), `last_accessed_at` access discipline. 520 tests across 9 files.
 - **v1.0.0** — Temporal relations (superseded_at on relations, invalidate_relations + entity_timeline tools), similarity check on addObservations, schema version tracking (versions 1–5), graceful shutdown, totalCount fix, JSONL backend deprecated
 - **v0.11.0** — Observation supersede mechanism, vector search (sqlite-vec + all-MiniLM-L6-v2), hybrid LIKE+KNN search
 - **v0.10.0** — Cursor-based pagination, entity timestamps (updatedAt/createdAt)
