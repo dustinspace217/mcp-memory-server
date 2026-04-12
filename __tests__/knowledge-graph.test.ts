@@ -3025,11 +3025,12 @@ describe('SqliteStore-specific', () => {
 			conn.close();
 
 			expect(row).toBeDefined();
-			// Fresh databases should be at version 8. v7 added soft-delete on entities
+			// Fresh databases should be at version 9. v7 added soft-delete on entities
 			// via superseded_at + partial unique index. v8 added the `normalized_name`
 			// identity-key column with a partial unique index, and converted relations
-			// to store their endpoints in normalized form.
-			expect(row!.version).toBe(8);
+			// to store their endpoints in normalized form. v9 added tombstoned_at on
+			// entities/observations/relations and last_accessed_at on entities for eviction.
+			expect(row!.version).toBe(9);
 		});
 	});
 

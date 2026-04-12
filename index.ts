@@ -521,7 +521,7 @@ server.registerTool(
     title: "Entity Timeline",
     description: "Returns full history of an entity including superseded observations and invalidated relations. " +
       "Unlike readGraph/searchNodes which only show active items, this shows the complete change history " +
-      "with status indicators ('active' or 'superseded') on each observation and relation.",
+      "with status indicators ('active', 'superseded', or 'tombstoned') on each observation and relation.",
     inputSchema: {
       entityName: z.string().min(1).max(500).describe("Name of the entity to get timeline for"),
       projectId: ProjectIdSchema,
@@ -536,7 +536,7 @@ server.registerTool(
         content: z.string(),
         createdAt: z.string(),
         supersededAt: z.string(),
-        status: z.enum(['active', 'superseded']),
+        status: z.enum(['active', 'superseded', 'tombstoned']),
       })),
       relations: z.array(z.object({
         from: z.string(),
@@ -544,7 +544,7 @@ server.registerTool(
         relationType: z.string(),
         createdAt: z.string(),
         supersededAt: z.string(),
-        status: z.enum(['active', 'superseded']),
+        status: z.enum(['active', 'superseded', 'tombstoned']),
       })),
     }
   },

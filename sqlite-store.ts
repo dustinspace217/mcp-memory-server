@@ -46,6 +46,7 @@ import {
   searchNodesFingerprint,
 } from './cursor.js';
 import { normalizeEntityName } from './normalize-name.js';
+import { checkAndEvict, type EvictionResult } from './evict.js';
 
 /**
  * Checks if a file exists at the given path.
@@ -84,6 +85,10 @@ function escapeLike(query: string): string {
 // We use 900 to leave headroom for other parameters in the same query.
 const CHUNK_SIZE = 900;
 
+// How many write operations between eviction checks. The spec suggests ~1000.
+// Each check is cheap (just a statSync on the DB file) so this can be low.
+const EVICTION_CHECK_INTERVAL = 1000;
+
 /**
  * SQLite-backed knowledge graph store. Uses WAL mode for concurrent read performance
  * and foreign key constraints for referential integrity.
@@ -103,6 +108,9 @@ export class SqliteStore implements GraphStore {
 
   /** Set to true when SIGTERM/SIGINT received. Tells the embedding sweep to stop. */
   private shuttingDown = false;
+
+  /** Counts write operations since the last eviction check. Resets after each check. */
+  private writesSinceLastEvictionCheck = 0;
 
   /** Exposes the current vector search state for callers to inspect. */
   get vectorState(): VectorState {
@@ -622,6 +630,54 @@ export class SqliteStore implements GraphStore {
       currentVersion = 8;
     }
 
+    if (currentVersion < 9) {
+      // Migration 8 → 9: eviction infrastructure — tombstoned_at + last_accessed_at.
+      //
+      // Adds columns for the four-tier degradation chain (§12 of the v1.1 design spec):
+      //   Active → Superseded → Tombstoned → Hard-deleted
+      //
+      // - `entities.tombstoned_at`: empty string = not tombstoned, ISO timestamp = content stripped.
+      //   When tombstoned, the entity skeleton (name, type, timestamps) is preserved but
+      //   all its observations have their content set to '' and their vec embeddings removed.
+      // - `entities.last_accessed_at`: tracks intentional access (search_nodes, open_nodes,
+      //   entity_timeline, any write). read_graph (bulk) does NOT update this. Used by the
+      //   LRU shield: entities accessed within 6 months are protected from eviction.
+      //   Initialized to updated_at so existing entities start with a reasonable access time.
+      // - `observations.tombstoned_at`: mirrors entity tombstoning at the observation level.
+      // - `relations.tombstoned_at`: mirrors entity tombstoning at the relation level.
+      //
+      // Each ALTER TABLE is a separate statement (SQLite limitation: one ALTER per statement).
+      this.db.transaction(() => {
+        // Entities: add tombstoned_at and last_accessed_at.
+        this.db.prepare(
+          `ALTER TABLE entities ADD COLUMN tombstoned_at TEXT NOT NULL DEFAULT ''`
+        ).run();
+        this.db.prepare(
+          `ALTER TABLE entities ADD COLUMN last_accessed_at TEXT NOT NULL DEFAULT ''`
+        ).run();
+
+        // Backfill last_accessed_at from updated_at so existing entities aren't immediately
+        // eligible for eviction. Entities with sentinel timestamps ('0000-...') get the
+        // sentinel — they'll be refreshed on first intentional access.
+        this.db.prepare(
+          `UPDATE entities SET last_accessed_at = updated_at`
+        ).run();
+
+        // Observations: add tombstoned_at.
+        this.db.prepare(
+          `ALTER TABLE observations ADD COLUMN tombstoned_at TEXT NOT NULL DEFAULT ''`
+        ).run();
+
+        // Relations: add tombstoned_at.
+        this.db.prepare(
+          `ALTER TABLE relations ADD COLUMN tombstoned_at TEXT NOT NULL DEFAULT ''`
+        ).run();
+
+        this.db.prepare('UPDATE schema_version SET version = 9').run();
+      })();
+      currentVersion = 9;
+    }
+
     // === Indexes (idempotent, run on every startup) ===
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
@@ -777,6 +833,18 @@ export class SqliteStore implements GraphStore {
         );
       }
     }
+
+    // --- Startup eviction check ---
+    // Run one eviction check at startup in case the database grew past the cap while
+    // the server was down. This is cheap (just a statSync) and only triggers actual
+    // eviction work if the DB exceeds 90% of the configured cap.
+    const startupEviction = checkAndEvict(this.db, this.dbPath);
+    if (startupEviction.triggered) {
+      console.error(
+        `Startup eviction: hard-deleted ${startupEviction.hardDeleted} entities, ` +
+        `tombstoned ${startupEviction.tombstoned} entities (DB size: ${(startupEviction.dbSize / 1_000_000).toFixed(1)} MB)`
+      );
+    }
   }
 
   /**
@@ -816,11 +884,81 @@ export class SqliteStore implements GraphStore {
     }
   }
 
+  /**
+   * Updates `last_accessed_at` on one or more entities to the current timestamp.
+   * Called by methods that represent intentional access: search_nodes, open_nodes,
+   * entity_timeline, and all write operations. NOT called by read_graph (bulk) or
+   * the eviction sweep (which uses raw SQL to avoid the observer effect — see §12
+   * of the v1.1 design spec).
+   *
+   * Accepts entity IDs (integers) to avoid re-lookups. Uses IN-clause chunking
+   * (same CHUNK_SIZE as openNodes) for large batches. Silently ignores empty input.
+   *
+   * @param entityIds - Array of entity row IDs to touch
+   */
+  private touchEntities(entityIds: number[]): void {
+    if (entityIds.length === 0) return;
+    const now = new Date().toISOString();
+    // Deduplicate so we don't issue redundant updates for the same entity.
+    const unique = [...new Set(entityIds)];
+    for (let i = 0; i < unique.length; i += CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(', ');
+      this.db.prepare(
+        `UPDATE entities SET last_accessed_at = ? WHERE id IN (${placeholders}) AND superseded_at = ''`
+      ).run(now, ...chunk);
+    }
+  }
+
+  /**
+   * Variant of touchEntities that accepts normalized entity names instead of IDs.
+   * Used by methods where we have names but not IDs (e.g. searchNodes, openNodes).
+   *
+   * @param normalizedNames - Array of normalized entity names to touch
+   */
+  private touchEntitiesByName(normalizedNames: string[]): void {
+    if (normalizedNames.length === 0) return;
+    const now = new Date().toISOString();
+    const unique = [...new Set(normalizedNames)];
+    for (let i = 0; i < unique.length; i += CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(', ');
+      this.db.prepare(
+        `UPDATE entities SET last_accessed_at = ? WHERE normalized_name IN (${placeholders}) AND superseded_at = ''`
+      ).run(now, ...chunk);
+    }
+  }
+
+  /**
+   * Increments the write counter and runs eviction if the interval threshold is reached.
+   * Called at the end of every write method. The check itself is cheap — just a statSync
+   * on the DB file to check size. Actual eviction only runs if the DB exceeds 90% of the
+   * configured cap (default 1 GB).
+   *
+   * Eviction uses raw SQL through the db handle directly (via evict.ts), NOT through
+   * any GraphStore method. This is the "observer effect" discipline from §12 of the
+   * design spec — the eviction sweep must never update last_accessed_at while scanning.
+   */
+  private maybeRunEviction(): void {
+    this.writesSinceLastEvictionCheck++;
+    if (this.writesSinceLastEvictionCheck < EVICTION_CHECK_INTERVAL) return;
+    this.writesSinceLastEvictionCheck = 0;
+
+    const result = checkAndEvict(this.db, this.dbPath);
+    if (result.triggered) {
+      console.error(
+        `Eviction sweep: hard-deleted ${result.hardDeleted} entities, ` +
+        `tombstoned ${result.tombstoned} entities (DB size: ${(result.dbSize / 1_000_000).toFixed(1)} MB)`
+      );
+    }
+  }
+
   private migrateFromJsonl(graph: KnowledgeGraph): void {
     // Prepared statements are compiled once and reused for every row in the transaction.
     // Schema v8 added normalized_name as the identity key — every entity insert must populate it.
+    // last_accessed_at initialized to updated_at — migration data gets a reasonable starting point.
     const insertEntity = this.db.prepare(
-      'INSERT OR IGNORE INTO entities (name, normalized_name, entity_type, project, updated_at, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO entities (name, normalized_name, entity_type, project, updated_at, created_at, last_accessed_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
     );
     // Look up the auto-assigned id after inserting. Goes through normalized_name +
     // active filter so a hypothetical re-run (after partial crash) finds the right row
@@ -863,7 +1001,7 @@ export class SqliteStore implements GraphStore {
         // Compute the identity key. normalizeEntityName() throws on empty/separator-only
         // names — that throws out of the txn callback and rolls back the migration cleanly.
         const normalizedName = normalizeEntityName(entity.name);
-        insertEntity.run(entity.name, normalizedName, entity.entityType, migratedProject, entityUpdatedAt, entityCreatedAt);
+        insertEntity.run(entity.name, normalizedName, entity.entityType, migratedProject, entityUpdatedAt, entityCreatedAt, entityUpdatedAt);
         const row = getEntityId.get(normalizedName) as { id: number } | undefined;
         if (!row) {
           // INSERT OR IGNORE skipped (collision with an earlier surface variant in
@@ -1064,8 +1202,9 @@ export class SqliteStore implements GraphStore {
     // Prepared statements are compiled once and reused -- faster than parsing per row.
     // INSERT now writes both `name` (display, preserved as the caller supplied) and
     // `normalized_name` (identity key, used by the partial unique index for collision detection).
+    // last_accessed_at is set to creation time — the act of creating is the strongest access signal.
     const insertEntity = this.db.prepare(
-      'INSERT OR IGNORE INTO entities (name, normalized_name, entity_type, project, updated_at, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO entities (name, normalized_name, entity_type, project, updated_at, created_at, last_accessed_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
     );
     // Lookups go through normalized_name now (the identity key). Filter superseded_at = ''
     // so we only see the active row, not historical soft-deleted rows that may share
@@ -1098,7 +1237,7 @@ export class SqliteStore implements GraphStore {
 
         // INSERT OR IGNORE returns changes=0 if normalized_name already exists
         // among ACTIVE rows (the partial unique index enforces this).
-        const info = insertEntity.run(e.name, normalizedName, e.entityType, normalizedProject, now, now);
+        const info = insertEntity.run(e.name, normalizedName, e.entityType, normalizedProject, now, now, now);
         if (info.changes === 0) {
           // Collision -- look up the existing winner so we can report both the
           // input display form (caller's `name`) and the stored display form (`existingName`).
@@ -1157,6 +1296,7 @@ export class SqliteStore implements GraphStore {
       }
     }
 
+    this.maybeRunEviction();
     return { created, skipped };
   }
 
@@ -1224,6 +1364,18 @@ export class SqliteStore implements GraphStore {
     });
     txn();
 
+    // Touch last_accessed_at on endpoint entities — creating a relation is a write that
+    // signals the caller cares about these entities.
+    if (results.length > 0) {
+      const endpointNames = new Set<string>();
+      for (const r of relations) {
+        try { endpointNames.add(normalizeEntityName(r.from)); } catch { /* skip */ }
+        try { endpointNames.add(normalizeEntityName(r.to)); } catch { /* skip */ }
+      }
+      this.touchEntitiesByName([...endpointNames]);
+    }
+
+    this.maybeRunEviction();
     return results;
   }
 
@@ -1248,9 +1400,10 @@ export class SqliteStore implements GraphStore {
     const insertObs = this.db.prepare(
       'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type) VALUES (?, ?, ?, ?, ?, ?)'
     );
-    // Prepared statement to bump updated_at when observations are added to an entity
+    // Prepared statement to bump updated_at and last_accessed_at when observations
+    // are added to an entity — writes are the strongest access signal.
     const updateTimestamp = this.db.prepare(
-      'UPDATE entities SET updated_at = ? WHERE id = ?'
+      'UPDATE entities SET updated_at = ?, last_accessed_at = ? WHERE id = ?'
     );
 
     const results: AddObservationResult[] = [];
@@ -1282,9 +1435,9 @@ export class SqliteStore implements GraphStore {
           }
         }
 
-        // Bump the entity's updated_at if any observations were actually added
+        // Bump the entity's updated_at and last_accessed_at if any observations were actually added
         if (addedObservations.length > 0) {
-          updateTimestamp.run(now, row.id);
+          updateTimestamp.run(now, now, row.id);
         }
 
         results.push({ entityName: o.entityName, addedObservations });
@@ -1387,6 +1540,7 @@ export class SqliteStore implements GraphStore {
       }
     }
 
+    this.maybeRunEviction();
     return results;
   }
 
@@ -1456,6 +1610,7 @@ export class SqliteStore implements GraphStore {
       }
     });
     txn();
+    this.maybeRunEviction();
   }
 
   /**
@@ -1475,9 +1630,10 @@ export class SqliteStore implements GraphStore {
     const delObs = this.db.prepare(
       `DELETE FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
     );
-    // Prepared statement to bump updated_at when observations are removed from an entity
+    // Prepared statement to bump updated_at and last_accessed_at when observations
+    // are removed from an entity — writes are the strongest access signal.
     const updateTimestamp = this.db.prepare(
-      'UPDATE entities SET updated_at = ? WHERE id = ?'
+      'UPDATE entities SET updated_at = ?, last_accessed_at = ? WHERE id = ?'
     );
 
     const deletedObsIds: number[] = [];
@@ -1509,7 +1665,8 @@ export class SqliteStore implements GraphStore {
         // Only bump updated_at if observations were actually deleted —
         // avoids spurious timestamp advances on no-op deletions (e.g., misspelled content)
         if (anyDeleted) {
-          updateTimestamp.run(new Date().toISOString(), row.id);
+          const deleteNow = new Date().toISOString();
+          updateTimestamp.run(deleteNow, deleteNow, row.id);
         }
       }
     });
@@ -1521,6 +1678,7 @@ export class SqliteStore implements GraphStore {
     for (const obsId of deletedObsIds) {
       this.syncEmbedding(obsId, '', 'delete');
     }
+    this.maybeRunEviction();
   }
 
   /**
@@ -1551,6 +1709,7 @@ export class SqliteStore implements GraphStore {
       }
     });
     txn();
+    this.maybeRunEviction();
   }
 
   /**
@@ -1584,9 +1743,9 @@ export class SqliteStore implements GraphStore {
     const insertObs = this.db.prepare(
       `INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type) VALUES (?, ?, ?, ?, ?, ?)`
     );
-    // Bump entity's updated_at timestamp
+    // Bump entity's updated_at and last_accessed_at — writes are the strongest access signal.
     const updateTimestamp = this.db.prepare(
-      'UPDATE entities SET updated_at = ? WHERE id = ?'
+      'UPDATE entities SET updated_at = ?, last_accessed_at = ? WHERE id = ?'
     );
 
     // better-sqlite3 transactions are synchronous -- the outer async wrapper
@@ -1627,8 +1786,8 @@ export class SqliteStore implements GraphStore {
         // INSERT OR IGNORE: if newContent already exists as an active observation, skip.
         insertObs.run(entityRow.id, s.newContent, now, obsRow.importance, obsRow.context_layer, obsRow.memory_type);
 
-        // Bump updated_at so the entity surfaces in recency-ordered queries
-        updateTimestamp.run(now, entityRow.id);
+        // Bump updated_at and last_accessed_at so the entity surfaces in recency-ordered queries
+        updateTimestamp.run(now, now, entityRow.id);
       }
     });
     txn();
@@ -1647,6 +1806,7 @@ export class SqliteStore implements GraphStore {
         this.syncEmbedding(newObsRow.id, s.newContent, 'upsert');
       }
     }
+    this.maybeRunEviction();
   }
 
   /**
@@ -2284,6 +2444,13 @@ export class SqliteStore implements GraphStore {
     const entityNames = new Set(entities.map(e => e.name));
     const allEntityNamesList = [...entityNames];
 
+    // Touch last_accessed_at on all returned entities — targeted search expresses intent.
+    // Only for current-time queries (not asOf historical reads, which are about the past).
+    if (!asOf && entities.length > 0) {
+      const normalizedNames = entities.map(e => normalizeEntityName(e.name));
+      this.touchEntitiesByName(normalizedNames);
+    }
+
     // When paginated or project-filtered, both endpoints must be in the result set.
     // When not paginated and not project-filtered, use OR logic (backward compat).
     if (isPaginated || projectId) {
@@ -2360,6 +2527,11 @@ export class SqliteStore implements GraphStore {
     }
 
     const entities = this.buildEntities(entityRows, asOf);
+
+    // Touch last_accessed_at — naming an entity is intent. Skip for historical reads.
+    if (!asOf && entityRows.length > 0) {
+      this.touchEntities(entityRows.map(e => e.id));
+    }
 
     // When project-filtered, use AND logic for relations (both endpoints in result set);
     // when unfiltered, use OR logic (at least one endpoint matches) for backward compat.
@@ -2442,6 +2614,18 @@ export class SqliteStore implements GraphStore {
       }
     });
     txn();
+
+    // Touch last_accessed_at on endpoint entities — invalidating a relation is a write.
+    if (totalChanged > 0) {
+      const endpointNames = new Set<string>();
+      for (const r of relations) {
+        try { endpointNames.add(normalizeEntityName(r.from)); } catch { /* skip */ }
+        try { endpointNames.add(normalizeEntityName(r.to)); } catch { /* skip */ }
+      }
+      this.touchEntitiesByName([...endpointNames]);
+    }
+
+    this.maybeRunEviction();
     return totalChanged;
   }
 
@@ -2498,24 +2682,31 @@ export class SqliteStore implements GraphStore {
     // Collect all entity IDs for the observation lookup so we get the full history
     // across re-creation cycles.
     const allEntityIds = entityRows.map(r => r.id);
+
+    // Touch last_accessed_at — viewing history expresses intent. Only touch active rows.
+    const activeIds = entityRows.filter(r => r.superseded_at === '').map(r => r.id);
+    this.touchEntities(activeIds);
     const idPlaceholders = allEntityIds.map(() => '?').join(',');
 
     // Fetch ALL observations (active AND superseded) across ALL incarnations of the
     // name, sorted chronologically. Unlike buildEntities() which filters
     // superseded_at = '', this returns everything for the timeline view.
     const obsRows = this.db.prepare(`
-      SELECT content, created_at, superseded_at
+      SELECT content, created_at, superseded_at, tombstoned_at
       FROM observations WHERE entity_id IN (${idPlaceholders})
       ORDER BY created_at ASC
-    `).all(...allEntityIds) as { content: string; created_at: string; superseded_at: string }[];
+    `).all(...allEntityIds) as { content: string; created_at: string; superseded_at: string; tombstoned_at: string }[];
 
-    // Map DB rows to TimelineObservation with computed status field
+    // Map DB rows to TimelineObservation with computed status field.
+    // Three states: active (superseded_at=''), tombstoned (tombstoned_at!='', content stripped
+    // by eviction), or superseded (retired by a newer version).
     const observations: TimelineObservation[] = obsRows.map(o => ({
       content: o.content,
       createdAt: o.created_at,
       supersededAt: o.superseded_at,
-      // '' superseded_at = still active; non-empty = has been superseded
-      status: o.superseded_at === '' ? 'active' as const : 'superseded' as const,
+      status: o.tombstoned_at !== '' ? 'tombstoned' as const
+            : o.superseded_at === '' ? 'active' as const
+            : 'superseded' as const,
     }));
 
     // Fetch ALL relations (active AND superseded) involving this entity.
@@ -2531,7 +2722,8 @@ export class SqliteStore implements GraphStore {
         COALESCE(et.name, r.to_entity)   AS to_entity,
         r.relation_type,
         r.created_at,
-        r.superseded_at
+        r.superseded_at,
+        r.tombstoned_at
       FROM relations r
       LEFT JOIN entities ef ON ef.normalized_name = r.from_entity AND ef.superseded_at = ''
       LEFT JOIN entities et ON et.normalized_name = r.to_entity   AND et.superseded_at = ''
@@ -2539,17 +2731,20 @@ export class SqliteStore implements GraphStore {
       ORDER BY r.created_at ASC
     `).all(normalizedName, normalizedName) as {
       from_entity: string; to_entity: string; relation_type: string;
-      created_at: string; superseded_at: string;
+      created_at: string; superseded_at: string; tombstoned_at: string;
     }[];
 
-    // Map DB rows to TimelineRelation with computed status field
+    // Map DB rows to TimelineRelation with computed status field.
+    // Same three-state logic as observations: tombstoned > superseded > active.
     const relations: TimelineRelation[] = relRows.map(r => ({
       from: r.from_entity,
       to: r.to_entity,
       relationType: r.relation_type,
       createdAt: r.created_at,
       supersededAt: r.superseded_at,
-      status: r.superseded_at === '' ? 'active' as const : 'superseded' as const,
+      status: r.tombstoned_at !== '' ? 'tombstoned' as const
+            : r.superseded_at === '' ? 'active' as const
+            : 'superseded' as const,
     }));
 
     return {
@@ -2846,17 +3041,19 @@ export class SqliteStore implements GraphStore {
         }
       }
 
-      // Bump updated_at on every entity that had at least one observation modified.
+      // Bump updated_at and last_accessed_at on every entity that had at least one
+      // observation modified — writes are the strongest access signal.
       if (touchedEntityIds.size > 0) {
         const updateEntity = this.db.prepare(
-          'UPDATE entities SET updated_at = ? WHERE id = ?'
+          'UPDATE entities SET updated_at = ?, last_accessed_at = ? WHERE id = ?'
         );
         for (const id of touchedEntityIds) {
-          updateEntity.run(now, id);
+          updateEntity.run(now, now, id);
         }
       }
     })();
 
+    this.maybeRunEviction();
     return totalUpdated;
   }
 }

@@ -73,7 +73,8 @@ export interface TimelineObservation {
   content: string;
   createdAt: string;
   supersededAt: string;
-  status: 'active' | 'superseded';
+  /** 'active' = current, 'superseded' = retired by newer version, 'tombstoned' = content stripped by eviction. */
+  status: 'active' | 'superseded' | 'tombstoned';
 }
 
 /** Relation entry in an entity timeline — includes invalidated relations. */
@@ -83,7 +84,8 @@ export interface TimelineRelation {
   relationType: string;
   createdAt: string;
   supersededAt: string;
-  status: 'active' | 'superseded';
+  /** 'active' = current, 'superseded' = retired, 'tombstoned' = stripped by eviction. */
+  status: 'active' | 'superseded' | 'tombstoned';
 }
 
 /** Full timeline response for a single entity. */

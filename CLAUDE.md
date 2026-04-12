@@ -45,7 +45,7 @@ This section exists so any future Claude session opening this project sees the *
 
 ## Architecture
 
-The server is split across 6 source files:
+The server is split across 7 source files:
 
 ### `types.ts` (~330 lines)
 - Defines the `Entity`, `Relation`, `KnowledgeGraph`, and `Observation` types
@@ -116,10 +116,22 @@ The server is split across 6 source files:
 - In-memory cursor-based pagination with entity name as tiebreaker
 - Imports cursor utilities from `cursor.ts`
 
-### `sqlite-store.ts` (~2650 lines)
+### `evict.ts` (~300 lines)
+- Four-tier degradation and size-pressure eviction module implementing §12 of the v1.1 design spec
+- `checkAndEvict(db, dbPath)`: main entry point — checks if DB size exceeds 90% of cap, runs eviction sweep if so
+- Tier 1: hard-delete tombstoned entities (tombstoned_at > 1 year, last_accessed_at > 6 months)
+- Tier 2: tombstone superseded entities (superseded_at > 1 year, last_accessed_at > 6 months) — strips observation content, preserves skeleton
+- Never hard-deletes active data on size pressure alone
+- LRU shield: entities accessed within 6 months are protected at every tier
+- **CRITICAL: uses raw SQL through better-sqlite3 Database handle directly** — NOT through any GraphStore method. The eviction sweep is a consumer of `last_accessed_at`, never a producer. Routing through GraphStore would update `last_accessed_at` on every scanned entity, defeating the LRU shield (the "observer effect" from §12).
+- `getCapBytes()`: reads `MEMORY_SIZE_CAP_BYTES` env var, defaults to 1 GB
+- Batch processing (BATCH_SIZE=500) to avoid blocking the main loop
+- `EvictionResult` interface: `{ triggered, hardDeleted, tombstoned, dbSize }`
+
+### `sqlite-store.ts` (~3050 lines)
 - `SqliteStore` class: SQLite backend using `better-sqlite3`
 - Implements the `GraphStore` interface
-- **Schema version tracking**: `schema_version` table with `CHECK(id=1)` single-row constraint. Versions 1–8 tracked. Legacy databases detected via column existence heuristics and assigned an initial version. All migrations run in sequence on startup.
+- **Schema version tracking**: `schema_version` table with `CHECK(id=1)` single-row constraint. Versions 1–9 tracked. Legacy databases detected via column existence heuristics and assigned an initial version. All migrations run in sequence on startup.
 - **Entity name normalization (v8)**: `entities.normalized_name` is the identity key (lowercased + NFC + separators stripped, produced by `normalize-name.ts`). `entities.name` preserves the original display form the user typed. All lookups and uniqueness constraints use `normalized_name`; tool output surfaces `name`. Partial unique index `idx_entities_normalized_active ON entities(normalized_name) WHERE superseded_at = ''` enforces one active identity per normalized key.
 - **Relations store normalized endpoints (v8)**: `relations.from_entity` and `relations.to_entity` hold the normalized identity keys — not display names — so lookups work regardless of which surface variant the caller used. `readGraph()` and `searchNodes()` translate endpoints back to display form via `LEFT JOIN entities ON ... COALESCE(e.name, r.from_entity)` so output always shows the user's original capitalization/separators. v6→v7 migration drops the FK clause from `relations.from_entity`/`to_entity` (the underlying `entities.name` UNIQUE constraint is now partial, and partial unique indexes don't qualify as FK targets in SQLite); integrity is enforced by the v8 migration's explicit orphan check and the tool-boundary normalization.
 - `project TEXT` nullable column on entities table — `NULL` means global (visible to all projects)
@@ -139,6 +151,9 @@ The server is split across 6 source files:
 - `idx_relations_to_entity_active` partial index on `relations(to_entity) WHERE superseded_at = ''`; `idx_entities_project_updated(project, updated_at DESC, id DESC)` and `idx_entities_updated(updated_at DESC, id DESC)` indexes for paginated reads
 - Single-column `idx_entities_project` dropped on startup (redundant — covered by composite `idx_entities_project_updated`)
 - **Graceful shutdown**: `private shuttingDown` flag checked in `runEmbeddingSweep` loop. `shutdown()` method sets the flag. Called from SIGINT/SIGTERM handlers before `close()`.
+- **Eviction integration**: `maybeRunEviction()` private helper increments a write counter and calls `checkAndEvict()` (from `evict.ts`) every 1000 writes. Also runs a startup eviction check in `init()`. All 9 write methods call `maybeRunEviction()` at the end.
+- **`last_accessed_at` access discipline**: `touchEntities()` and `touchEntitiesByName()` private helpers update the timestamp. Called by: `searchNodes`, `openNodes`, `entityTimeline`, and all write operations. NOT called by `readGraph` (bulk reads aren't intentional access). The eviction sweep never touches `last_accessed_at` (uses raw SQL in evict.ts).
+- **`tombstoned_at`** columns on entities, observations, and relations (v9). Tombstoned entities have `superseded_at != ''` (from original soft-delete) so existing `WHERE superseded_at = ''` filters already exclude them from active queries. The `tombstoned_at` column is only meaningful for the eviction sweep and `entityTimeline()` output (which shows `'tombstoned'` status for stripped observations/relations).
 - Opens the database with WAL mode (Write-Ahead Logging) — allows reads to proceed concurrently with writes
 - `foreign_keys = ON` is set per connection — SQLite does not enable FK constraints by default, so this must be set explicitly each time the connection opens
 - Deduplication is enforced at the database level via `UNIQUE` constraints on entity names, relation triples (+ superseded_at), and (entity + observation content + superseded_at) — `INSERT OR IGNORE` silently skips duplicate inserts
@@ -146,7 +161,7 @@ The server is split across 6 source files:
 - Cursor-based keyset pagination on `(updated_at DESC, id DESC)` — imports cursor utilities from `cursor.ts`
 - `openNodes` uses IN-clause chunking (CHUNK_SIZE=900) for consistency with other methods
 
-### `index.ts` (~760 lines)
+### `index.ts` (~780 lines)
 - Entry point: registers 16 MCP tools via `server.registerTool()`
 - `StoreConfig` type and `ensureMemoryFilePath()`: resolves the storage path from `MEMORY_FILE_PATH` env var and returns which store class to use
   - `.jsonl` extension → `JsonlStore`
@@ -212,19 +227,21 @@ Database schema is versioned in the single-row `schema_version` table (CHECK con
 - **v5→v6:** Observation metadata — `importance REAL DEFAULT 3.0`, `context_layer TEXT NULL`, `memory_type TEXT NULL` on observations.
 - **v6→v7:** Soft-delete on entities — `superseded_at TEXT NOT NULL DEFAULT ''` column, partial unique index `idx_entities_name_active ON entities(name) WHERE superseded_at = ''`. FK clauses on `relations.from_entity`/`to_entity` are dropped in this migration because partial unique indexes don't qualify as FK targets in SQLite.
 - **v7→v8:** Entity name normalization — adds `normalized_name` column on entities (the identity key), rewrites `relations.from_entity`/`to_entity` to normalized form, drops `idx_entities_name_active`, creates `idx_entities_normalized_active ON entities(normalized_name) WHERE superseded_at = ''`. Collision check before index creation aborts the migration (rollback) if two active rows normalize to the same key, naming both display forms and the collision key. Wrapped with `PRAGMA foreign_keys = OFF/ON` (outside the transaction) to tolerate historical databases that arrived at v7 with stale FK clauses still attached; integrity is enforced by an explicit orphan check inside the migration.
+- **v8→v9:** Eviction infrastructure — adds `tombstoned_at TEXT NOT NULL DEFAULT ''` on entities, observations, and relations; adds `last_accessed_at TEXT NOT NULL DEFAULT ''` on entities, backfilled from `updated_at`. Supports the four-tier degradation chain (§12).
 
-## Tests (502 total across 8 test files)
+## Tests (520 total across 9 test files)
 - `__tests__/knowledge-graph.test.ts` (358 tests) — parameterized suite (`describe.each`) running shared behavioral tests against both `JsonlStore` and `SqliteStore`, covering all CRUD operations, deduplication, composite key safety, search, edge cases, observation timestamps, normalizeObservation validation, atomic writes (JSONL), idempotent delete edge cases, project filtering, cursor-based pagination, supersedeObservations, temporal relations (createdAt/supersededAt on relations, invalidateRelations, entityTimeline), similarity check, totalCount accuracy, entity name normalization behavioral tests, setObservationMetadata (importance/contextLayer/memoryType updates, entity not found, observation not found, surface variant lookup, timestamp bumps, superseded exclusion, batch updates), getContextLayers (empty result, importance sorting, layer filtering, project scoping, L2 exclusion, L1 token budget truncation), getSummary (empty result, importance+recency sorting, observation counts, limit param, project scoping, excludeContextLayers, aggregate stats, recentEntities project scoping, superseded observation exclusion, soft-deleted entity exclusion). Plus JSONL-specific and SQLite-specific tests (including `entity name normalization (Layer 1)` block, getSummary/getContextLayers soft-delete exclusion, setObservationMetadata batch atomicity rollback).
 - `__tests__/mcp-tools.test.ts` (82 tests) — integration tests for MCP tool handlers including invalidate_relations, entity_timeline, normalization at the tool boundary, set_observation_metadata Zod schema validation (name normalization, importance range, contextLayer enum, null demotion), and get_summary Zod schema validation (limit range, valid input acceptance)
 - `__tests__/normalize-name.test.ts` (17 tests) — unit tests for `normalizeEntityName()`: NFC equivalence, case fold, separator stripping, Turkish dotted-I behavior, empty/whitespace/separator-only rejection
 - `__tests__/file-path.test.ts` (16 tests) — `StoreConfig` return type, extension routing (.jsonl / .db / .sqlite / default), and legacy .json→.jsonl migration
 - `__tests__/migration.test.ts` (5 tests) — JSONL→SQLite auto-migration: data transfer, .jsonl.bak rename, idempotency when .db already exists, empty JSONL file handling
-- `__tests__/migration-validation.test.ts` (14 tests) — schema version tracking and migration validation across versions 1–8, including v7→v8 forward-migration test (display preservation + relation rewrite) and collision-abort test (two active entities normalizing to same key → rollback)
+- `__tests__/migration-validation.test.ts` (15 tests) — schema version tracking and migration validation across versions 1–9, including v7→v8 forward-migration test (display preservation + relation rewrite), collision-abort test (two active entities normalizing to same key → rollback), and v8→v9 forward test (tombstoned_at + last_accessed_at columns with backfill verification)
+- `__tests__/eviction.test.ts` (17 tests) — eviction system tests: last_accessed_at access discipline (7 tests covering create/search/open/timeline/read/add/supersede operations), eviction module unit tests (7 tests: below-threshold no-op, getCapBytes env var + fallback, hard-delete tombstoned, tombstone superseded, LRU shield protection, active entity immunity), entity_timeline tombstoned status (2 tests: observation + relation tombstoned rendering), eviction lifecycle integration (1 test)
 - `__tests__/vector-search.test.ts` (4 tests) — vector state reporting, MEMORY_VECTOR_SEARCH=off degradation, LIKE fallback while loading, superseded observations excluded from LIKE search
 - `__tests__/vector-integration.test.ts` (6 tests) — end-to-end tests with real embedding model: semantic search, LIKE+vector dedup, superseded observation exclusion, similarExisting check, as_of recovery of superseded matches, soft-deleted entity exclusion. Skip with `SKIP_VECTOR_INTEGRATION=1`.
 - `__tests__/smoke-test-vec.ts` — one-off script (not a vitest test) validating sqlite-vec + better-sqlite3 + @huggingface/transformers compatibility on this platform
 
-**Test pool discipline:** The suite runs in two commands. Pool 1 (non-vector, 496 tests): `MEMORY_VECTOR_SEARCH=off SKIP_VECTOR_INTEGRATION=1 npx vitest run --exclude '**/vector-integration.test.ts'`. Pool 2 (vector integration, 6 tests): `MEMORY_VECTOR_SEARCH=on npx vitest run __tests__/vector-integration.test.ts --pool=forks --poolOptions.forks.singleFork=true`. See `feedback_local_llm_test_pool_discipline.md` for the reasoning (the local ONNX model load must be isolated and single-fork to avoid hard-reboots).
+**Test pool discipline:** The suite runs in two commands. Pool 1 (non-vector, 514 tests): `MEMORY_VECTOR_SEARCH=off SKIP_VECTOR_INTEGRATION=1 npx vitest run --exclude '**/vector-integration.test.ts'`. Pool 2 (vector integration, 6 tests): `MEMORY_VECTOR_SEARCH=on npx vitest run __tests__/vector-integration.test.ts --pool=forks --poolOptions.forks.singleFork=true`. See `feedback_local_llm_test_pool_discipline.md` for the reasoning (the local ONNX model load must be isolated and single-fork to avoid hard-reboots).
 
 ## Version History
 - **v1.0.0** — Temporal relations (superseded_at on relations, invalidate_relations + entity_timeline tools), similarity check on addObservations, schema version tracking (versions 1–5), graceful shutdown, totalCount fix, JSONL backend deprecated

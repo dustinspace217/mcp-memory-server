@@ -788,14 +788,14 @@ describe('Migration safety validation', () => {
 
     db.close();
 
-    // Open with SqliteStore — should auto-migrate v7 → v8.
+    // Open with SqliteStore — should auto-migrate v7 → v8 (and then v8 → v9).
     const sqliteStore = new SqliteStore(dbPath);
     await sqliteStore.init();
 
-    // Verify schema_version is now 8.
+    // Verify schema_version is now 9 (v7→v8 normalization + v8→v9 eviction columns).
     const db2 = new Database(dbPath);
     const version = (db2.prepare(`SELECT version FROM schema_version`).get() as { version: number }).version;
-    expect(version).toBe(8);
+    expect(version).toBe(9);
 
     // Verify normalized_name column was added with NOT NULL constraint.
     const v8Cols = db2.prepare(`PRAGMA table_info(entities)`).all() as { name: string; dflt_value: string | null; notnull: number }[];
@@ -954,5 +954,120 @@ describe('Migration safety validation', () => {
     // sqliteStore.close() is safe to call even after a failed init (the
     // underlying Database handle was opened before the transaction threw).
     try { await sqliteStore.close(); } catch { /* ignore */ }
+  });
+
+  it('should migrate v8 → v9: add tombstoned_at + last_accessed_at for eviction', async () => {
+    // Create a v8 database directly, then verify that SqliteStore auto-migrates
+    // it to v9 (eviction infrastructure):
+    //   - adds tombstoned_at column on entities, observations, and relations
+    //   - adds last_accessed_at column on entities (backfilled from updated_at)
+    //   - bumps schema_version to 9
+    const id = Date.now();
+    dbPath = path.join(testDir, `test-v8-to-v9-${id}.db`);
+    jsonlPath = path.join(testDir, `nonexistent-${id}.jsonl`); // not used, just for cleanup
+
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
+
+    // Build v8 schema directly.
+    db.prepare(`CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL)`).run();
+    db.prepare(`INSERT INTO schema_version (id, version) VALUES (1, 8)`).run();
+
+    // entities table — v8 schema (has normalized_name, NO tombstoned_at/last_accessed_at).
+    db.prepare(`CREATE TABLE entities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      project TEXT,
+      updated_at TEXT NOT NULL DEFAULT '0000-00-00T00:00:00.000Z',
+      created_at TEXT NOT NULL DEFAULT '0000-00-00T00:00:00.000Z',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      normalized_name TEXT NOT NULL DEFAULT ''
+    )`).run();
+
+    // observations table — v8 schema (has importance/context_layer/memory_type, NO tombstoned_at).
+    db.prepare(`CREATE TABLE observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      superseded_at TEXT NOT NULL DEFAULT '',
+      importance REAL NOT NULL DEFAULT 3.0,
+      context_layer TEXT,
+      memory_type TEXT,
+      UNIQUE(entity_id, content, superseded_at)
+    )`).run();
+
+    // relations table — v8 schema (normalized endpoints, NO tombstoned_at).
+    db.prepare(`CREATE TABLE relations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_entity TEXT NOT NULL,
+      to_entity TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT '',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      UNIQUE(from_entity, to_entity, relation_type, superseded_at)
+    )`).run();
+
+    // Insert test data with a known updated_at so we can verify last_accessed_at backfill.
+    const knownTimestamp = '2026-04-10T12:00:00.000Z';
+    db.prepare(`INSERT INTO entities (name, entity_type, project, updated_at, created_at, normalized_name) VALUES (?, ?, NULL, ?, ?, ?)`).run(
+      'TestEntity', 'concept', knownTimestamp, knownTimestamp, 'testentity'
+    );
+    const entityId = (db.prepare('SELECT id FROM entities WHERE name = ?').get('TestEntity') as { id: number }).id;
+    db.prepare(`INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)`).run(
+      entityId, 'test observation', knownTimestamp
+    );
+    db.prepare(`INSERT INTO relations (from_entity, to_entity, relation_type) VALUES (?, ?, ?)`).run(
+      'testentity', 'testentity', 'self-ref'
+    );
+
+    db.close();
+
+    // Open with SqliteStore — should auto-migrate v8 → v9.
+    const sqliteStore = new SqliteStore(dbPath);
+    await sqliteStore.init();
+
+    // Verify: schema version is now 9.
+    const db2 = new Database(dbPath, { readonly: true });
+    const version = (db2.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+    expect(version).toBe(9);
+
+    // Verify: entities has tombstoned_at and last_accessed_at columns.
+    const entityCols = db2.prepare('PRAGMA table_info(entities)').all() as { name: string }[];
+    const entityColNames = entityCols.map(c => c.name);
+    expect(entityColNames).toContain('tombstoned_at');
+    expect(entityColNames).toContain('last_accessed_at');
+
+    // Verify: observations has tombstoned_at column.
+    const obsCols = db2.prepare('PRAGMA table_info(observations)').all() as { name: string }[];
+    expect(obsCols.map(c => c.name)).toContain('tombstoned_at');
+
+    // Verify: relations has tombstoned_at column.
+    const relCols = db2.prepare('PRAGMA table_info(relations)').all() as { name: string }[];
+    expect(relCols.map(c => c.name)).toContain('tombstoned_at');
+
+    // Verify: last_accessed_at was backfilled from updated_at.
+    const entity = db2.prepare('SELECT last_accessed_at, updated_at FROM entities WHERE name = ?').get('TestEntity') as {
+      last_accessed_at: string;
+      updated_at: string;
+    };
+    expect(entity.last_accessed_at).toBe(knownTimestamp);
+    expect(entity.last_accessed_at).toBe(entity.updated_at);
+
+    // Verify: tombstoned_at defaults to empty string (not tombstoned).
+    const entityRow = db2.prepare('SELECT tombstoned_at FROM entities WHERE name = ?').get('TestEntity') as { tombstoned_at: string };
+    expect(entityRow.tombstoned_at).toBe('');
+
+    const obsRow = db2.prepare('SELECT tombstoned_at FROM observations LIMIT 1').get() as { tombstoned_at: string };
+    expect(obsRow.tombstoned_at).toBe('');
+
+    const relRow = db2.prepare('SELECT tombstoned_at FROM relations LIMIT 1').get() as { tombstoned_at: string };
+    expect(relRow.tombstoned_at).toBe('');
+
+    db2.close();
+    await sqliteStore.close();
   });
 });
