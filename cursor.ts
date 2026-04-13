@@ -122,8 +122,10 @@ export function readGraphFingerprint(projectId?: string, asOf?: string): string 
  *
  * @param projectId - The project scope, or undefined/empty for global
  * @param query - The search query string
+ * @param asOf - Optional ISO 8601 timestamp for point-in-time queries
+ * @param memoryType - Optional memory type filter string
  * @returns Fingerprint string for cursor validation
  */
-export function searchNodesFingerprint(projectId?: string, query?: string, asOf?: string): string {
-  return `searchNodes\0${projectId ?? ''}\0${query ?? ''}\0${asOf ?? ''}`;
+export function searchNodesFingerprint(projectId?: string, query?: string, asOf?: string, memoryType?: string): string {
+  return `searchNodes\0${projectId ?? ''}\0${query ?? ''}\0${asOf ?? ''}\0${memoryType ?? ''}`;
 }

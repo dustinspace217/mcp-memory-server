@@ -24,6 +24,8 @@ import {
   type PaginatedKnowledgeGraph,
   type SupersedeInput,
   type SetObservationMetadataInput,
+  type CheckDuplicateInput,
+  type CheckDuplicatesResponse,
   type ContextLayersResult,
   type ContextLayerObservation,
   type SummaryResult,
@@ -556,6 +558,28 @@ export class JsonlStore implements GraphStore {
   }
 
   /**
+   * Pre-write duplicate check. JSONL backend has no vector search, so this
+   * always returns modelReady: false with empty matches. Not an error — the
+   * caller should interpret this as "unable to check, proceed with caution."
+   *
+   * @param candidates - Array of { entityName, content } to check (ignored)
+   * @returns CheckDuplicatesResponse with modelReady: false and empty matches
+   */
+  async checkDuplicates(candidates: CheckDuplicateInput[]): Promise<CheckDuplicatesResponse> {
+    // JSONL backend lacks vector search — return empty results with modelReady: false
+    // so the caller knows no similarity check was performed.
+    return {
+      results: candidates.map(c => ({
+        entityName: c.entityName,
+        candidateContent: c.content,
+        matches: [],
+      })),
+      modelReady: false,
+      errorCount: 0,
+    };
+  }
+
+  /**
    * Returns a concise summary snapshot by scanning the in-memory graph.
    * Three sections: top observations by importance, recently updated entities,
    * and aggregate stats.
@@ -563,9 +587,10 @@ export class JsonlStore implements GraphStore {
    * @param projectId - Optional project scope. Includes project + global entities.
    * @param excludeContextLayers - When true, excludes L0/L1 observations.
    * @param limit - Max top observations to return (default 20, max 100).
+   * @param memoryType - Optional filter for topObservations and recentEntities. Stats unfiltered.
    * @returns SummaryResult with topObservations, recentEntities, and stats
    */
-  async getSummary(projectId?: string, excludeContextLayers?: boolean, limit?: number): Promise<Readonly<SummaryResult>> {
+  async getSummary(projectId?: string, excludeContextLayers?: boolean, limit?: number, memoryType?: string): Promise<Readonly<SummaryResult>> {
     const graph = await this.loadGraph();
     const obsLimit = Math.min(Math.max(limit ?? 20, 1), 100);
 
@@ -580,6 +605,8 @@ export class JsonlStore implements GraphStore {
       for (const obs of entity.observations) {
         // Skip L0/L1 observations when excludeContextLayers is set.
         if (excludeContextLayers && obs.contextLayer !== null) continue;
+        // Skip observations that don't match the requested memoryType filter.
+        if (memoryType && obs.memoryType !== memoryType) continue;
 
         allObs.push({
           entityName: entity.name,
@@ -596,7 +623,13 @@ export class JsonlStore implements GraphStore {
     const topObservations = allObs.slice(0, obsLimit);
 
     // -- 2. Recently updated entities (last 5) --
-    const sortedEntities = [...entities].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    // When memoryType is set, only include entities that have at least one
+    // observation matching the type — otherwise the list would show entities
+    // with zero relevant observations.
+    const typeFilteredEntities = memoryType
+      ? entities.filter(e => e.observations.some(o => o.memoryType === memoryType))
+      : entities;
+    const sortedEntities = [...typeFilteredEntities].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     const recentEntities: SummaryEntity[] = sortedEntities.slice(0, 5).map(e => ({
       name: e.name,
       entityType: e.entityType,
@@ -749,9 +782,11 @@ export class JsonlStore implements GraphStore {
    * @param query - Case-insensitive substring to search for
    * @param projectId - Optional project name; only returns entities in this project or global
    * @param pagination - Optional cursor and limit for paginated results
+   * @param asOf - Not supported in JSONL backend — throws if provided
+   * @param memoryType - Optional filter: only return entities with matching observation type
    * @returns PaginatedKnowledgeGraph with matching entities, relations, nextCursor, and totalCount
    */
-  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string): Promise<PaginatedKnowledgeGraph> {
+  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string, memoryType?: string): Promise<PaginatedKnowledgeGraph> {
     if (asOf !== undefined) {
       throw new Error('as_of queries not supported in JSONL backend: migrate to SQLite');
     }
@@ -759,8 +794,8 @@ export class JsonlStore implements GraphStore {
     const lowerQuery = query.toLowerCase();
     // projectId arrives pre-normalized from normalizeProjectId() in index.ts
     const normalizedProject = projectId;
-    // Fingerprint includes both projectId and query so cursors can't cross-pollinate
-    const fingerprint = searchNodesFingerprint(projectId, query, asOf);
+    // Fingerprint includes projectId, query, asOf, and memoryType so cursors can't cross-pollinate
+    const fingerprint = searchNodesFingerprint(projectId, query, asOf, memoryType);
 
     // First filter: match by name, type, or observation content
     let filteredEntities = graph.entities.filter(e =>
@@ -773,6 +808,13 @@ export class JsonlStore implements GraphStore {
     if (normalizedProject) {
       filteredEntities = filteredEntities.filter(e =>
         e.project === normalizedProject || e.project === null
+      );
+    }
+
+    // Third filter: restrict to entities with at least one observation matching memoryType
+    if (memoryType) {
+      filteredEntities = filteredEntities.filter(e =>
+        e.observations.some(o => o.memoryType === memoryType)
       );
     }
 

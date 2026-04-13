@@ -209,7 +209,7 @@ const PaginatedOutputSchema = {
 
 const server = new McpServer({
   name: "memory-server",
-  version: "1.1.0",
+  version: "1.1.1",
 });
 
 server.registerTool(
@@ -429,13 +429,23 @@ server.registerTool(
       cursor: z.string().max(10000).optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page."),
       limit: z.number().int().min(1).max(100).optional().default(40).describe("Max entities per page (default 40, max 100)"),
       asOf: z.string().datetime({ offset: false }).optional().describe("ISO 8601 UTC timestamp (Z suffix only — no offsets). Returns graph state as it was at this moment. Omit for current state. When paginating, you MUST re-pass the same asOf on every page request — the cursor fingerprint encodes the temporal context, and a mismatched (or missing) asOf on a follow-up page will be rejected with InvalidCursorError."),
+      memoryType: z.string().min(1).max(50).optional().describe("Filter results to entities that have at least one observation with this memory_type (e.g., 'decision', 'procedure', 'preference'). Omit to search all types."),
     },
     outputSchema: PaginatedOutputSchema,
   },
-  async ({ query, projectId, cursor, limit, asOf }) => {
-    const result = await store.searchNodes(query, normalizeProjectId(projectId), { cursor, limit }, asOf);
+  async ({ query, projectId, cursor, limit, asOf, memoryType }) => {
+    const result = await store.searchNodes(query, normalizeProjectId(projectId), { cursor, limit }, asOf, memoryType);
+    // When memoryType is set but no results found, add a hint — a typo in
+    // memoryType silently returns empty and is indistinguishable from "no
+    // entities of this type." The hint lists known types so the caller can
+    // spot the mismatch.
+    const KNOWN_TYPES = ['decision', 'procedure', 'architecture', 'problem', 'preference', 'status', 'fact', 'emotional'];
+    let text = JSON.stringify(result, null, 2);
+    if (memoryType && result.entities.length === 0 && !KNOWN_TYPES.includes(memoryType)) {
+      text += `\n\nNote: no results for memoryType '${memoryType}'. Known types: ${KNOWN_TYPES.join(', ')}.`;
+    }
     return {
-      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      content: [{ type: "text" as const, text }],
       structuredContent: { ...result }
     };
   }
@@ -683,6 +693,8 @@ server.registerTool(
         .describe("When true, excludes L0/L1 observations from topObservations (to deduplicate with get_context_layers). Default false."),
       limit: z.number().int().min(1).max(100).optional()
         .describe("Max number of top observations to return. Default 20."),
+      memoryType: z.string().min(1).max(50).optional()
+        .describe("Filter topObservations and recentEntities to those with this memory_type (e.g., 'decision', 'procedure'). Stats remain unfiltered. Omit for all types."),
     },
     outputSchema: {
       topObservations: z.array(z.object({
@@ -706,20 +718,66 @@ server.registerTool(
       }).describe("Aggregate counts across the knowledge graph"),
     }
   },
-  async ({ projectId, excludeContextLayers, limit }) => {
+  async ({ projectId, excludeContextLayers, limit, memoryType }) => {
     const normalizedProject = normalizeProjectId(projectId);
-    const result = await store.getSummary(normalizedProject, excludeContextLayers, limit);
+    const result = await store.getSummary(normalizedProject, excludeContextLayers, limit, memoryType);
 
     // Build a human-readable summary for the text content.
     const obsCount = result.topObservations.length;
     const entCount = result.recentEntities.length;
     const { totalEntities, totalObservations, totalRelations, projectCount } = result.stats;
-    const text = `Summary: ${obsCount} top observation(s), ${entCount} recent entit${entCount === 1 ? 'y' : 'ies'}. ` +
+    let text = `Summary: ${obsCount} top observation(s), ${entCount} recent entit${entCount === 1 ? 'y' : 'ies'}. ` +
       `Graph totals: ${totalEntities} entities, ${totalObservations} observations, ` +
       `${totalRelations} relations across ${projectCount} project(s).`;
 
+    // Hint when memoryType is set but no results found — a typo silently
+    // returns empty, which is indistinguishable from "no entities of this type."
+    const KNOWN_TYPES = ['decision', 'procedure', 'architecture', 'problem', 'preference', 'status', 'fact', 'emotional'];
+    if (memoryType && obsCount === 0 && entCount === 0 && !KNOWN_TYPES.includes(memoryType)) {
+      text += `\n\nNote: no results for memoryType '${memoryType}'. Known types: ${KNOWN_TYPES.join(', ')}.`;
+    }
+
     return {
       content: [{ type: "text" as const, text }],
+      structuredContent: result as unknown as Record<string, unknown>,
+    };
+  }
+);
+
+server.registerTool(
+  "check_duplicates",
+  {
+    title: "Check Duplicates",
+    description: "Pre-write duplicate check. Embeds candidate observations and queries for " +
+      "semantically similar existing observations (cosine > 0.80) on the same entity. " +
+      "Does NOT write anything — use before add_observations to avoid redundancy. " +
+      "Returns modelReady: false if embeddings are unavailable (JSONL backend or model not loaded).",
+    inputSchema: {
+      candidates: z.array(z.object({
+        entityName: z.string().min(1).max(500).describe("Name of the entity to check against"),
+        content: z.string().min(1).max(5000).describe("Candidate observation content to check for duplicates"),
+      })).min(1).max(50).describe("Array of candidate observations to check (max 50)"),
+    },
+    outputSchema: {
+      results: z.array(z.object({
+        entityName: z.string(),
+        candidateContent: z.string(),
+        matches: z.array(z.object({
+          content: z.string(),
+          similarity: z.number(),
+          createdAt: z.string(),
+        })),
+      })),
+      modelReady: z.boolean(),
+    },
+  },
+  async ({ candidates }) => {
+    // Entity name normalization happens inside the store layer (sqlite-store.ts
+    // calls normalizeEntityName() during the lookup). The Zod schema refinement
+    // above validates that names CAN be normalized; the store resolves them.
+    const result = await store.checkDuplicates(candidates);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       structuredContent: result as unknown as Record<string, unknown>,
     };
   }

@@ -192,4 +192,39 @@ describe('Vector search integration', () => {
     const found = result.entities.find(e => e.name === 'doomed-entity');
     expect(found).toBeUndefined();
   });
+
+  it('checkDuplicates should find semantically similar existing observations', async () => {
+    // Use 'dog-entity' from the first test — its observation "A loyal canine
+    // companion that loves to fetch" has already been embedded (2s wait in
+    // that test + time elapsed since). Check a semantically similar candidate.
+    const result = await store.checkDuplicates([
+      { entityName: 'dog-entity', content: 'A faithful dog companion who enjoys playing fetch' },
+    ]);
+
+    // Model should be ready (loaded in beforeAll)
+    expect(result.modelReady).toBe(true);
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].entityName).toBe('dog-entity');
+    // The existing observation about a canine companion should match
+    expect(result.results[0].matches.length).toBeGreaterThanOrEqual(1);
+    expect(result.results[0].matches[0].content).toBe(
+      'A loyal canine companion that loves to fetch'
+    );
+    // Similarity should be high (> 0.80 threshold)
+    expect(result.results[0].matches[0].similarity).toBeGreaterThan(0.80);
+    // createdAt should be a valid ISO timestamp
+    expect(result.results[0].matches[0].createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it('checkDuplicates should return empty matches for unrelated content', async () => {
+    // Use 'dog-entity' — "The weather in Paris" is unrelated to dogs
+    const result = await store.checkDuplicates([
+      { entityName: 'dog-entity', content: 'The weather in Paris is beautiful in spring' },
+    ]);
+
+    expect(result.modelReady).toBe(true);
+    expect(result.results).toHaveLength(1);
+    // Unrelated content should not match the canine observation
+    expect(result.results[0].matches).toHaveLength(0);
+  });
 });

@@ -178,12 +178,57 @@ export interface SimilarObservation {
 
 /** Return type for addObservations. Reports which observations were actually added
  *  (excludes duplicates). similarExisting is present when the embedding model is
- *  ready and found near-matches (cosine > 0.85) for newly added observations. */
+ *  ready and found near-matches (cosine > 0.85) for newly added observations.
+ *  similarityCheckFailed is true when the similarity check encountered an error
+ *  (database corruption, embedding failure, etc.) — absence of similarExisting
+ *  may mean "no similar observations" OR "check couldn't run." */
 export type AddObservationResult = {
   entityName: string;
   addedObservations: Observation[];
   similarExisting?: SimilarObservation[];
+  /** True when the similarity check hit an error. When set, the absence of
+   *  similarExisting is NOT evidence that no duplicates exist. */
+  similarityCheckFailed?: boolean;
 };
+
+/** Input for pre-write duplicate checking. Identifies a candidate observation
+ *  by entity name and content — the caller wants to know if something similar
+ *  already exists before committing it. */
+export interface CheckDuplicateInput {
+  entityName: string;
+  content: string;
+}
+
+/** A single match found by the pre-write duplicate checker. Contains the
+ *  existing observation content, its cosine similarity to the candidate,
+ *  and when it was created (to help the caller decide freshness). */
+export interface DuplicateMatch {
+  content: string;
+  similarity: number;  // cosine similarity 0.0-1.0
+  createdAt: string;
+}
+
+/** Result for one candidate observation in a check_duplicates request.
+ *  matches is empty when no similar observations were found. */
+export interface CheckDuplicateResult {
+  entityName: string;
+  candidateContent: string;
+  matches: DuplicateMatch[];
+}
+
+/** Full response from checkDuplicates. modelReady is false when the
+ *  embedding pipeline isn't available (JSONL backend, or model failed to load)
+ *  — results will have empty matches in that case. When errorCount > 0,
+ *  some candidates failed (database corruption, embedding failure, etc.)
+ *  and their results have empty matches even though duplicates may exist. */
+export interface CheckDuplicatesResponse {
+  results: CheckDuplicateResult[];
+  modelReady: boolean;
+  /** Number of candidates that hit errors during the check. 0 = all candidates
+   *  were checked successfully. When errorCount === results.length, treat the
+   *  entire response as unreliable (equivalent to modelReady: false). */
+  errorCount: number;
+}
 
 /** An entity that was skipped during createEntities because its name
  *  already exists (possibly in a different project, or under a different
@@ -350,8 +395,9 @@ export interface GraphStore {
    *  @param query - Case-insensitive substring to search for
    *  @param projectId - Optional project scope
    *  @param pagination - Optional cursor and limit
-   *  @param asOf - Optional ISO 8601 UTC timestamp for point-in-time queries */
-  searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string): Promise<Readonly<PaginatedKnowledgeGraph>>;
+   *  @param asOf - Optional ISO 8601 UTC timestamp for point-in-time queries
+   *  @param memoryType - Optional filter: only return entities with at least one observation of this type (e.g., 'procedure', 'decision') */
+  searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string, memoryType?: string): Promise<Readonly<PaginatedKnowledgeGraph>>;
   /** Retrieves specific entities by exact name match plus connected relations.
    *  Non-existent names are silently skipped. Use this instead of readGraph when you
    *  need full relation context for a known set of entities.
@@ -367,8 +413,9 @@ export interface GraphStore {
    *  @param projectId - Optional project scope. When set, includes project + global entities.
    *  @param excludeContextLayers - When true, excludes L0/L1 observations (for dedup with getContextLayers).
    *  @param limit - Max top observations to return (default 20).
+   *  @param memoryType - Optional filter for topObservations and recentEntities. Stats remain unfiltered.
    *  @returns SummaryResult with topObservations, recentEntities, and stats */
-  getSummary(projectId?: string, excludeContextLayers?: boolean, limit?: number): Promise<Readonly<SummaryResult>>;
+  getSummary(projectId?: string, excludeContextLayers?: boolean, limit?: number, memoryType?: string): Promise<Readonly<SummaryResult>>;
   /** Returns L0 and L1 observations for a project, sorted by layer then importance DESC.
    *  Enforces soft token budgets (~100 tokens for L0, ~800 for L1). When observations
    *  exceed the budget, the response is truncated to the most important ones.
@@ -382,6 +429,13 @@ export interface GraphStore {
    *  @param updates - Array of SetObservationMetadataInput identifying observations and new metadata
    *  @returns Number of observations actually updated */
   setObservationMetadata(updates: SetObservationMetadataInput[]): Promise<number>;
+  /** Pre-write duplicate check. Embeds candidate observations and queries for
+   *  semantically similar existing observations (cosine > 0.80) on the same entity.
+   *  Does NOT write anything — the caller decides what to do with the results.
+   *  JSONL backend returns modelReady: false with empty matches (no vector search).
+   *  @param candidates - Array of { entityName, content } to check
+   *  @returns Per-candidate matches plus a modelReady flag */
+  checkDuplicates(candidates: CheckDuplicateInput[]): Promise<CheckDuplicatesResponse>;
 }
 
 /**

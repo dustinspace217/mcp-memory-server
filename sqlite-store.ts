@@ -35,6 +35,9 @@ import {
   type EntityTimelineResult,
   type TimelineObservation,
   type TimelineRelation,
+  type CheckDuplicateInput,
+  type CheckDuplicatesResponse,
+  type DuplicateMatch,
 } from './types.js';
 import { JsonlStore } from './jsonl-store.js';
 import {
@@ -156,6 +159,10 @@ export class SqliteStore implements GraphStore {
     // new Database() creates the file if it doesn't exist (this is why we check first)
     this.db = new Database(this.dbPath);
     this.db.pragma('journal_mode = WAL');
+    // Wait up to 5 seconds if another process holds the write lock (e.g. weekly
+    // consolidation running concurrently with an active Claude session). Without
+    // this, better-sqlite3 defaults to 0ms and throws SQLITE_BUSY immediately.
+    this.db.pragma('busy_timeout = 5000');
     this.db.pragma('foreign_keys = ON');
 
     // === Create tables with current (v4) schema ===
@@ -1551,9 +1558,14 @@ export class SqliteStore implements GraphStore {
           }
         }
       } catch (err: unknown) {
-        // Similarity check is best-effort — don't fail the whole operation
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`Similarity check failed: ${msg}`);
+        // Similarity check is best-effort — don't fail the whole operation.
+        // But flag it on every result so the caller knows "no similarExisting"
+        // means "check couldn't run" rather than "no duplicates exist."
+        const detail = err instanceof Error ? err.stack ?? err.message : String(err);
+        console.error(`Similarity check failed: ${detail}`);
+        for (const r of results) {
+          r.similarityCheckFailed = true;
+        }
       }
     }
 
@@ -2236,8 +2248,8 @@ export class SqliteStore implements GraphStore {
    * @param pagination - Optional cursor and limit for paginated results; omit for all results
    * @returns PaginatedKnowledgeGraph with matching entities, relations, nextCursor, and totalCount
    */
-  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string): Promise<PaginatedKnowledgeGraph> {
-    const fingerprint = searchNodesFingerprint(projectId, query, asOf);
+  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string, memoryType?: string): Promise<PaginatedKnowledgeGraph> {
+    const fingerprint = searchNodesFingerprint(projectId, query, asOf, memoryType);
 
     // When pagination is undefined, return all results (backward compat).
     const isPaginated = pagination !== undefined;
@@ -2299,6 +2311,14 @@ export class SqliteStore implements GraphStore {
         WHERE ${entFilter.clause}
           AND ${likeClause}
     `;
+
+    // memoryType filter: restrict to entities with at least one active observation
+    // of the requested type. The observation JOIN is already in the CTE, so this
+    // is just an additional WHERE clause. When omitted, all types are included.
+    if (memoryType) {
+      cteSql += ' AND o.memory_type = ?';
+      cteParams.push(memoryType);
+    }
 
     if (normalizedProject) {
       cteSql += ' AND (e2.project = ? OR e2.project IS NULL)';
@@ -2378,8 +2398,12 @@ export class SqliteStore implements GraphStore {
         const queryEmbedding = await this.embeddingPipeline.embed(query);
         if (queryEmbedding) {
           // Request more KNN results than the page limit to account for
-          // duplicates and multiple observations per entity
-          const knnK = Math.min((limit ?? 40) * 2, 200);
+          // duplicates and multiple observations per entity. When memoryType is
+          // set, use a larger k because the post-retrieval filter may discard most
+          // results (e.g., 3 "decision" observations among 1000 total — a sparse
+          // type would be drowned out in the global top-80).
+          const baseK = (limit ?? 40) * 2;
+          const knnK = Math.min(memoryType ? Math.max(baseK, 200) : baseK, 500);
           const knnRows = this.db.prepare(`
             SELECT observation_id, distance
             FROM vec_observations
@@ -2418,6 +2442,13 @@ export class SqliteStore implements GraphStore {
                 ...knnObsFilter.params,
                 ...knnEntFilter.params,
               ];
+              // memoryType filter: ensure vector matches also have a matching observation type.
+              // Without this, a vector match for entity X could be included even if X has
+              // no observations of the requested type — inconsistent with the LIKE path.
+              if (memoryType) {
+                vecSql += ' AND o.memory_type = ?';
+                vecParams.push(memoryType);
+              }
               if (normalizedProject) {
                 vecSql += ' AND (e.project = ? OR e.project IS NULL)';
                 vecParams.push(normalizedProject);
@@ -2808,7 +2839,7 @@ export class SqliteStore implements GraphStore {
    * @param limit - Max top observations to return (default 20, max 100).
    * @returns SummaryResult with topObservations, recentEntities, and stats
    */
-  async getSummary(projectId?: string, excludeContextLayers?: boolean, limit?: number): Promise<Readonly<SummaryResult>> {
+  async getSummary(projectId?: string, excludeContextLayers?: boolean, limit?: number, memoryType?: string): Promise<Readonly<SummaryResult>> {
     const obsLimit = Math.min(Math.max(limit ?? 20, 1), 100);
 
     // Build project filter clause — reused across all three queries.
@@ -2823,6 +2854,13 @@ export class SqliteStore implements GraphStore {
       ? `AND o.context_layer IS NULL`
       : '';
 
+    // Optional filter: restrict to observations of a specific memory_type.
+    // Enables queries like "show me decisions" or "show me procedures."
+    const typeClause = memoryType !== undefined
+      ? `AND o.memory_type = ?`
+      : '';
+    const typeParams = memoryType !== undefined ? [memoryType] : [];
+
     // -- 1. Top observations by importance DESC, then entity recency DESC --
     const topObs = this.db.prepare(`
       SELECT e.name AS entityName, o.content, o.importance, o.memory_type, e.updated_at
@@ -2831,10 +2869,11 @@ export class SqliteStore implements GraphStore {
       WHERE o.superseded_at = ''
         AND e.superseded_at = ''
         ${layerClause}
+        ${typeClause}
         ${projectClause}
       ORDER BY o.importance DESC, e.updated_at DESC
       LIMIT ?
-    `).all(...projectParams, obsLimit) as Array<{
+    `).all(...typeParams, ...projectParams, obsLimit) as Array<{
       entityName: string; content: string; importance: number;
       memory_type: string | null; updated_at: string;
     }>;
@@ -2849,19 +2888,30 @@ export class SqliteStore implements GraphStore {
     }));
 
     // -- 2. Recently updated entities (last 5) --
+    // When memoryType is set, only include entities that have at least one
+    // observation of the matching type, and only count those observations.
     const entityProjectClause = projectId !== undefined
       ? `AND (project = ? OR project IS NULL)`
       : '';
+    const entityTypeFilter = memoryType !== undefined
+      ? `AND memory_type = ?`
+      : '';
+    // When memoryType is set, also filter the entity list to those with matching observations.
+    const entityTypeHaving = memoryType !== undefined
+      ? `AND e.id IN (SELECT entity_id FROM observations WHERE superseded_at = '' AND memory_type = ?)`
+      : '';
+    const entityTypeParams = memoryType !== undefined ? [memoryType] : [];
 
     const recentRows = this.db.prepare(`
       SELECT name, entity_type, updated_at,
-        (SELECT COUNT(*) FROM observations WHERE entity_id = e.id AND superseded_at = '') AS obs_count
+        (SELECT COUNT(*) FROM observations WHERE entity_id = e.id AND superseded_at = '' ${entityTypeFilter}) AS obs_count
       FROM entities e
       WHERE superseded_at = ''
         ${entityProjectClause}
+        ${entityTypeHaving}
       ORDER BY updated_at DESC
       LIMIT 5
-    `).all(...projectParams) as Array<{
+    `).all(...entityTypeParams, ...projectParams, ...entityTypeParams) as Array<{
       name: string;
       entity_type: string;
       updated_at: string;
@@ -3094,5 +3144,113 @@ export class SqliteStore implements GraphStore {
 
     this.maybeRunEviction();
     return totalUpdated;
+  }
+
+  /**
+   * Pre-write duplicate check. Embeds each candidate observation and queries
+   * vec_observations for KNN matches on the same entity. Returns semantically
+   * similar existing observations (cosine > 0.80) without writing anything.
+   *
+   * Uses a slightly lower threshold (0.80) than the post-write check in
+   * addObservations (0.85) because this is advisory — better to surface a
+   * borderline match and let the caller decide than to miss it.
+   *
+   * @param candidates - Array of { entityName, content } to check
+   * @returns Per-candidate matches plus modelReady flag
+   */
+  async checkDuplicates(candidates: CheckDuplicateInput[]): Promise<CheckDuplicatesResponse> {
+    // If the embedding model or vec table isn't ready, return empty results
+    // with modelReady: false so the caller knows no check was performed.
+    const modelReady = this.vecTableExists && this.embeddingPipeline.state.status === 'ready';
+    if (!modelReady) {
+      return {
+        results: candidates.map(c => ({
+          entityName: c.entityName,
+          candidateContent: c.content,
+          matches: [],
+        })),
+        modelReady: false,
+        errorCount: 0,
+      };
+    }
+
+    // Prepared statements used in the loop below
+    // findEntity: resolves entity name → id via the normalized identity key
+    const findEntity = this.db.prepare(
+      `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
+    );
+
+    let errorCount = 0;
+    const results = await Promise.all(candidates.map(async (candidate) => {
+      const result = {
+        entityName: candidate.entityName,
+        candidateContent: candidate.content,
+        matches: [] as DuplicateMatch[],
+      };
+
+      try {
+        // Resolve entity name to ID — if entity doesn't exist, return empty matches
+        // (not an error: the caller might be checking before creating the entity).
+        const entityRow = findEntity.get(normalizeEntityName(candidate.entityName)) as { id: number } | undefined;
+        if (!entityRow) return result;
+
+        // Embed the candidate content for KNN search
+        const embedding = await this.embeddingPipeline.embed(candidate.content);
+        if (!embedding) return result;
+
+        // KNN search for 50 nearest neighbors (larger than addObservations' k=20 because
+        // we filter to same-entity afterward — with k=20, all top results might belong to
+        // unrelated entities and the real same-entity match could be missed entirely).
+        const knnRows = this.db.prepare(`
+          SELECT v.observation_id, v.distance FROM vec_observations v
+          WHERE v.embedding MATCH ? AND k = 50
+        `).all(
+          Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+        ) as { observation_id: string; distance: number }[];
+
+        // Cap at 5 matches per candidate to keep responses concise
+        const MAX_MATCHES = 5;
+        for (const knn of knnRows) {
+          if (result.matches.length >= MAX_MATCHES) break;
+
+          // Convert L2 distance on normalized vectors to cosine similarity.
+          // For unit vectors: cos_sim = 1 - (L2_dist² / 2).
+          const similarity = 1 - (knn.distance * knn.distance) / 2;
+          // 0.80 threshold — slightly more permissive than the 0.85 post-write check
+          // because this is advisory (better to show a borderline match than miss it).
+          if (similarity <= 0.80) continue;
+
+          // Verify this observation belongs to the same entity and is active
+          const obsRow = this.db.prepare(`
+            SELECT o.content, o.created_at FROM observations o
+            WHERE o.id = ? AND o.entity_id = ? AND o.superseded_at = ''
+          `).get(parseInt(knn.observation_id, 10), entityRow.id) as {
+            content: string; created_at: string;
+          } | undefined;
+
+          if (obsRow) {
+            result.matches.push({
+              content: obsRow.content,
+              similarity: Math.round(similarity * 1000) / 1000,
+              createdAt: obsRow.created_at,
+            });
+          }
+        }
+
+        // Sort matches by similarity DESC (highest first)
+        result.matches.sort((a, b) => b.similarity - a.similarity);
+      } catch (err: unknown) {
+        // Log with stack trace for diagnosability. Continue with empty matches
+        // for this candidate — errorCount tracks how many candidates failed so
+        // the caller knows empty matches may mean "error" not "no duplicates."
+        const detail = err instanceof Error ? err.stack ?? err.message : String(err);
+        console.error(`checkDuplicates failed for '${candidate.entityName}': ${detail}`);
+        errorCount++;
+      }
+
+      return result;
+    }));
+
+    return { results, modelReady: true, errorCount };
   }
 }

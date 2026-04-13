@@ -1093,6 +1093,43 @@ describe.each<[string, string, StoreFactory]>([
 			expect(result.entities).toHaveLength(0);
 			expect(result.relations).toHaveLength(0);
 		});
+
+		it('should filter by memoryType when provided', async () => {
+			// Create fresh entities with typed observations so the test works
+			// on both backends (JSONL doesn't support setObservationMetadata).
+			await store.createEntities([
+				{ name: 'DecisionEntity', entityType: 'concept', observations: [
+					{ content: 'decided to use React', createdAt: '2026-01-01T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: 'decision' },
+				] },
+				{ name: 'FactEntity', entityType: 'concept', observations: [
+					{ content: 'decided to use Vue', createdAt: '2026-01-01T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: 'fact' },
+				] },
+			]);
+
+			// Search for 'decided' with memoryType='decision' — only DecisionEntity
+			// has an observation that matches BOTH the LIKE query and the memoryType.
+			const result = await store.searchNodes('decided', undefined, undefined, undefined, 'decision');
+			expect(result.entities).toHaveLength(1);
+			expect(result.entities[0].name).toBe('DecisionEntity');
+		});
+
+		it('should return all types when memoryType is omitted', async () => {
+			// Create entities with different memoryTypes but same search term
+			await store.createEntities([
+				{ name: 'TypeA', entityType: 'concept', observations: [
+					{ content: 'common keyword', createdAt: '2026-01-01T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: 'decision' },
+				] },
+				{ name: 'TypeB', entityType: 'concept', observations: [
+					{ content: 'common keyword', createdAt: '2026-01-01T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: 'fact' },
+				] },
+			]);
+
+			// Without memoryType filter, both should match 'common keyword'
+			const result = await store.searchNodes('common keyword');
+			const names = result.entities.map(e => e.name);
+			expect(names).toContain('TypeA');
+			expect(names).toContain('TypeB');
+		});
 	});
 
 	// ----------------------------------------------------------
@@ -2603,6 +2640,116 @@ describe.each<[string, string, StoreFactory]>([
 			expect(recentNames).toContain('ProjA-E1');
 			expect(recentNames).toContain('Global');
 			expect(recentNames).not.toContain('ProjB-E1');
+		});
+
+		it('filters topObservations by memoryType when provided', async () => {
+			// Create entities with typed observations
+			await store.createEntities([
+				{ name: 'Decisions', entityType: 'concept', observations: [
+					{ content: 'chose React', createdAt: '2026-01-01T00:00:00.000Z', importance: 5.0, contextLayer: null, memoryType: 'decision' },
+				] },
+				{ name: 'Prefs', entityType: 'concept', observations: [
+					{ content: 'prefers tabs', createdAt: '2026-01-01T00:00:00.000Z', importance: 4.0, contextLayer: null, memoryType: 'preference' },
+				] },
+				{ name: 'Mixed', entityType: 'concept', observations: [
+					{ content: 'a decision', createdAt: '2026-01-01T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: 'decision' },
+					{ content: 'a preference', createdAt: '2026-01-01T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: 'preference' },
+				] },
+			]);
+
+			// Filter by 'decision' — should get 'chose React' and 'a decision' only
+			const result = await store.getSummary(undefined, undefined, undefined, 'decision');
+			expect(result.topObservations).toHaveLength(2);
+			const contents = result.topObservations.map(o => o.content);
+			expect(contents).toContain('chose React');
+			expect(contents).toContain('a decision');
+			expect(contents).not.toContain('prefers tabs');
+			expect(contents).not.toContain('a preference');
+		});
+
+		it('filters recentEntities by memoryType when provided', async () => {
+			// Create entities — only one has a 'procedure' observation
+			await store.createEntities([
+				{ name: 'WithProc', entityType: 'concept', observations: [
+					{ content: 'deploy steps', createdAt: '2026-01-01T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: 'procedure' },
+				] },
+				{ name: 'NoProc', entityType: 'concept', observations: [
+					{ content: 'some fact', createdAt: '2026-01-01T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: 'fact' },
+				] },
+			]);
+
+			const result = await store.getSummary(undefined, undefined, undefined, 'procedure');
+			const recentNames = result.recentEntities.map(e => e.name);
+			expect(recentNames).toContain('WithProc');
+			expect(recentNames).not.toContain('NoProc');
+		});
+
+		it('leaves stats unfiltered even when memoryType is provided', async () => {
+			// Stats should reflect the full graph regardless of memoryType filter
+			await store.createEntities([
+				{ name: 'E1', entityType: 'test', observations: [
+					{ content: 'obs1', createdAt: '2026-01-01T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: 'decision' },
+				] },
+				{ name: 'E2', entityType: 'test', observations: [
+					{ content: 'obs2', createdAt: '2026-01-01T00:00:00.000Z', importance: 3.0, contextLayer: null, memoryType: 'preference' },
+				] },
+			]);
+
+			const filtered = await store.getSummary(undefined, undefined, undefined, 'decision');
+			// topObservations should only have 1 (the decision)
+			expect(filtered.topObservations).toHaveLength(1);
+			// But stats should count all entities and observations
+			expect(filtered.stats.totalEntities).toBe(2);
+			expect(filtered.stats.totalObservations).toBe(2);
+		});
+	});
+
+	// checkDuplicates (pre-write duplicate check)
+	// Parameterized across both backends. With MEMORY_VECTOR_SEARCH=off,
+	// both backends return modelReady: false (no actual similarity matching).
+	describe('checkDuplicates', () => {
+		it('returns modelReady false when vector search is disabled', async () => {
+			await store.createEntities([
+				{ name: 'TestEntity', entityType: 'test', observations: ['existing observation'] },
+			]);
+
+			const result = await store.checkDuplicates([
+				{ entityName: 'TestEntity', content: 'similar observation' },
+			]);
+
+			// With vector search off, model is never ready — matches will be empty
+			expect(result.modelReady).toBe(false);
+			expect(result.results).toHaveLength(1);
+			expect(result.results[0].entityName).toBe('TestEntity');
+			expect(result.results[0].candidateContent).toBe('similar observation');
+			expect(result.results[0].matches).toEqual([]);
+		});
+
+		it('returns empty matches for non-existent entity', async () => {
+			const result = await store.checkDuplicates([
+				{ entityName: 'NonExistentEntity', content: 'some content' },
+			]);
+
+			expect(result.results).toHaveLength(1);
+			expect(result.results[0].matches).toEqual([]);
+		});
+
+		it('handles multiple candidates in one request', async () => {
+			await store.createEntities([
+				{ name: 'EntityA', entityType: 'test', observations: ['obs a'] },
+				{ name: 'EntityB', entityType: 'test', observations: ['obs b'] },
+			]);
+
+			const result = await store.checkDuplicates([
+				{ entityName: 'EntityA', content: 'candidate for A' },
+				{ entityName: 'EntityB', content: 'candidate for B' },
+				{ entityName: 'NonExistent', content: 'candidate for missing' },
+			]);
+
+			expect(result.results).toHaveLength(3);
+			expect(result.results[0].entityName).toBe('EntityA');
+			expect(result.results[1].entityName).toBe('EntityB');
+			expect(result.results[2].entityName).toBe('NonExistent');
 		});
 	});
 });

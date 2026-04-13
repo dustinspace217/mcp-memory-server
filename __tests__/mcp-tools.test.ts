@@ -105,7 +105,7 @@ const CreateEntitiesInputSchema = z.object({
  */
 const AsOfSchema = z.string().datetime({ offset: false }).optional();
 
-/** Schema for search_nodes input — query string + optional projectId, cursor, limit, asOf */
+/** Schema for search_nodes input — query string + optional projectId, cursor, limit, asOf, memoryType */
 const SearchNodesInputSchema = z.object({
 	query: z.string().min(1).max(5000)
 		.describe("The search query to match against entity names, types, and observation content"),
@@ -115,6 +115,8 @@ const SearchNodesInputSchema = z.object({
 	limit: z.number().int().min(1).max(100).optional().default(40)
 		.describe("Max entities per page (default 40, max 100)"),
 	asOf: AsOfSchema,
+	memoryType: z.string().min(1).max(50).optional()
+		.describe("Filter results to entities with at least one observation matching this memory_type"),
 });
 
 /** Schema for read_graph input — optional projectId, cursor, limit, asOf */
@@ -1426,14 +1428,90 @@ describe('MCP Tool Handler Integration', () => {
 				projectId: z.string().trim().min(1).max(500).optional(),
 				excludeContextLayers: z.boolean().optional(),
 				limit: z.number().int().min(1).max(100).optional(),
+				memoryType: z.string().min(1).max(50).optional(),
 			});
 
 			const result = GetSummaryInputSchema.safeParse({
 				projectId: 'myproject',
 				excludeContextLayers: true,
 				limit: 10,
+				memoryType: 'decision',
 			});
 			expect(result.success).toBe(true);
+		});
+
+		it('search_nodes accepts memoryType parameter', () => {
+			const result = SearchNodesInputSchema.safeParse({
+				query: 'test',
+				memoryType: 'procedure',
+			});
+			expect(result.success).toBe(true);
+		});
+
+		it('search_nodes rejects empty memoryType', () => {
+			const result = SearchNodesInputSchema.safeParse({
+				query: 'test',
+				memoryType: '',
+			});
+			expect(result.success).toBe(false);
+		});
+
+		it('check_duplicates accepts valid input', () => {
+			const CheckDuplicatesInputSchema = z.object({
+				candidates: z.array(z.object({
+					entityName: z.string().min(1).max(500),
+					content: z.string().min(1).max(5000),
+				})).min(1).max(50),
+			});
+
+			const result = CheckDuplicatesInputSchema.safeParse({
+				candidates: [
+					{ entityName: 'TestEntity', content: 'some observation' },
+				],
+			});
+			expect(result.success).toBe(true);
+		});
+
+		it('check_duplicates rejects empty candidates array', () => {
+			const CheckDuplicatesInputSchema = z.object({
+				candidates: z.array(z.object({
+					entityName: z.string().min(1).max(500),
+					content: z.string().min(1).max(5000),
+				})).min(1).max(50),
+			});
+
+			const result = CheckDuplicatesInputSchema.safeParse({ candidates: [] });
+			expect(result.success).toBe(false);
+		});
+
+		it('check_duplicates rejects candidates over 50 items', () => {
+			const CheckDuplicatesInputSchema = z.object({
+				candidates: z.array(z.object({
+					entityName: z.string().min(1).max(500),
+					content: z.string().min(1).max(5000),
+				})).min(1).max(50),
+			});
+
+			// Build 51 candidates
+			const candidates = Array.from({ length: 51 }, (_, i) => ({
+				entityName: `entity${i}`, content: `content${i}`,
+			}));
+			const result = CheckDuplicatesInputSchema.safeParse({ candidates });
+			expect(result.success).toBe(false);
+		});
+
+		it('get_summary rejects memoryType over 50 chars', () => {
+			const GetSummaryInputSchema = z.object({
+				projectId: z.string().trim().min(1).max(500).optional(),
+				excludeContextLayers: z.boolean().optional(),
+				limit: z.number().int().min(1).max(100).optional(),
+				memoryType: z.string().min(1).max(50).optional(),
+			});
+
+			const result = GetSummaryInputSchema.safeParse({
+				memoryType: 'a'.repeat(51),
+			});
+			expect(result.success).toBe(false);
 		});
 
 		it('create_relations rejects names that normalize to empty (write-path)', () => {
