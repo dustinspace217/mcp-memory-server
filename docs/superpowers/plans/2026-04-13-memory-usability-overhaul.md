@@ -619,12 +619,146 @@ These existing GitHub issues are related but not addressed by this plan:
 
 ---
 
-## Post-Implementation Deviation Review
+## Post-Implementation Deviation Review (2026-04-13)
 
-After all phases are complete, write a deviation review into this plan document (per `feedback_plan_deviation_review.md`):
-- What deviated from the plan and why
-- What principles emerged
-- What impact the deviations had
-- Whether deviations were worth it
+### D1: Phase 4 changed from CCR to local systemd timer + `claude -p`
 
-This review should be appended as a new section at the bottom of this file.
+**What changed:** Plan said "Phase 4 is a scheduled CCR agent" (using Anthropic's cloud infrastructure). Shipped as a local systemd user timer invoking `claude -p`.
+
+**Why:** CCR runs in Anthropic's cloud with no access to local MCP servers or local files. The consolidation agent needs both — the local MCP memory server to query/supersede observations, and file system access to verify cited files against current content.
+
+**Principle:** Goal A (reduce drift) — verification requires reading the actual files. A cloud agent that can't read the files can't verify observations, defeating the purpose.
+
+**Impact:** The agent runs only when the machine is on. `Persistent=true` catches missed runs, but extended offline periods mean consolidation pauses. No risk to data — just delayed maintenance.
+
+**Worth it because:** A consolidation agent that can't verify observations against files is theater, not maintenance. The whole point is catching drift between memory and reality.
+
+### D2: Consolidation prompt grew from 3 passes to 4
+
+**What changed:** Plan described a 3-pass workflow (freshness → noise triage → consolidation). Shipped with 4 passes: freshness → noise triage → consolidation → classification check.
+
+**Why:** The 6-agent review (architect agent) flagged that the consolidation agent had no instruction to verify or correct `memoryType`, `importance`, and `contextLayer` metadata. Without Pass D, observations with wrong classifications would persist indefinitely — the only other fixer is `set_observation_metadata` invoked manually.
+
+**Principle:** Goal A (reduce drift) — wrong metadata is a form of drift. An observation classified as `procedure` when it's really a `decision` degrades the memoryType filter's usefulness.
+
+**Impact:** Slightly longer consolidation runs (~1 minute). Marginal — the agent already reads every observation for Passes A-C.
+
+**Worth it because:** Without Pass D, the memoryType filter (Phase 3a) returns wrong results. Classification correctness is as important as content correctness.
+
+### D3: `check_duplicates` gained `errorCount` field
+
+**What changed:** Plan's `CheckDuplicatesResponse` had `results` and `modelReady`. Shipped with an additional `errorCount: number` field.
+
+**Why:** Silent-failure-hunter flagged that embedding errors per-candidate were caught but invisible to callers. An empty `matches` array meant either "no duplicates" or "check failed" — callers couldn't distinguish.
+
+**Principle:** Goal A (reduce drift) — if a caller trusts "no duplicates" when the check actually errored, they write a duplicate. The flag makes failure visible.
+
+**Impact:** All callers must now check `errorCount > 0` to know whether empty matches are trustworthy. Minor API surface growth.
+
+**Worth it because:** Silent failures in deduplication defeat the purpose of the deduplication check.
+
+### D4: `addObservations` gained `similarityCheckFailed` flag
+
+**What changed:** Plan didn't specify any change to `addObservations` error surfacing. Shipped with `similarityCheckFailed?: boolean` on `AddObservationResult`.
+
+**Why:** Same principle as D3 — the post-write similarity check catches errors internally but the caller sees only the absence of `similarExisting`, which looks identical to "no similar observations found."
+
+**Principle:** Goal A — same as D3. Silent failure in similarity checks leads to uncaught duplicates.
+
+**Impact:** Callers that check `similarExisting` should also check `similarityCheckFailed`. Backward compatible (field is optional, undefined = check ran normally).
+
+**Worth it because:** Consistent with D3. If error surfacing matters for pre-write checks, it matters for post-write checks too.
+
+### D5: KNN k boosted for memoryType-filtered queries
+
+**What changed:** Plan didn't address the interaction between memoryType filtering and vector search. Shipped with `knnK = min(max(baseK, 200), 500)` when memoryType is set, up from `min(baseK, 200)` default.
+
+**Why:** Architect agent identified that KNN retrieves top-k globally, then filters by `memory_type` in post-processing. Sparse types (e.g., `procedure` with 5 observations in a corpus of 1500) would rarely appear in the global top-k, making the vector search path effectively useless for them.
+
+**Principle:** Goal B (faithful recall) — if procedures exist but search can't find them, the procedure library (Pillar 4) is broken.
+
+**Impact:** Slightly slower vector queries when memoryType is set (~200-500 KNN neighbors vs ~80). At current scale (<2000 observations), sub-millisecond difference. At 50K+, could matter — but that's when ANN indexes would be needed anyway.
+
+**Worth it because:** The memoryType filter is the key Phase 3 feature. If it doesn't work for sparse types, it's unreliable in exactly the cases it's most needed.
+
+### D6: `busy_timeout` pragma added to SQLite store
+
+**What changed:** Plan didn't mention concurrency handling. Shipped with `PRAGMA busy_timeout = 5000` after WAL mode.
+
+**Why:** Security-auditor flagged that `better-sqlite3` defaults to 0ms busy timeout — any concurrent write contention throws `SQLITE_BUSY` immediately. The consolidation agent (Phase 4) and normal Claude sessions can write concurrently.
+
+**Principle:** Goal A — a consolidation agent that crashes on `SQLITE_BUSY` because it ran during a session is unreliable maintenance.
+
+**Impact:** Writers wait up to 5 seconds instead of failing instantly. In WAL mode, readers never block, so the practical impact is only on concurrent writers (consolidation agent vs live session). No risk of deadlock — SQLite's internal timeout handles retry.
+
+**Worth it because:** Without this, the consolidation agent would intermittently fail every time it overlapped with a live session's write. That's a near-certainty given Claude sessions write to memory.
+
+### D7: Security hardening of consolidation-settings.json
+
+**What changed:** Plan specified stripped settings (no hooks, opus model). Shipped with a full `permissions` block: allow-list of read-only Bash commands, deny-list of destructive commands.
+
+**Why:** Security-auditor flagged that `--dangerously-skip-permissions` with no `permissions.deny` meant the consolidation agent had unrestricted Bash access. A prompt injection via a malicious observation could execute arbitrary commands.
+
+**Principle:** Defense-in-depth. The prompt is trustworthy, but the data it processes (observations) comes from prior sessions that may have been compromised. The deny-list is a safety net.
+
+**Impact:** The consolidation agent can't run `rm`, `mv`, `cp`, `curl`, `wget`, `sudo`, `chmod`, `shred`, `dd`, `truncate`, or `mkfs`. It can still `cat`, `grep`, `ls`, `head`, `tail`, `stat`, `date`, and `wc` — everything it needs for verification.
+
+**Worth it because:** The cost of the deny-list is one JSON block in a config file. The cost of not having it is unbounded if an observation ever contains injected instructions.
+
+### D8: `sanitize-network-output.py` fail-closed error handling
+
+**What changed:** Plan didn't address existing hook security. Shipped with try/except wrapping + `sys.exit(2)` on any unhandled exception, plus a 4-second `SIGALRM` timeout.
+
+**Why:** Silent-failure-hunter flagged that the network sanitization hook was fail-open — any exception (malformed JSON, regex error, unexpected field type) would let sensitive data pass through to the transcript unredacted.
+
+**Principle:** Security hooks must fail closed. A security mechanism that fails open is worse than none — it creates a false sense of protection.
+
+**Impact:** If the hook crashes for any reason, tool output is blocked (exit 2) instead of passed through. False positives (blocking clean output on hook error) are preferable to false negatives (leaking sensitive data).
+
+**Worth it because:** This hook guards secrets, API keys, and credentials in Bash output. The fail-open window existed since the hook was created.
+
+### D9: `check-memory-noise.py` stderr logging on JSON parse failure
+
+**What changed:** Plan didn't specify error handling for the noise guardrail hook. Shipped with `print(f"...", file=sys.stderr)` on `json.JSONDecodeError`.
+
+**Why:** Silent-failure-hunter flagged that the hook silently returned on parse failure — if stdin was malformed, the hook did nothing and nobody knew.
+
+**Principle:** Observability. A guardrail that silently fails gives no signal about why observations aren't being flagged.
+
+**Impact:** Parse errors now appear in stderr (visible in `--debug` mode). The hook still doesn't block writes — it just logs the error instead of swallowing it.
+
+**Worth it because:** Zero-cost diagnostic that makes debugging hook failures possible.
+
+### D10: `run-consolidation.sh` pre-flight failure marker + `--kill-after=10`
+
+**What changed:** Plan specified a simple run script. Shipped with: (a) failure marker written BEFORE `claude -p` runs (cleared on success), and (b) `timeout --kill-after=10 1800` instead of `timeout 1800`.
+
+**Why:** (a) Adversarial tester: if the script is killed mid-run (OOM, power loss), no failure is recorded — the next timer fires and may hit the same problem. Pre-flight marker means any incomplete run is detectable. (b) `timeout` sends SIGTERM by default; `claude -p` may not clean up within the default grace period, leaving orphaned processes.
+
+**Principle:** Goal A (reliability) — a maintenance system that silently fails is maintenance debt.
+
+**Impact:** (a) A stale `LAST_FAILURE` file now means either "run failed" or "run is in progress" — disambiguated by whether the service is active. (b) After SIGTERM, `claude -p` gets 10 seconds before SIGKILL.
+
+**Worth it because:** Without (a), a consistently-failing consolidation agent could run for months without anyone noticing. Without (b), zombie processes could accumulate.
+
+### D11: Supersession verification instruction in consolidation prompt
+
+**What changed:** Plan's consolidation prompt didn't address the exact-match requirement of `supersede_observations`. Shipped with an explicit instruction: "re-read the entity to get the exact current text — don't guess or paraphrase from memory."
+
+**Why:** The adversarial tester initially claimed `supersede_observations` silently skips mismatches. Investigation proved it actually throws and rolls back the entire batch. The real risk is worse: one hallucinated `oldContent` kills all 100 supersessions in the batch. The consolidation agent runs with extended context and processes many entities — hallucinating an observation's exact text after reading 50 entities is plausible.
+
+**Principle:** Goal A — a consolidation run that fails at the `supersede_observations` step and rolls back wastes the entire session's work.
+
+**Impact:** The agent is instructed to copy-paste exact text rather than paraphrasing from its context window. Slightly more tool calls (re-reading entities before superseding), slightly more reliable batches.
+
+**Worth it because:** A single mismatched oldContent in a batch of 100 supersessions rolls back all 100. The cost of re-reading is trivial; the cost of a rolled-back batch is the entire run.
+
+### Cross-cutting behaviors
+
+1. **Security hardening was the largest category of deviations (D7, D8, D9, D10, D11).** The plan focused on usability — "make memory useful" — and treated the consolidation agent and hooks as trusted infrastructure. The 6-agent review surfaced that these components process untrusted data (observations from prior sessions, Bash output from arbitrary commands) and need defensive design. The plan's threat model was implicitly too trusting.
+
+2. **Error surfacing was a recurring theme (D3, D4, D9).** Three deviations independently addressed the same anti-pattern: operations that catch errors internally but present success to callers. This suggests the codebase had a systematic bias toward graceful degradation (good for availability) at the expense of caller awareness (bad for correctness). The fixes add flags, not blocks — callers can still proceed, but they know when the check didn't actually run.
+
+3. **The plan underestimated the CCR→local gap (D1).** The plan was written assuming CCR could reach local resources. This is a fundamental architectural constraint of CCR, not an oversight that could have been avoided. Future plans involving scheduled agents should start with: "Does this need local file/MCP access? If yes, use local systemd + `claude -p`, not CCR."
+
+4. **No deviations reduced scope.** Every deviation added to the plan. This is consistent with the user's principle — "if it's worth fixing later, it's worth fixing now" — but means the shipped implementation is a superset of the plan. Future work referencing this plan should read the deviation review, not just the phase descriptions.
