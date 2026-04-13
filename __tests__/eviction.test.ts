@@ -177,6 +177,13 @@ describe('eviction module (evict.ts)', () => {
   /**
    * Sets up a raw database with v9 schema for eviction testing.
    * Returns the open Database handle. Caller must close it.
+   *
+   * NOTE: This uses a simplified schema (plain UNIQUE on name, no partial index
+   * on normalized_name). Production uses a partial unique index:
+   *   idx_entities_normalized_active ON entities(normalized_name) WHERE superseded_at = ''
+   * This divergence is acceptable because eviction tests verify relation filter
+   * logic, not uniqueness constraints. Tests use distinct `name` values for
+   * different incarnations of the same normalized_name.
    */
   function createTestDb(filePath: string): Database.Database {
     const db = new Database(filePath);
@@ -407,6 +414,84 @@ describe('eviction module (evict.ts)', () => {
         const obs = db.prepare('SELECT content FROM observations WHERE entity_id = ?')
           .get(entityId) as { content: string };
         expect(obs.content).toBe('shielded content');
+      } finally {
+        if (original === undefined) {
+          delete process.env.MEMORY_SIZE_CAP_BYTES;
+        } else {
+          process.env.MEMORY_SIZE_CAP_BYTES = original;
+        }
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('eviction of tombstoned entity preserves re-created entity active relations (#70)', () => {
+    // Scenario: entity "foo" was soft-deleted (superseded) and then hard-tombstoned.
+    // A new "foo" was created with new active relations. Tier 1 eviction of the old
+    // tombstoned "foo" must NOT delete the new "foo"'s active relations.
+    dbPath = tempDbPath();
+    const db = createTestDb(dbPath);
+    try {
+      const twoYearsAgo = new Date(Date.now() - 2 * 365.25 * 24 * 60 * 60 * 1000).toISOString();
+      const recently = new Date().toISOString();
+
+      // Old entity "foo" — tombstoned, eligible for hard-delete.
+      db.prepare(`
+        INSERT INTO entities (name, normalized_name, entity_type, updated_at, created_at, superseded_at, tombstoned_at, last_accessed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run('OldFoo', 'foo', 'test', twoYearsAgo, twoYearsAgo, twoYearsAgo, twoYearsAgo, twoYearsAgo);
+
+      const oldId = (db.prepare('SELECT id FROM entities WHERE name = ?').get('OldFoo') as { id: number }).id;
+      db.prepare(`
+        INSERT INTO observations (entity_id, content, created_at, superseded_at, tombstoned_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(oldId, '', twoYearsAgo, twoYearsAgo, twoYearsAgo);
+
+      // Old relation — superseded when the old entity was soft-deleted. Should be deleted by eviction.
+      db.prepare(`
+        INSERT INTO relations (from_entity, to_entity, relation_type, created_at, superseded_at, tombstoned_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run('foo', 'bar', 'old_relation', twoYearsAgo, twoYearsAgo, twoYearsAgo);
+
+      // New entity "Foo" (same normalized_name "foo") — active, with active relations.
+      db.prepare(`
+        INSERT INTO entities (name, normalized_name, entity_type, updated_at, created_at, superseded_at, tombstoned_at, last_accessed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run('Foo', 'foo', 'test', recently, recently, '', '', recently);
+
+      // "bar" entity needed as relation endpoint.
+      db.prepare(`
+        INSERT INTO entities (name, normalized_name, entity_type, updated_at, created_at, superseded_at, tombstoned_at, last_accessed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run('Bar', 'bar', 'test', recently, recently, '', '', recently);
+
+      // New active relation — must NOT be deleted when old "foo" is evicted.
+      db.prepare(`
+        INSERT INTO relations (from_entity, to_entity, relation_type, created_at, superseded_at, tombstoned_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run('foo', 'bar', 'new_relation', recently, '', '');
+
+      // Trigger eviction with tiny cap.
+      const original = process.env.MEMORY_SIZE_CAP_BYTES;
+      process.env.MEMORY_SIZE_CAP_BYTES = '1';
+      try {
+        const result = checkAndEvict(db, dbPath);
+        expect(result.triggered).toBe(true);
+        expect(result.hardDeleted).toBe(1); // Old tombstoned entity deleted
+
+        // The new active relation must still exist.
+        const activeRels = db.prepare(
+          `SELECT * FROM relations WHERE superseded_at = '' AND tombstoned_at = ''`
+        ).all() as { relation_type: string }[];
+        expect(activeRels.length).toBe(1);
+        expect(activeRels[0].relation_type).toBe('new_relation');
+
+        // The old tombstoned relation should be deleted.
+        const oldRels = db.prepare(
+          `SELECT * FROM relations WHERE relation_type = 'old_relation'`
+        ).all();
+        expect(oldRels.length).toBe(0);
       } finally {
         if (original === undefined) {
           delete process.env.MEMORY_SIZE_CAP_BYTES;

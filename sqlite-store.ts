@@ -838,12 +838,20 @@ export class SqliteStore implements GraphStore {
     // Run one eviction check at startup in case the database grew past the cap while
     // the server was down. This is cheap (just a statSync) and only triggers actual
     // eviction work if the DB exceeds 90% of the configured cap.
-    const startupEviction = checkAndEvict(this.db, this.dbPath);
-    if (startupEviction.triggered) {
-      console.error(
-        `Startup eviction: hard-deleted ${startupEviction.hardDeleted} entities, ` +
-        `tombstoned ${startupEviction.tombstoned} entities (DB size: ${(startupEviction.dbSize / 1_000_000).toFixed(1)} MB)`
-      );
+    // Wrap in try/catch so an eviction bug doesn't prevent the server from starting.
+    // A broken eviction sweep should degrade gracefully — the server is still usable,
+    // just without size pressure relief until the bug is fixed. (Issue #72.)
+    try {
+      const startupEviction = checkAndEvict(this.db, this.dbPath);
+      if (startupEviction.triggered) {
+        console.error(
+          `Startup eviction: hard-deleted ${startupEviction.hardDeleted} entities, ` +
+          `tombstoned ${startupEviction.tombstoned} entities (DB size: ${(startupEviction.dbSize / 1_000_000).toFixed(1)} MB)`
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`Startup eviction failed (non-fatal): ${msg}`);
     }
   }
 
@@ -944,12 +952,21 @@ export class SqliteStore implements GraphStore {
     if (this.writesSinceLastEvictionCheck < EVICTION_CHECK_INTERVAL) return;
     this.writesSinceLastEvictionCheck = 0;
 
-    const result = checkAndEvict(this.db, this.dbPath);
-    if (result.triggered) {
-      console.error(
-        `Eviction sweep: hard-deleted ${result.hardDeleted} entities, ` +
-        `tombstoned ${result.tombstoned} entities (DB size: ${(result.dbSize / 1_000_000).toFixed(1)} MB)`
-      );
+    // Wrap in try/catch so an eviction bug doesn't propagate through the user's
+    // write operation. The user's data is already committed at this point — an
+    // eviction failure would be confusing noise. Matches syncEmbedding's
+    // fire-and-forget pattern. (Issue #72.)
+    try {
+      const result = checkAndEvict(this.db, this.dbPath);
+      if (result.triggered) {
+        console.error(
+          `Eviction sweep: hard-deleted ${result.hardDeleted} entities, ` +
+          `tombstoned ${result.tombstoned} entities (DB size: ${(result.dbSize / 1_000_000).toFixed(1)} MB)`
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`Eviction check failed (non-fatal): ${msg}`);
     }
   }
 
@@ -2159,7 +2176,19 @@ export class SqliteStore implements GraphStore {
     // both endpoints are in the current page's entity set.
     // When not paginated and not project-filtered, return all relations (backward compat).
     if (isPaginated || projectId) {
+      // Build the name set from both display names AND normalized names. This handles
+      // the COALESCE fallback in getConnectedRelations: when a relation endpoint's
+      // entity is soft-deleted, the LEFT JOIN misses and COALESCE returns the normalized
+      // form instead of the display form. Without the normalized form in the set, those
+      // relations would be silently dropped. Matches the openNodes pattern. (Issue #73.)
       const entityNames = new Set(pageRows.map(e => e.name));
+      for (const row of pageRows) {
+        try {
+          entityNames.add(normalizeEntityName(row.name));
+        } catch {
+          // Name can't be normalized — display form is already in the set.
+        }
+      }
       const connectedRelations = this.getConnectedRelations(pageRows.map(e => e.name), asOf);
       const filteredRelations = connectedRelations.filter(r =>
         entityNames.has(r.from) && entityNames.has(r.to)
@@ -2441,7 +2470,17 @@ export class SqliteStore implements GraphStore {
 
     // Relations: include vector-supplementary entities in the lookup set.
     // entities[] may have more entries than pageRows if vector search found additional matches.
+    // Include normalized names alongside display names — when a relation endpoint's entity
+    // is soft-deleted, COALESCE falls back to the normalized form. Without it in the set,
+    // those relations would be silently dropped. Matches the openNodes pattern. (Issue #73.)
     const entityNames = new Set(entities.map(e => e.name));
+    for (const entity of entities) {
+      try {
+        entityNames.add(normalizeEntityName(entity.name));
+      } catch {
+        // Name can't be normalized — display form is already in the set.
+      }
+    }
     const allEntityNamesList = [...entityNames];
 
     // Touch last_accessed_at on all returned entities — targeted search expresses intent.

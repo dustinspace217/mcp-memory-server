@@ -39,9 +39,6 @@ const DEFAULT_SIZE_CAP = 1_000_000_000;
 /** Trigger eviction when DB size exceeds this fraction of the cap. */
 const TRIGGER_RATIO = 0.9;
 
-/** Target DB size after eviction: this fraction of the cap. */
-const TARGET_RATIO = 0.85;
-
 /** Minimum age (in ms) before a superseded item becomes eligible for tombstoning. */
 const TOMBSTONE_ELIGIBILITY_MS = 365.25 * 24 * 60 * 60 * 1000; // ~1 year
 
@@ -70,8 +67,11 @@ export function checkAndEvict(db: Database, dbPath: string): EvictionResult {
   let dbSize: number;
   try {
     dbSize = statSync(dbPath).size;
-  } catch {
-    // Can't stat the file — skip eviction.
+  } catch (err) {
+    // Can't stat the file — skip eviction entirely. Log so the operator
+    // knows eviction isn't running, rather than silently doing nothing. (#74)
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Eviction: cannot stat ${dbPath}: ${msg} — skipping eviction check`);
     return { triggered: false, hardDeleted: 0, tombstoned: 0, dbSize: 0 };
   }
 
@@ -80,18 +80,32 @@ export function checkAndEvict(db: Database, dbPath: string): EvictionResult {
   }
 
   // Eviction triggered — run the sweep.
-  const targetSize = cap * TARGET_RATIO;
   let hardDeleted = 0;
   let tombstoned = 0;
 
   // Tier 1: hard-delete tombstoned rows.
-  hardDeleted += hardDeleteTombstoned(db, dbPath, targetSize);
-  if (getCurrentSize(dbPath) <= targetSize) {
-    return { triggered: true, hardDeleted, tombstoned, dbSize };
-  }
+  hardDeleted += hardDeleteTombstoned(db);
 
   // Tier 2: tombstone superseded rows.
-  tombstoned += tombstoneSuperseded(db, dbPath, targetSize);
+  tombstoned += tombstoneSuperseded(db);
+
+  // WAL checkpoint: in WAL mode, DELETEs don't shrink the main DB file until a
+  // checkpoint merges the WAL back. Without this, statSync on the next eviction
+  // check would still see the pre-eviction file size, and the graduated eviction
+  // design would be non-functional (every sweep would exhaust all eligible rows
+  // because the file never appears to shrink). TRUNCATE mode does a full checkpoint
+  // AND truncates the WAL file to zero, giving an accurate size on the next check.
+  // (Issue #75.)
+  if (hardDeleted > 0 || tombstoned > 0) {
+    try {
+      db.pragma('wal_checkpoint(TRUNCATE)');
+    } catch (err) {
+      // Checkpoint failure is non-fatal — the DB is still consistent, just the
+      // file size won't reflect the deletions until the next automatic checkpoint.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`Eviction: WAL checkpoint failed (non-fatal): ${msg}`);
+    }
+  }
 
   return { triggered: true, hardDeleted, tombstoned, dbSize: getCurrentSize(dbPath) };
 }
@@ -128,10 +142,16 @@ export function getCapBytes(): number {
  * tombstoned for at least HARD_DELETE_ELIGIBILITY_MS and whose last_accessed_at
  * is older than LRU_SHIELD_MS.
  *
- * Processes in batches of BATCH_SIZE to avoid long-running transactions.
+ * Processes all eligible rows in batches of BATCH_SIZE to avoid long-running
+ * transactions. The caller (checkAndEvict) runs a WAL checkpoint after both
+ * tiers complete so that the reclaimed space is visible to statSync on the
+ * next eviction check. (Issue #75: the previous while-loop checked file size
+ * per batch, but in WAL mode the file never shrank mid-sweep, so the loop
+ * always exhausted all eligible rows anyway.)
+ *
  * Returns the total number of entity rows deleted.
  */
-function hardDeleteTombstoned(db: Database, dbPath: string, targetSize: number): number {
+function hardDeleteTombstoned(db: Database): number {
   const now = Date.now();
   // Eligibility: tombstoned_at must be older than 1 year AND last_accessed_at
   // must be older than 6 months. Both are ISO 8601 strings — lexicographic
@@ -141,8 +161,8 @@ function hardDeleteTombstoned(db: Database, dbPath: string, targetSize: number):
 
   let totalDeleted = 0;
 
-  // Loop in batches until we're under target or out of eligible rows.
-  while (getCurrentSize(dbPath) > targetSize) {
+  // Loop in batches until out of eligible rows.
+  for (;;) {
     // Find eligible entities: tombstoned long enough + not recently accessed.
     // Raw SQL — never through GraphStore. Oldest tombstones first (most stale).
     const eligible = db.prepare(`
@@ -158,21 +178,45 @@ function hardDeleteTombstoned(db: Database, dbPath: string, targetSize: number):
     const ids = eligible.map(r => r.id);
     const placeholders = ids.map(() => '?').join(',');
 
-    // Delete in a single transaction: observations → relations → entities.
+    // Delete in a single transaction: vec cleanup → observations → relations → entities.
     // ON DELETE CASCADE would handle observations, but relations use
     // normalized_name not entity.id, so we clean up explicitly.
     db.transaction(() => {
+      // Collect observation IDs BEFORE deleting observations — we need them to
+      // clean up vec_observations, and the parent rows will be gone after DELETE.
+      // (Issue #71: the original code deleted observations first, then had comments
+      // about orphan cleanup but never implemented it.)
+      const obsIds = db.prepare(
+        `SELECT id FROM observations WHERE entity_id IN (${placeholders})`
+      ).all(...ids) as { id: number }[];
+      if (obsIds.length > 0) {
+        const obsPlaceholders = obsIds.map(() => '?').join(',');
+        const obsIdStrings = obsIds.map(o => String(o.id));
+        // vec_observations may not exist (MEMORY_VECTOR_SEARCH=off). Try/catch
+        // so eviction still works without the vec extension — matches Tier 2 pattern.
+        try {
+          db.prepare(
+            `DELETE FROM vec_observations WHERE observation_id IN (${obsPlaceholders})`
+          ).run(...obsIdStrings);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Eviction Tier 1: vec_observations cleanup failed (non-fatal): ${msg}`);
+        }
+      }
+
       // Delete observations belonging to these entities.
       db.prepare(`DELETE FROM observations WHERE entity_id IN (${placeholders})`).run(...ids);
 
-      // Delete vec_observations for these entities' observations.
-      // vec_observations.observation_id is a TEXT column matching observations.id.
-      // Since we already deleted the observations, we clean up by finding vec rows
-      // that no longer have a parent.
-      // (Alternatively, we could collect obs IDs first — but orphan cleanup is simpler.)
-
       // Delete relations where either endpoint is one of these entities.
       // Relations store normalized_name, so look up the names.
+      //
+      // CRITICAL SAFETY: Only delete relations that are already retired
+      // (superseded_at or tombstoned_at set). Without this filter, if an entity
+      // was soft-deleted and re-created under the same normalized_name, eviction
+      // of the old incarnation would destroy the NEW entity's active relations.
+      // deleteEntities() supersedes relations when soft-deleting an entity, so
+      // the old incarnation's relations will have superseded_at != '' by the time
+      // Tier 1 runs. (See issue #70.)
       const names = db.prepare(
         `SELECT normalized_name FROM entities WHERE id IN (${placeholders})`
       ).all(...ids) as { normalized_name: string }[];
@@ -180,7 +224,9 @@ function hardDeleteTombstoned(db: Database, dbPath: string, targetSize: number):
         const namePlaceholders = names.map(() => '?').join(',');
         const nameValues = names.map(n => n.normalized_name);
         db.prepare(
-          `DELETE FROM relations WHERE from_entity IN (${namePlaceholders}) OR to_entity IN (${namePlaceholders})`
+          `DELETE FROM relations
+           WHERE (from_entity IN (${namePlaceholders}) OR to_entity IN (${namePlaceholders}))
+             AND (superseded_at != '' OR tombstoned_at != '')`
         ).run(...nameValues, ...nameValues);
       }
 
@@ -208,9 +254,12 @@ function hardDeleteTombstoned(db: Database, dbPath: string, targetSize: number):
  *   - Set relations.tombstoned_at to current timestamp
  *   - Delete corresponding vec_observations rows (embeddings no longer useful)
  *
+ * Processes all eligible rows in batches. The caller runs a WAL checkpoint
+ * after both tiers complete. (See hardDeleteTombstoned JSDoc for #75 rationale.)
+ *
  * Returns the total number of entities tombstoned.
  */
-function tombstoneSuperseded(db: Database, dbPath: string, targetSize: number): number {
+function tombstoneSuperseded(db: Database): number {
   const now = Date.now();
   const nowIso = new Date(now).toISOString();
   // Eligibility: superseded_at must be older than 1 year AND last_accessed_at
@@ -220,7 +269,7 @@ function tombstoneSuperseded(db: Database, dbPath: string, targetSize: number): 
 
   let totalTombstoned = 0;
 
-  while (getCurrentSize(dbPath) > targetSize) {
+  for (;;) {
     // Find eligible superseded (but not yet tombstoned) entities.
     const eligible = db.prepare(`
       SELECT id FROM entities
@@ -249,7 +298,12 @@ function tombstoneSuperseded(db: Database, dbPath: string, targetSize: number): 
         `UPDATE observations SET content = '', tombstoned_at = ? WHERE entity_id IN (${placeholders})`
       ).run(nowIso, ...ids);
 
-      // Mark relations as tombstoned.
+      // Mark relations as tombstoned — but ONLY relations that are already
+      // superseded (superseded_at != '') and not yet tombstoned. Without this
+      // filter, if an entity was soft-deleted and re-created under the same
+      // normalized_name, this would tombstone the NEW entity's active relations.
+      // deleteEntities() sets superseded_at on relations when soft-deleting, so
+      // the old incarnation's relations are distinguishable. (See issue #70.)
       const names = db.prepare(
         `SELECT normalized_name FROM entities WHERE id IN (${placeholders})`
       ).all(...ids) as { normalized_name: string }[];
@@ -257,12 +311,18 @@ function tombstoneSuperseded(db: Database, dbPath: string, targetSize: number): 
         const namePlaceholders = names.map(() => '?').join(',');
         const nameValues = names.map(n => n.normalized_name);
         db.prepare(
-          `UPDATE relations SET tombstoned_at = ? WHERE from_entity IN (${namePlaceholders}) OR to_entity IN (${namePlaceholders})`
+          `UPDATE relations SET tombstoned_at = ?
+           WHERE (from_entity IN (${namePlaceholders}) OR to_entity IN (${namePlaceholders}))
+             AND superseded_at != '' AND tombstoned_at = ''`
         ).run(nowIso, ...nameValues, ...nameValues);
       }
 
       // Remove vec_observations for tombstoned observations (embeddings of '' are useless).
       // vec_observations.observation_id is TEXT matching observations.id cast to string.
+      // NOTE: Unlike Tier 1, we SELECT obs IDs AFTER stripping content (line ~298) because
+      // Tier 2 UPDATEs observations (preserving rows) rather than DELETing them. The IDs
+      // survive the UPDATE, so the ordering is safe. Tier 1 must collect IDs BEFORE its
+      // DELETE because the rows are destroyed. (See issue #71 for the Tier 1 fix.)
       const obsIds = db.prepare(
         `SELECT id FROM observations WHERE entity_id IN (${placeholders})`
       ).all(...ids) as { id: number }[];
@@ -275,8 +335,9 @@ function tombstoneSuperseded(db: Database, dbPath: string, targetSize: number): 
           db.prepare(
             `DELETE FROM vec_observations WHERE observation_id IN (${obsPlaceholders})`
           ).run(...obsIdStrings);
-        } catch {
-          // vec_observations table doesn't exist — fine, nothing to clean up.
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Eviction Tier 2: vec_observations cleanup failed (non-fatal): ${msg}`);
         }
       }
     })();
@@ -291,11 +352,18 @@ function tombstoneSuperseded(db: Database, dbPath: string, targetSize: number): 
 
 /**
  * Gets the current database file size. Returns 0 if the file can't be stat'd.
+ *
+ * Used by checkAndEvict for (a) the initial trigger check (is the DB over 90%
+ * of the cap?) and (b) reporting the post-eviction size. Returning 0 on error
+ * means the trigger check never fires (0 <= threshold), which is correct — if
+ * we can't read the file, don't try to evict. (#74)
  */
 function getCurrentSize(dbPath: string): number {
   try {
     return statSync(dbPath).size;
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Eviction: cannot stat ${dbPath}: ${msg} — treating size as 0`);
     return 0;
   }
 }
