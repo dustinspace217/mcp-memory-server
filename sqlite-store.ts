@@ -2956,10 +2956,14 @@ export class SqliteStore implements GraphStore {
   }
 
   // -- Token budget constant for context layers (from spec §7) --
-  // L1 budget: ~800 tokens ≈ 3200 chars. Session-start context — updated frequently.
+  // L1 budget: ~2000 tokens ≈ 8000 chars. Session-start context — updated frequently.
+  // Bumped from 800 tokens on 2026-04-14: original budget was too tight once L0/L1
+  // were populated with real content (procedures, project status, decisions crowded
+  // each other out). 2000 tokens is ~1% of 200k context — well within safe range
+  // for attention quality. See tombstone-incident feedback memory for context.
   // L0 has no budget enforcement by design: core identity/rules are always included
   // regardless of size (~100 tokens is a guideline, not a hard cap).
-  private static readonly L1_CHAR_BUDGET = 3200;
+  private static readonly L1_CHAR_BUDGET = 8000;
 
   /**
    * Returns L0 and L1 observations for a project, sorted by layer then importance DESC.

@@ -2445,8 +2445,9 @@ describe.each<[string, string, StoreFactory]>([
 
 		it('truncates L1 at character budget', async () => {
 			// Create an entity with many L1 observations that collectively exceed
-			// the ~3200 char budget. Each observation is ~200 chars + entity name.
-			const longContent = 'A'.repeat(190);
+			// the ~8000 char budget (2000 tokens). Each observation is ~500 chars.
+			// 20 * 500 = ~10000 chars, well over the 8000 budget.
+			const longContent = 'A'.repeat(490);
 			const observations = [];
 			for (let i = 0; i < 20; i++) {
 				observations.push({
@@ -2464,7 +2465,7 @@ describe.each<[string, string, StoreFactory]>([
 
 			const result = await store.getContextLayers();
 
-			// 20 observations * ~200 chars each = ~4000 chars. Budget is ~3200.
+			// 20 observations * ~500 chars each = ~10000 chars. Budget is ~8000.
 			// Should be truncated — fewer than 20 L1 observations returned.
 			expect(result.L1.length).toBeLessThan(20);
 			expect(result.L1.length).toBeGreaterThan(0);

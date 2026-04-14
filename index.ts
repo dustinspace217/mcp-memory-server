@@ -632,7 +632,7 @@ server.registerTool(
     title: "Get Context Layers",
     description: "Returns L0 and L1 observations — the 'push' layers that should be restored at session " +
       "start or after compaction. L0 (~100 token budget) holds core identity and rules that rarely change. " +
-      "L1 (~800 token budget) holds active project context loaded at session start. Observations are " +
+      "L1 (~2000 token budget) holds active project context loaded at session start. Observations are " +
       "sorted by importance (highest first) and truncated at the token budget. Call this from SessionStart " +
       "and PostCompact hooks to automatically restore critical context.",
     inputSchema: {

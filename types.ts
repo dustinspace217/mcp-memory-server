@@ -11,7 +11,7 @@
  * contextLayer: determines when this observation is loaded:
  *   null = L2 (on-demand, only via search/readGraph — the default for all data)
  *   'L0' = always loaded (~100 token budget, core identity and rules)
- *   'L1' = loaded at session start (~800 token budget, active work and decisions)
+ *   'L1' = loaded at session start (~2000 token budget, active work and decisions)
  * memoryType: free-form tag classifying the nature of the observation.
  *   null = unclassified. Recommended values: 'decision', 'preference', 'fact',
  *   'problem', 'milestone', 'emotional'. Enables type-filtered queries.
