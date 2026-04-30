@@ -95,17 +95,18 @@ export async function migrateJsonToJsonl(scriptDir: string, jsonlPath: string): 
  */
 export function normalizeObservation(obs: unknown): Observation {
   if (typeof obs === 'string') {
-    return { content: obs, createdAt: 'unknown', importance: 3.0, contextLayer: null, memoryType: null };
+    return { content: obs, createdAt: 'unknown', importance: 3.0, contextLayer: null, memoryType: null, sourceInstance: 'unknown' };
   }
   if (typeof obs === 'object' && obs !== null && 'content' in obs && typeof (obs as any).content === 'string') {
     // Cast to access optional fields — legacy JSONL data won't have the v1.1 metadata fields
-    const o = obs as { content: string; createdAt?: unknown; importance?: unknown; contextLayer?: unknown; memoryType?: unknown };
+    const o = obs as { content: string; createdAt?: unknown; importance?: unknown; contextLayer?: unknown; memoryType?: unknown; sourceInstance?: unknown };
     return {
       content: o.content,
       createdAt: typeof o.createdAt === 'string' ? o.createdAt : 'unknown',
       importance: typeof o.importance === 'number' ? o.importance : 3.0,
       contextLayer: typeof o.contextLayer === 'string' ? o.contextLayer : null,
       memoryType: typeof o.memoryType === 'string' ? o.memoryType : null,
+      sourceInstance: typeof o.sourceInstance === 'string' ? o.sourceInstance : 'unknown',
     };
   }
   throw new Error(`Invalid observation format: ${JSON.stringify(obs)}`);
@@ -452,6 +453,7 @@ export class JsonlStore implements GraphStore {
             importance: o.importances?.[i] ?? 3.0,
             contextLayer: o.contextLayers?.[i] ?? null,
             memoryType: o.memoryTypes?.[i] ?? null,
+            sourceInstance: process.env.MEMORY_INSTANCE_NAME || 'unknown',
           });
         }
       }
@@ -613,6 +615,7 @@ export class JsonlStore implements GraphStore {
           content: obs.content,
           importance: obs.importance,
           memoryType: obs.memoryType,
+          sourceInstance: obs.sourceInstance ?? 'unknown',
           updatedAt: entity.updatedAt,
         });
       }
@@ -689,6 +692,7 @@ export class JsonlStore implements GraphStore {
             content: obs.content,
             importance: obs.importance,
             memoryType: obs.memoryType,
+            sourceInstance: obs.sourceInstance ?? 'unknown',
           });
         } else if (obs.contextLayer === 'L1' && requestedLayers.has('L1')) {
           rawL1.push({
@@ -696,6 +700,7 @@ export class JsonlStore implements GraphStore {
             content: obs.content,
             importance: obs.importance,
             memoryType: obs.memoryType,
+            sourceInstance: obs.sourceInstance ?? 'unknown',
             updatedAt: entity.updatedAt,
           });
         }

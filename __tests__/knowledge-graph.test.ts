@@ -2935,6 +2935,7 @@ describe('JsonlStore-specific', () => {
 			importance: 3.0,
 			contextLayer: null,
 			memoryType: null,
+			sourceInstance: 'unknown',
 		});
 	});
 
@@ -2956,7 +2957,7 @@ describe('JsonlStore-specific', () => {
 		const graph = await store.readGraph();
 		const alice = graph.entities[0];
 		expect(alice.observations).toHaveLength(2);
-		expect(alice.observations[0]).toEqual({ content: 'old observation', createdAt: 'unknown', importance: 3.0, contextLayer: null, memoryType: null });
+		expect(alice.observations[0]).toEqual({ content: 'old observation', createdAt: 'unknown', importance: 3.0, contextLayer: null, memoryType: null, sourceInstance: 'unknown' });
 		expect(alice.observations[1].content).toBe('new observation');
 		expect(alice.observations[1].createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 		expect(alice.observations[1].createdAt).not.toBe('unknown');
@@ -3019,6 +3020,7 @@ describe('JsonlStore-specific', () => {
 				importance: 3.0,
 				contextLayer: null,
 				memoryType: null,
+				sourceInstance: 'unknown',
 			});
 		});
 
@@ -3178,7 +3180,8 @@ describe('SqliteStore-specific', () => {
 			// identity-key column with a partial unique index, and converted relations
 			// to store their endpoints in normalized form. v9 added tombstoned_at on
 			// entities/observations/relations and last_accessed_at on entities for eviction.
-			expect(row!.version).toBe(9);
+			// v10 added source_instance to observations for multi-machine tracking.
+			expect(row!.version).toBe(10);
 		});
 	});
 

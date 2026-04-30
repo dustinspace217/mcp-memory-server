@@ -86,6 +86,7 @@ const ObservationSchema = z.object({
   importance: z.number().describe("Importance score 1.0-5.0 (3.0 = medium)"),
   contextLayer: z.enum(['L0', 'L1']).nullable().describe("Context layer: 'L0' = always loaded, 'L1' = session start, null = L2 (on-demand)"),
   memoryType: z.string().nullable().describe("Memory type tag (e.g., 'decision', 'preference', 'fact'). null = unclassified"),
+  sourceInstance: z.string().describe("Which Claude Code instance created this observation (e.g., 'fedora', 'windows-mele')"),
 });
 
 /**
@@ -546,6 +547,7 @@ server.registerTool(
         content: z.string(),
         createdAt: z.string(),
         supersededAt: z.string(),
+        sourceInstance: z.string(),
         status: z.enum(['active', 'superseded', 'tombstoned']),
       })),
       relations: z.array(z.object({
@@ -646,12 +648,14 @@ server.registerTool(
         content: z.string(),
         importance: z.number(),
         memoryType: z.string().nullable(),
+        sourceInstance: z.string(),
       })).describe("Core identity and rules (always loaded)"),
       L1: z.array(z.object({
         entityName: z.string(),
         content: z.string(),
         importance: z.number(),
         memoryType: z.string().nullable(),
+        sourceInstance: z.string(),
         updatedAt: z.string().optional(),
       })).describe("Session-start context (active work and decisions)"),
       tokenEstimate: z.number().describe("Approximate token count (chars / 4)"),
@@ -702,6 +706,7 @@ server.registerTool(
         content: z.string(),
         importance: z.number(),
         memoryType: z.string().nullable(),
+        sourceInstance: z.string(),
         updatedAt: z.string(),
       })).describe("Highest-importance observations, sorted by importance DESC then recency DESC"),
       recentEntities: z.array(z.object({

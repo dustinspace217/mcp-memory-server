@@ -92,6 +92,13 @@ const CHUNK_SIZE = 900;
 // Each check is cheap (just a statSync on the DB file) so this can be low.
 const EVICTION_CHECK_INTERVAL = 1000;
 
+// Which Claude Code instance is running. Set via MEMORY_INSTANCE_NAME env var
+// in the MCP server config (e.g. "fedora", "windows-mele"). Tagged on every
+// observation at insert time so cross-instance setups can trace provenance.
+// 'unknown' is the fallback when the env var isn't set — makes misconfigured
+// instances visible rather than silently producing untagged observations.
+const SOURCE_INSTANCE = process.env.MEMORY_INSTANCE_NAME || 'unknown';
+
 /**
  * SQLite-backed knowledge graph store. Uses WAL mode for concurrent read performance
  * and foreign key constraints for referential integrity.
@@ -213,6 +220,8 @@ export class SqliteStore implements GraphStore {
     //   7 = added superseded_at to entities + partial unique index on active rows (soft-delete)
     //   8 = added normalized_name to entities + rewrote relations to reference normalized form
     //       (Layer 1 entity name normalization — collapses surface variants under one identity)
+    //   9 = added tombstoned_at + last_accessed_at for eviction (§12)
+    //  10 = added source_instance to observations for multi-machine tracking
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_version (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -685,6 +694,52 @@ export class SqliteStore implements GraphStore {
       currentVersion = 9;
     }
 
+    if (currentVersion < 10) {
+      // Migration 9 → 10: source instance tracking for multi-machine setups.
+      //
+      // Adds `source_instance` to observations so each observation records which
+      // Claude Code instance (machine/environment) created it. The value comes
+      // from the MEMORY_INSTANCE_NAME env var at insert time.
+      //
+      // Why on observations (not entities): the same entity ("dustin" profile,
+      // "working-relationship") can have observations from multiple machines.
+      // The entity is global; provenance is per-observation.
+      //
+      // Queries do NOT filter by source_instance — cross-instance visibility is
+      // the point. The only consumer that filters is the audit/freshness hook,
+      // which checks file mtimes that are instance-local.
+      //
+      // DEFAULT 'unknown' (not NULL) prevents query issues with NULL comparisons
+      // and makes misconfigured instances visible rather than silently broken.
+      this.db.transaction(() => {
+        // try-catch on ALTER TABLE: when multiple MCP server instances share
+        // the same database (11 concurrent sessions in this deployment), they
+        // all read schema_version=9 and race to migrate. The first one adds
+        // the column; the rest hit "duplicate column name". Catching that
+        // specific error lets the losers continue to the idempotent backfill
+        // and version bump without crashing. (Issue #78.)
+        try {
+          this.db.prepare(
+            `ALTER TABLE observations ADD COLUMN source_instance TEXT NOT NULL DEFAULT 'unknown'`
+          ).run();
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!msg.includes('duplicate column name')) throw err;
+          // Another process already added the column — safe to continue.
+        }
+
+        // Backfill: all existing observations came from the Fedora machine.
+        // WHERE clause makes this idempotent — re-running after a race doesn't
+        // overwrite observations that were already correctly tagged.
+        this.db.prepare(
+          `UPDATE observations SET source_instance = 'fedora' WHERE source_instance = 'unknown'`
+        ).run();
+
+        this.db.prepare('UPDATE schema_version SET version = 10').run();
+      })();
+      currentVersion = 10;
+    }
+
     // === Indexes (idempotent, run on every startup) ===
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
@@ -992,8 +1047,9 @@ export class SqliteStore implements GraphStore {
     );
     // INSERT includes metadata columns — schema v6 guarantees they exist.
     // Legacy JSONL observations will have default values (3.0, null, null).
+    // source_instance = 'fedora' for migrated data (all JSONL data predates multi-instance).
     const insertObs = this.db.prepare(
-      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type) VALUES (?, ?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance) VALUES (?, ?, ?, ?, ?, ?, ?)'
     );
     // Relations store the NORMALIZED form for from_entity / to_entity (post-v8). The
     // JSONL file holds display names, so we normalize before insert.
@@ -1038,7 +1094,7 @@ export class SqliteStore implements GraphStore {
         for (const obs of entity.observations) {
           // obs is already a normalized Observation object (JsonlStore.readGraph() calls normalizeObservation).
           // Read metadata fields with defaults for legacy JSONL data that predates v1.1.
-          insertObs.run(row.id, obs.content, obs.createdAt, obs.importance ?? 3.0, obs.contextLayer ?? null, obs.memoryType ?? null);
+          insertObs.run(row.id, obs.content, obs.createdAt, obs.importance ?? 3.0, obs.contextLayer ?? null, obs.memoryType ?? null, 'fedora');
         }
       }
       for (const rel of graph.relations) {
@@ -1241,10 +1297,10 @@ export class SqliteStore implements GraphStore {
     const getExistingForSkip = this.db.prepare(
       `SELECT name AS existing_name, project FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
-    // INSERT includes all three observation metadata columns (importance, context_layer, memory_type).
-    // Schema v6 guarantees these columns exist. Defaults (3.0, NULL, NULL) match the column defaults.
+    // INSERT includes observation metadata columns + source_instance (schema v6/v10).
+    // Defaults (3.0, NULL, NULL, SOURCE_INSTANCE) match the column defaults.
     const insertObs = this.db.prepare(
-      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type) VALUES (?, ?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance) VALUES (?, ?, ?, ?, ?, ?, ?)'
     );
 
     const created: Entity[] = [];
@@ -1287,9 +1343,9 @@ export class SqliteStore implements GraphStore {
           // but EntityInput observations are plain strings or Observation objects --
           // strings get defaults via createObservation(obs), objects pass through as-is
           const o = typeof obs === 'string' ? createObservation(obs) : obs;
-          const obsInfo = insertObs.run(row.id, o.content, o.createdAt, o.importance, o.contextLayer, o.memoryType);
+          const obsInfo = insertObs.run(row.id, o.content, o.createdAt, o.importance, o.contextLayer, o.memoryType, SOURCE_INSTANCE);
           if (obsInfo.changes > 0) {
-            observations.push(o);
+            observations.push({ ...o, sourceInstance: SOURCE_INSTANCE });
           }
         }
 
@@ -1420,9 +1476,9 @@ export class SqliteStore implements GraphStore {
     const findEntity = this.db.prepare(
       `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
-    // INSERT includes all three metadata columns — schema v6 guarantees they exist
+    // INSERT includes metadata columns + source_instance (schema v6/v10)
     const insertObs = this.db.prepare(
-      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type) VALUES (?, ?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance) VALUES (?, ?, ?, ?, ?, ?, ?)'
     );
     // Prepared statement to bump updated_at and last_accessed_at when observations
     // are added to an entity — writes are the strongest access signal.
@@ -1452,8 +1508,8 @@ export class SqliteStore implements GraphStore {
           const importance = o.importances?.[i] ?? 3.0;
           const contextLayer = o.contextLayers?.[i] ?? null;
           const memoryType = o.memoryTypes?.[i] ?? null;
-          const obs: Observation = { content, createdAt: now, importance, contextLayer, memoryType };
-          const info = insertObs.run(row.id, content, now, importance, contextLayer, memoryType);
+          const obs: Observation = { content, createdAt: now, importance, contextLayer, memoryType, sourceInstance: SOURCE_INSTANCE };
+          const info = insertObs.run(row.id, content, now, importance, contextLayer, memoryType, SOURCE_INSTANCE);
           if (info.changes > 0) {
             addedObservations.push(obs);
           }
@@ -1769,8 +1825,10 @@ export class SqliteStore implements GraphStore {
     // Insert the replacement observation as active (superseded_at defaults to '').
     // Carries forward importance/context_layer/memory_type from the superseded observation
     // so metadata isn't lost during content updates (use set_observation_metadata to change these).
+    // source_instance is set from the CURRENT instance (the one performing the supersede),
+    // not carried forward — the new observation was authored by this instance.
     const insertObs = this.db.prepare(
-      `INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type) VALUES (?, ?, ?, ?, ?, ?)`
+      `INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance) VALUES (?, ?, ?, ?, ?, ?, ?)`
     );
     // Bump entity's updated_at and last_accessed_at — writes are the strongest access signal.
     const updateTimestamp = this.db.prepare(
@@ -1813,7 +1871,7 @@ export class SqliteStore implements GraphStore {
         // Insert the replacement — carry forward importance, context_layer, and memory_type
         // from the old observation so metadata survives content updates.
         // INSERT OR IGNORE: if newContent already exists as an active observation, skip.
-        insertObs.run(entityRow.id, s.newContent, now, obsRow.importance, obsRow.context_layer, obsRow.memory_type);
+        insertObs.run(entityRow.id, s.newContent, now, obsRow.importance, obsRow.context_layer, obsRow.memory_type, SOURCE_INSTANCE);
 
         // Bump updated_at and last_accessed_at so the entity surfaces in recency-ordered queries
         updateTimestamp.run(now, now, entityRow.id);
@@ -1951,11 +2009,11 @@ export class SqliteStore implements GraphStore {
 
       const obsRows = this.db.prepare(`
         SELECT o.entity_id AS entityId, o.content, o.created_at AS createdAt,
-               o.importance, o.context_layer, o.memory_type
+               o.importance, o.context_layer, o.memory_type, o.source_instance
         FROM observations o
         WHERE o.entity_id IN (${placeholders}) AND ${obsFilter.clause}
       `).all(...chunk, ...obsFilter.params) as { entityId: number; content: string; createdAt: string;
-        importance: number; context_layer: string | null; memory_type: string | null }[];
+        importance: number; context_layer: string | null; memory_type: string | null; source_instance: string }[];
 
       for (const o of obsRows) {
         if (!obsMap.has(o.entityId)) obsMap.set(o.entityId, []);
@@ -1965,6 +2023,7 @@ export class SqliteStore implements GraphStore {
           importance: o.importance ?? 3.0,
           contextLayer: o.context_layer ?? null,
           memoryType: o.memory_type ?? null,
+          sourceInstance: o.source_instance ?? 'unknown',
         });
       }
     }
@@ -2762,10 +2821,10 @@ export class SqliteStore implements GraphStore {
     // name, sorted chronologically. Unlike buildEntities() which filters
     // superseded_at = '', this returns everything for the timeline view.
     const obsRows = this.db.prepare(`
-      SELECT content, created_at, superseded_at, tombstoned_at
+      SELECT content, created_at, superseded_at, tombstoned_at, source_instance
       FROM observations WHERE entity_id IN (${idPlaceholders})
       ORDER BY created_at ASC
-    `).all(...allEntityIds) as { content: string; created_at: string; superseded_at: string; tombstoned_at: string }[];
+    `).all(...allEntityIds) as { content: string; created_at: string; superseded_at: string; tombstoned_at: string; source_instance: string }[];
 
     // Map DB rows to TimelineObservation with computed status field.
     // Three states: active (superseded_at=''), tombstoned (tombstoned_at!='', content stripped
@@ -2774,6 +2833,7 @@ export class SqliteStore implements GraphStore {
       content: o.content,
       createdAt: o.created_at,
       supersededAt: o.superseded_at,
+      sourceInstance: o.source_instance ?? 'unknown',
       status: o.tombstoned_at !== '' ? 'tombstoned' as const
             : o.superseded_at === '' ? 'active' as const
             : 'superseded' as const,
@@ -2863,7 +2923,8 @@ export class SqliteStore implements GraphStore {
 
     // -- 1. Top observations by importance DESC, then entity recency DESC --
     const topObs = this.db.prepare(`
-      SELECT e.name AS entityName, o.content, o.importance, o.memory_type, e.updated_at
+      SELECT e.name AS entityName, o.content, o.importance, o.memory_type,
+             o.source_instance, e.updated_at
       FROM observations o
       JOIN entities e ON o.entity_id = e.id
       WHERE o.superseded_at = ''
@@ -2875,7 +2936,7 @@ export class SqliteStore implements GraphStore {
       LIMIT ?
     `).all(...typeParams, ...projectParams, obsLimit) as Array<{
       entityName: string; content: string; importance: number;
-      memory_type: string | null; updated_at: string;
+      memory_type: string | null; source_instance: string; updated_at: string;
     }>;
 
     // Map DB column names (snake_case) to interface field names (camelCase).
@@ -2884,6 +2945,7 @@ export class SqliteStore implements GraphStore {
       content: row.content,
       importance: row.importance,
       memoryType: row.memory_type ?? null,
+      sourceInstance: row.source_instance ?? 'unknown',
       updatedAt: row.updated_at ?? '',
     }));
 
@@ -2994,7 +3056,8 @@ export class SqliteStore implements GraphStore {
     // Single query: fetch all matching observations with their entity's display name
     // and updated_at. Sorted by layer (L0 first) then importance DESC.
     const rows = this.db.prepare(`
-      SELECT e.name AS entityName, o.content, o.importance, o.context_layer, o.memory_type, e.updated_at
+      SELECT e.name AS entityName, o.content, o.importance, o.context_layer, o.memory_type,
+             o.source_instance, e.updated_at
       FROM observations o
       JOIN entities e ON o.entity_id = e.id
       WHERE o.superseded_at = ''
@@ -3008,6 +3071,7 @@ export class SqliteStore implements GraphStore {
       importance: number;
       context_layer: string;
       memory_type: string | null;
+      source_instance: string;
       updated_at: string;
     }>;
 
@@ -3028,6 +3092,7 @@ export class SqliteStore implements GraphStore {
           content: row.content,
           importance: row.importance,
           memoryType: row.memory_type,
+          sourceInstance: row.source_instance ?? 'unknown',
           // L0 omits updatedAt per spec — these are identity/rules, not timestamped context.
         });
       } else if (row.context_layer === 'L1' && requestedLayers.has('L1')) {
@@ -3045,6 +3110,7 @@ export class SqliteStore implements GraphStore {
           content: row.content,
           importance: row.importance,
           memoryType: row.memory_type,
+          sourceInstance: row.source_instance ?? 'unknown',
           updatedAt: row.updated_at,
         });
       }

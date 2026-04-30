@@ -795,7 +795,7 @@ describe('Migration safety validation', () => {
     // Verify schema_version is now 9 (v7→v8 normalization + v8→v9 eviction columns).
     const db2 = new Database(dbPath);
     const version = (db2.prepare(`SELECT version FROM schema_version`).get() as { version: number }).version;
-    expect(version).toBe(9);
+    expect(version).toBe(10);
 
     // Verify normalized_name column was added with NOT NULL constraint.
     const v8Cols = db2.prepare(`PRAGMA table_info(entities)`).all() as { name: string; dflt_value: string | null; notnull: number }[];
@@ -1033,7 +1033,7 @@ describe('Migration safety validation', () => {
     // Verify: schema version is now 9.
     const db2 = new Database(dbPath, { readonly: true });
     const version = (db2.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
-    expect(version).toBe(9);
+    expect(version).toBe(10);
 
     // Verify: entities has tombstoned_at and last_accessed_at columns.
     const entityCols = db2.prepare('PRAGMA table_info(entities)').all() as { name: string }[];

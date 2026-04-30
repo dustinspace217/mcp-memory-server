@@ -22,6 +22,7 @@ export interface Observation {
   importance: number;           // 1.0-5.0, default 3.0
   contextLayer: string | null;  // null = L2 (on-demand), 'L0' = always loaded, 'L1' = session start
   memoryType: string | null;    // null = unclassified
+  sourceInstance: string;        // which Claude instance created this observation (from MEMORY_INSTANCE_NAME env var)
 }
 
 /**
@@ -73,6 +74,7 @@ export interface TimelineObservation {
   content: string;
   createdAt: string;
   supersededAt: string;
+  sourceInstance: string;
   /** 'active' = current, 'superseded' = retired by newer version, 'tombstoned' = content stripped by eviction. */
   status: 'active' | 'superseded' | 'tombstoned';
 }
@@ -275,6 +277,7 @@ export interface ContextLayerObservation {
   content: string;
   importance: number;
   memoryType: string | null;
+  sourceInstance: string;
   updatedAt?: string;   // present on L1, omitted on L0
 }
 
@@ -294,6 +297,7 @@ export interface SummaryObservation {
   content: string;
   importance: number;
   memoryType: string | null;
+  sourceInstance: string;
   updatedAt: string;
 }
 
@@ -454,5 +458,5 @@ export function createObservation(
   contextLayer: string | null = null,
   memoryType: string | null = null
 ): Observation {
-  return { content, createdAt: new Date().toISOString(), importance, contextLayer, memoryType };
+  return { content, createdAt: new Date().toISOString(), importance, contextLayer, memoryType, sourceInstance: process.env.MEMORY_INSTANCE_NAME || 'unknown' };
 }
