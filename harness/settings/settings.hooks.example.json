@@ -1,0 +1,93 @@
+{
+  "_comment": "Hooks block fragment to merge into ~/.claude/settings.json. Do NOT replace your existing 'hooks' object — merge each event's array. If you already have entries under SessionStart, append the load-l0-context.py and check-memory-freshness.py commands rather than overwriting. Paths assume CLAUDE_HOME=$HOME/.claude; adjust if you installed elsewhere.",
+
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/load-l0-context.py --chunk=0 --max-entries=3",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/load-l0-context.py --chunk=1 --max-entries=3",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/load-l0-context.py --chunk=2 --max-entries=3",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/check-memory-freshness.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+
+    "PostToolUse": [
+      {
+        "matcher": "mcp__memory__add_observations|mcp__memory__supersede_observations",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/check-memory-noise.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/hooks/pre-compact-agent.sh",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/hooks/post-compact-agent.sh",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/hooks/session-end-agent.sh",
+            "timeout": 180
+          }
+        ]
+      }
+    ],
+
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/hooks/memory-save-gate.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "_comment": "Memory MCP server registration. Merge into the 'mcpServers' object in ~/.claude.json. Adjust 'args' to point at your built dist/index.js. MEMORY_INSTANCE_NAME is optional but recommended for multi-machine setups (one machine writes 'fedora', another writes 'mele', etc., and observations are tagged at write time so audit/freshness hooks can filter by source).",
+
+  "mcpServers": {
+    "memory": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "/REPLACE/WITH/PATH/TO/mcp-memory-server/dist/index.js"
+      ],
+      "env": {
+        "MEMORY_FILE_PATH": "/REPLACE/WITH/PATH/TO/memory.db",
+        "MEMORY_INSTANCE_NAME": "REPLACE_WITH_HOSTNAME"
+      }
+    }
+  }
+}

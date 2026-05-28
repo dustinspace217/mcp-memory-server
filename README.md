@@ -33,6 +33,17 @@ npm run build
 
 > **Note:** `better-sqlite3` is a native C addon. You'll need C build tools (gcc, make) installed. On Fedora: `sudo dnf install gcc make`. On Ubuntu/Debian: `sudo apt install build-essential`.
 
+### Full harness install (recommended for Claude Code)
+
+The server alone provides the storage layer. To replicate the full session-lifecycle integration — auto-loaded L0 context, freshness scanning, pre/post-compact agents, noise gating, `/audit-memory` and `/checkpoint` skills, custom QA agents — see [`harness/README.md`](harness/README.md):
+
+```bash
+cd harness
+./install.sh
+```
+
+The installer is idempotent, backs up existing files, and prints the manual integration steps (settings.json merge, MCP registration, CLAUDE.md fragments) at the end.
+
 ## Usage
 
 ### With Claude Code
