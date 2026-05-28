@@ -4,15 +4,14 @@ The MCP server in this repo's root provides the storage layer (knowledge graph, 
 
 - **Hooks** that load L0 context on session start, flag stale memory entries, gate noisy writes, save snapshots at compaction boundaries
 - **Skills** (`/audit-memory`, `/checkpoint`) that orchestrate maintenance and snapshot workflows
-- **Custom agents** (`silent-failure-hunter`, `adversarial-tester`) used by the project's own QA review process
-- **CLAUDE.md fragments** that establish the Session Protocol, Mid-Session Memory Triggers, and Subagent Model Rules
+- **CLAUDE.md fragment** that establishes the Session Protocol and Mid-Session Memory Triggers
 - **Settings/MCP registration examples** showing how the pieces wire into Claude Code
 
 The server runs without any of this. The harness is what turns a generic MCP memory tool into the kind of system the [project goals](../CLAUDE.md#project-goals) describe — "fast, accurate, drift-resistant, and directly useful in the moment."
 
 ## Source of truth
 
-These files are **verbatim copies** of what's running on the original installation (Fedora 43 KDE, `/home/dustin/.claude/hooks/`, `/home/dustin/.claude/skills/`, `/home/dustin/.claude/agents/`). Hardcoded paths still contain `/home/dustin/Claude` and `/home/dustin/.claude` — the install script substitutes those at install time so the source remains a faithful record of what's deployed.
+These files are **verbatim copies** of what's running on the original installation (Fedora 43 KDE, `/home/dustin/.claude/hooks/`, `/home/dustin/.claude/skills/`). Hardcoded paths still contain `/home/dustin/Claude` and `/home/dustin/.claude` — the install script substitutes those at install time so the source remains a faithful record of what's deployed.
 
 ## Quick install
 
@@ -54,16 +53,16 @@ harness/
 ├── skills/
 │   ├── audit-memory/SKILL.md
 │   └── checkpoint/SKILL.md
-├── agents/
-│   ├── silent-failure-hunter.md
-│   └── adversarial-tester.md
 ├── settings/
 │   ├── settings.hooks.example.json    # hooks block to merge into ~/.claude/settings.json
 │   └── mcp-registration.example.json  # entry to merge into ~/.claude.json mcpServers
 └── claude-md/
-    ├── session-protocol.md            # paste into ~/Claude/CLAUDE.md
-    └── subagent-model-rules.md        # paste into ~/Claude/CLAUDE.md
+    └── session-protocol.md            # paste into ~/Claude/CLAUDE.md
 ```
+
+### What's intentionally not here
+
+General-purpose code-review agents (`silent-failure-hunter`, `adversarial-tester`) and universal subagent-dispatch rules ("implementation = Sonnet min, review = Opus only") are part of the project author's broader Claude Code workflow, not specific to the memory server's runtime. Bundling them here would couple the server's install to one user's workflow defaults. They live in the source machine's `~/.claude/agents/` and top-level `CLAUDE.md` instead.
 
 ## How the pieces fit together
 
@@ -127,9 +126,6 @@ ls -la ~/.claude/hooks/load-l0-context.py ~/.claude/hooks/check-memory-freshness
 # Skills discoverable:
 ls ~/.claude/skills/audit-memory/SKILL.md ~/.claude/skills/checkpoint/SKILL.md
 
-# Agents discoverable:
-ls ~/.claude/agents/silent-failure-hunter.md ~/.claude/agents/adversarial-tester.md
-
 # Database accessible:
 sqlite3 ~/.claude/memory.db "SELECT version FROM schema_version;"
 ```
@@ -145,7 +141,6 @@ cd /path/to/mcp-memory-server
 cp ~/.claude/hooks/{load-l0-context.py,check-memory-freshness.py,check-memory-noise.py,memory-save-gate.sh,periodic-memory-check.sh,session-end-agent.sh,sessionend-prompt.md,pre-compact-agent.sh,precompact-prompt.md,post-compact-agent.sh,test_check_memory_freshness.py} harness/hooks/
 cp ~/.claude/skills/audit-memory/SKILL.md harness/skills/audit-memory/
 cp ~/.claude/skills/checkpoint/SKILL.md harness/skills/checkpoint/
-cp ~/.claude/agents/{silent-failure-hunter.md,adversarial-tester.md} harness/agents/
 git diff harness/
 ```
 

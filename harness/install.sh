@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Memory server harness installer.
 #
-# Installs the hooks, skills, and agents that wire the MCP memory server
-# into Claude Code's session lifecycle. Idempotent — existing files get
+# Installs the hooks and skills that wire the MCP memory server into
+# Claude Code's session lifecycle. Idempotent — existing files get
 # timestamped backups before overwrite. Does NOT auto-edit settings.json,
 # ~/.claude.json, or your CLAUDE.md — those merges are printed at the end.
 #
@@ -118,7 +118,6 @@ show_plan() {
 	  ${C_DIM}Files to install:${C_OFF}
 	    $(find "$HARNESS_DIR/hooks" -maxdepth 1 -type f | wc -l) hooks into $CLAUDE_HOME/hooks/
 	    $(find "$HARNESS_DIR/skills" -mindepth 1 -maxdepth 1 -type d | wc -l) skills into $CLAUDE_HOME/skills/
-	    $(find "$HARNESS_DIR/agents" -maxdepth 1 -type f -name '*.md' | wc -l) agents into $CLAUDE_HOME/agents/
 
 	  ${C_DIM}Existing files will be backed up with suffix:${C_OFF}
 	    $BACKUP_SUFFIX
@@ -254,24 +253,6 @@ install_skills() {
 	ok "Installed $count skills."
 }
 
-install_agents() {
-	heading "Installing custom agents → $CLAUDE_HOME/agents/"
-	ensure_dir "$CLAUDE_HOME/agents"
-	local count=0
-	for src in "$HARNESS_DIR"/agents/*.md; do
-		[[ -f "$src" ]] || continue
-		local name target
-		name="$(basename "$src")"
-		target="$CLAUDE_HOME/agents/$name"
-		# Agents are typically pure markdown with no paths — but run them
-		# through substitution anyway in case future agents reference paths.
-		install_file_with_substitution "$src" "$target" 0
-		say "  ${C_GREEN}✓${C_OFF} $name"
-		count=$((count + 1))
-	done
-	ok "Installed $count agents."
-}
-
 ensure_audit_state_dir() {
 	heading "Ensuring audit state dir exists → $AUDIT_STATE_DIR"
 	ensure_dir "$AUDIT_STATE_DIR"
@@ -327,11 +308,10 @@ print_integration_steps() {
 
 	${C_BOLD}3. Add the Session Protocol to your CLAUDE.md${C_OFF}
 
-	Append the contents of these files to your ~/Claude/CLAUDE.md (or wherever
+	Append the contents of this file to your ~/Claude/CLAUDE.md (or wherever
 	your top-level CLAUDE.md lives) so the agent knows to rely on the harness:
 
 	    $HARNESS_DIR/claude-md/session-protocol.md
-	    $HARNESS_DIR/claude-md/subagent-model-rules.md
 
 	${C_BOLD}4. (Optional) Build the server if you haven't yet${C_OFF}
 
@@ -358,7 +338,6 @@ main() {
 
 	install_hooks
 	install_skills
-	install_agents
 	ensure_audit_state_dir
 
 	check_server_build
