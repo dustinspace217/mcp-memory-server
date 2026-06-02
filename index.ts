@@ -333,7 +333,7 @@ server.registerTool(
   "delete_observations",
   {
     title: "Delete Observations",
-    description: "Delete specific observations from entities in the knowledge graph",
+    description: "Soft-delete observations: retires them (sets superseded_at) so they no longer appear in active queries, but keeps them recoverable via asOf / entity_timeline — it does NOT destroy data. Permanent removal is the automatic eviction sweep's job. Prefer supersede_observations when you have replacement content; use this to retire an observation without a replacement.",
     inputSchema: {
       deletions: z.array(z.object({
         entityName: z.string().min(1).max(500).describe("The name of the entity containing the observations"),

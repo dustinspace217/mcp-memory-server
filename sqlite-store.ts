@@ -1712,18 +1712,26 @@ export class SqliteStore implements GraphStore {
     const findEntity = this.db.prepare(
       `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
-    const delObs = this.db.prepare(
-      `DELETE FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
+    // Soft-delete: RETIRE the observation (stamp superseded_at) rather than DELETE FROM.
+    // The row is kept — excluded from active queries by the superseded_at = '' filter,
+    // but recoverable via asOf / entityTimeline — matching supersedeObservations and the
+    // four-tier preservation model. Actual removal is the automatic eviction sweep's job,
+    // never this method. (This aligns to the long-documented "Tier 2, recoverable" intent;
+    // the prior hard DELETE FROM was the anomaly — see
+    // docs/superpowers/plans/2026-05-30-delete-observations-soft-delete.md.)
+    const softDeleteObs = this.db.prepare(
+      `UPDATE observations SET superseded_at = ? WHERE entity_id = ? AND content = ? AND superseded_at = ''`
     );
     // Prepared statement to bump updated_at and last_accessed_at when observations
-    // are removed from an entity — writes are the strongest access signal.
+    // are retired from an entity — writes are the strongest access signal.
     const updateTimestamp = this.db.prepare(
       'UPDATE entities SET updated_at = ?, last_accessed_at = ? WHERE id = ?'
     );
 
-    const deletedObsIds: number[] = [];
-
     const txn = this.db.transaction(() => {
+      // One timestamp for the whole batch: the superseded_at marker and the entity
+      // access bump share it.
+      const now = new Date().toISOString();
       for (const d of deletions) {
         // deleteObservations is idempotent — empty/separator-only names can't refer
         // to anything that exists, so swallow the normalize error and skip silently.
@@ -1735,34 +1743,22 @@ export class SqliteStore implements GraphStore {
         }
         const row = findEntity.get(normalizedName) as { id: number } | undefined;
         if (!row) continue;
-        let anyDeleted = false;
+        let anyRetired = false;
         for (const content of d.contents) {
-          // Look up the observation ID before deleting (needed for vec cleanup)
-          if (this.vecTableExists) {
-            const obsRow = this.db.prepare(
-              `SELECT id FROM observations WHERE entity_id = ? AND content = ? AND superseded_at = ''`
-            ).get(row.id, content) as { id: number } | undefined;
-            if (obsRow) deletedObsIds.push(obsRow.id);
-          }
-          const result = delObs.run(row.id, content);
-          if (result.changes > 0) anyDeleted = true;
+          // Stamp superseded_at on the active row. The vec_observations embedding is
+          // deliberately KEPT (not deleted) so asOf vector search can still recover the
+          // historically-active observation — same rationale as supersedeObservations.
+          const result = softDeleteObs.run(now, row.id, content);
+          if (result.changes > 0) anyRetired = true;
         }
-        // Only bump updated_at if observations were actually deleted —
+        // Only bump updated_at if observations were actually retired —
         // avoids spurious timestamp advances on no-op deletions (e.g., misspelled content)
-        if (anyDeleted) {
-          const deleteNow = new Date().toISOString();
-          updateTimestamp.run(deleteNow, deleteNow, row.id);
+        if (anyRetired) {
+          updateTimestamp.run(now, now, row.id);
         }
       }
     });
     txn();
-
-    // Clean up vec_observations for deleted observations (fire-and-forget).
-    // Delete path in syncEmbedding is synchronous internally, but we still
-    // don't need to await — it never rejects.
-    for (const obsId of deletedObsIds) {
-      this.syncEmbedding(obsId, '', 'delete');
-    }
     this.maybeRunEviction();
   }
 

@@ -823,6 +823,72 @@ describe.each<[string, string, StoreFactory]>([
 			const graph = await store.readGraph();
 			expect(graph.entities).toHaveLength(0);
 		});
+
+		it('soft-deletes: removed from active queries but recoverable via entityTimeline', async function() {
+			// SqliteStore-only: soft-delete relies on superseded_at + entityTimeline,
+			// which the deprecated JSONL backend does not support.
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Alice', entityType: 'person', observations: ['works at Acme Corp', 'likes coffee'] },
+			]);
+
+			await store.deleteObservations([
+				{ entityName: 'Alice', contents: ['likes coffee'] },
+			]);
+
+			// Excluded from active queries — true for both hard- and soft-delete.
+			const graph = await store.readGraph();
+			const alice = graph.entities.find(e => e.name === 'Alice');
+			expect(alice?.observations).toHaveLength(1);
+			expect(alice?.observations[0]).toEqual(expect.objectContaining({ content: 'works at Acme Corp' }));
+
+			// The deleted observation must be RETIRED, not destroyed — recoverable via
+			// entityTimeline as a superseded entry. A hard DELETE drops the row entirely,
+			// so this assertion is what distinguishes soft-delete from hard-delete.
+			const timeline = await store.entityTimeline('Alice');
+			expect(timeline).not.toBeNull();
+			const deleted = timeline!.observations.find(o => o.content === 'likes coffee');
+			expect(deleted).toBeDefined();
+			expect(deleted!.status).toBe('superseded');
+			expect(deleted!.supersededAt).not.toBe('');
+		});
+
+		it('re-add after soft-delete: same content becomes active again, timeline keeps both rows', async function() {
+			// SqliteStore-only: relies on superseded_at + entityTimeline (JSONL lacks both).
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Bob', entityType: 'person', observations: ['plays guitar'] },
+			]);
+			await store.deleteObservations([
+				{ entityName: 'Bob', contents: ['plays guitar'] },
+			]);
+
+			// Re-add the EXACT same content. The retired row holds
+			// (entity_id, 'plays guitar', superseded_at=<timestamp>); the re-add inserts
+			// (entity_id, 'plays guitar', superseded_at='') — a DISTINCT tuple under
+			// UNIQUE(entity_id, content, superseded_at), so INSERT OR IGNORE creates a
+			// fresh ACTIVE row instead of colliding. This is the interaction soft-delete
+			// introduces: if the constraint or the active filter regressed, the re-add
+			// would be silently swallowed and the content lost from active queries with
+			// no error — a silent-data-loss shape, which is why it earns its own test.
+			await store.addObservations([
+				{ entityName: 'Bob', contents: ['plays guitar'] },
+			]);
+
+			// Active query sees the re-added observation.
+			const graph = await store.readGraph();
+			const bob = graph.entities.find(e => e.name === 'Bob');
+			expect(bob?.observations).toHaveLength(1);
+			expect(bob?.observations[0]).toEqual(expect.objectContaining({ content: 'plays guitar' }));
+
+			// Timeline keeps BOTH the retired row and the re-added active row.
+			const timeline = await store.entityTimeline('Bob');
+			expect(timeline).not.toBeNull();
+			const rows = timeline!.observations.filter(o => o.content === 'plays guitar');
+			expect(rows).toHaveLength(2);
+			expect(rows.filter(o => o.status === 'superseded')).toHaveLength(1);
+			expect(rows.filter(o => o.status === 'active')).toHaveLength(1);
+		});
 	});
 
 	// ----------------------------------------------------------

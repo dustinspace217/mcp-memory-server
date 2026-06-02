@@ -197,7 +197,7 @@ The server is split across 7 source files:
 ### Observation write guidance
 - **Supersede** when an observation states a fact that has changed (status, counts, signatures, descriptions). Use `supersede_observations` to atomically retire the old observation and insert the updated version. The old observation remains in the database (with a `superseded_at` timestamp) for history but is filtered from all active queries.
 - **Append** when an observation adds a genuinely new fact that doesn't contradict or update any existing observation. Use `add_observations` as before.
-- **Never delete** observations to "clean up" — supersede preserves history and avoids accidental data loss.
+- **Delete is now a soft-retire, not destruction.** `delete_observations` stamps `superseded_at` (recoverable via `as_of` / `entity_timeline`), exactly like supersede — it no longer hard-`DELETE`s the row. Use **supersede** when replacing an observation with updated content; use **delete** to retire one that has *no* replacement (e.g. pure noise). Permanent removal happens only through the eviction sweep, never a direct call. (Historically `delete_observations` was a hard `DELETE FROM`; corrected to soft-delete so it stops being the one path that bypassed the preservation-biased lifecycle.)
 
 ### Vector search
 - Vector search uses sqlite-vec + @huggingface/transformers (all-MiniLM-L6-v2, 384 dimensions)
