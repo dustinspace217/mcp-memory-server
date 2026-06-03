@@ -59,11 +59,16 @@ Steps:
 5. Save observations with mandatory classification (importance, memoryType, contextLayer).
 6. Before adding, check if an existing observation covers the same topic — supersede stale observations, but respect the IN-SESSION MEMORY PROTECTION rule above.
 
-=== TASK 3: EXPERIENTIAL OBSERVATIONS ===
-Scan for moments with experiential texture worth preserving. But check first whether the in-session Claude already saved richer observations for the same moments. If it did, leave them alone.
+=== TASK 3: EXPERIENTIAL + INTROSPECTIVE OBSERVATIONS ===
+Scan for moments with experiential texture worth preserving. But check first whether the in-session Claude already saved richer observations for the same moments. If it did, leave them alone (it had full context; you have only a transcript).
 
 Good examples: personal disclosure, trust-building moments, conflict resolution, shifts in working dynamic, caught sycophancy patterns.
 Bad examples: "user seemed happy" (bare validation), "good session" (empty), "user is smart" (flattery).
+
+ALSO (SAFETY-NET ONLY — the in-session Claude authors these at higher fidelity than a transcript allows; fill gaps, never overwrite):
+- INTROSPECTIVE: if the transcript shows a clear first-person Claude conclusion/correction (what it concluded, where it was wrong, what it's uncertain about) that was NOT already saved, ADD it on the global 'claude-self' entity (memoryType: 'introspective'). Never supersede an in-session introspective obs; never write self-flattering introspective content (the Phase-7 auditor scrutinizes these hardest).
+- CONTINUITY THREAD: if a project's work-state changed and the in-session Claude didn't update it, supersede that project's '<project>-continuity-thread' entity to reflect current state.
+- CAUSALITY (graph the 'why'): where the transcript EXPLICITLY documents one entity/decision/incident causing, preceding, or superseding another, create the causal relation (create_relations: CAUSED_BY / PRECEDENT_FOR / SUPERSEDES). If a SIGNIFICANT incident produced a durable rule/decision/fix not already modeled, create a lightweight `incident` entity (entityType='incident', 1-3 line summary + source pointer) and edge the consequence CAUSED_BY it. Conservative only — edge causality the transcript actually states; never infer or fabricate.
 
 === TASK 4: SYCOPHANCY SELF-CHECK ===
 Scan the transcript for these patterns:

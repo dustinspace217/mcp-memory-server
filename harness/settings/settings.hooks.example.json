@@ -1,6 +1,5 @@
 {
-  "_comment": "Hooks block fragment to merge into ~/.claude/settings.json. Do NOT replace your existing 'hooks' object — merge each event's array. If you already have entries under SessionStart, append the load-l0-context.py and check-memory-freshness.py commands rather than overwriting. Paths assume CLAUDE_HOME=$HOME/.claude; adjust if you installed elsewhere.",
-
+  "_comment": "Hooks block fragment to merge into ~/.claude/settings.json. Do NOT replace your existing 'hooks' object \u2014 merge each event's array. If you already have entries under SessionStart, append the load-l0-context.py and check-memory-freshness.py commands rather than overwriting. Paths assume CLAUDE_HOME=$HOME/.claude; adjust if you installed elsewhere.",
   "hooks": {
     "SessionStart": [
       {
@@ -22,13 +21,17 @@
           },
           {
             "type": "command",
+            "command": "python3 $HOME/.claude/hooks/load-continuity-thread.py",
+            "timeout": 10
+          },
+          {
+            "type": "command",
             "command": "python3 $HOME/.claude/hooks/check-memory-freshness.py",
             "timeout": 10
           }
         ]
       }
     ],
-
     "PostToolUse": [
       {
         "matcher": "mcp__memory__add_observations|mcp__memory__supersede_observations",
@@ -41,7 +44,6 @@
         ]
       }
     ],
-
     "PreCompact": [
       {
         "hooks": [
@@ -53,7 +55,6 @@
         ]
       }
     ],
-
     "PostCompact": [
       {
         "hooks": [
@@ -65,7 +66,6 @@
         ]
       }
     ],
-
     "SessionEnd": [
       {
         "hooks": [
@@ -77,7 +77,6 @@
         ]
       }
     ],
-
     "Stop": [
       {
         "hooks": [

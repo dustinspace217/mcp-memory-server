@@ -50,6 +50,7 @@ import os
 import sqlite3
 import sys
 import traceback
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -64,6 +65,11 @@ DB_PATH = Path.home() / ".claude" / "memory.db"
 # Where exception tracebacks go. Stdout is reserved for the hook envelope; if
 # we wrote tracebacks there it'd corrupt the JSON.
 ERROR_LOG_PATH = Path("/tmp/claude/load-l0-errors.log")
+
+# Statusline overflow flag. The in-context overflow warning (appended to the last
+# chunk) reaches only Claude; this flag file is the user-facing route — statusline.sh
+# renders it when present. Written/cleared on chunk 0 by update_overflow_flag().
+OVERFLOW_FLAG_PATH = Path("/tmp/claude/l0-overflow.flag")
 
 # Per-invocation payload budget. The Claude Code cap on hook output is 10,000
 # chars total (stdout). 9500 leaves ~500 chars for the JSON envelope wrapping
@@ -155,13 +161,25 @@ def derive_project(cwd):
 
 	Examples:
 	  /home/dustin/Claude/dustin-space/src  → "dustin-space"
+	  /home/dustin/Claude/Voice Prompt      → "voice prompt"  (normalized)
 	  /home/dustin/Claude                   → None (global)
 	  /home/dustin                          → None (outside workspace)
+
+	The derived name is NORMALIZED (trim → lower → NFC) to match the key the MCP
+	server stores: normalizeProjectId (index.ts) applies the same on every
+	project-scoped write, so entities.project is always lowercased+NFC. The L1
+	query below is an exact `e.project = ?` match, so without this a capitalized /
+	spaced / NFD directory name (e.g. "Voice Prompt") would never match its stored
+	"voice prompt" and the project's L1 context would SILENTLY fail to load (worse
+	than the continuity hook's case — there is no visible "no thread" note here, L0
+	just loads without the project's L1). Mirror trim+lower+NFC exactly; do NOT
+	strip separators (that's normalizeEntityName — the project field keeps spaces
+	and hyphens).
 	"""
 	try:
 		rel = Path(cwd).resolve().relative_to(PROJECT_ROOT_BASE)
 		if rel.parts:
-			return rel.parts[0]
+			return unicodedata.normalize("NFC", rel.parts[0].strip().lower())
 	except (ValueError, OSError):
 		pass
 	return None
@@ -384,6 +402,33 @@ def log_error():
 
 # ─── entry point ─────────────────────────────────────────────────────────────
 
+def update_overflow_flag(total_chunks, max_entries):
+	"""
+	Write or clear the statusline overflow flag.
+
+	The existing in-context warning (appended to the last chunk) reaches only
+	Claude — Dustin never sees it unless Claude relays it, which is unreliable.
+	This flag file is the user-facing route: statusline.sh renders it when present.
+	Called once, on chunk 0 (which always runs and has the full chunk plan), and
+	clears the flag when there's no overflow so a fixed config self-heals on the
+	next session start.
+
+	Best-effort: a flag-file failure must never break context loading, so all
+	filesystem errors are swallowed.
+	"""
+	try:
+		if total_chunks > max_entries:
+			missing = total_chunks - max_entries
+			OVERFLOW_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+			OVERFLOW_FLAG_PATH.write_text(
+				f"L0 overflow: needs {total_chunks} chunks, {max_entries} configured (+{missing} more entries)"
+			)
+		elif OVERFLOW_FLAG_PATH.exists():
+			OVERFLOW_FLAG_PATH.unlink()
+	except OSError:
+		pass
+
+
 def _main_inner(args):
 	"""
 	The actual loader logic. Returns the envelope text. Allowed to raise.
@@ -427,6 +472,12 @@ def _main_inner(args):
 		return ""
 
 	chunks = plan_chunks(rows, project)
+
+	# Surface overflow to the user (not just Claude) via the statusline flag.
+	# Done on chunk 0 because it always runs and sees the full chunk plan.
+	if args.chunk == 0:
+		update_overflow_flag(len(chunks), args.max_entries)
+
 	text = build_chunk_text(rows, chunks, args.chunk, project)
 	if not text:
 		# Past-end chunk. Stay silent (empty stdout) so the env is uncluttered.
@@ -466,10 +517,23 @@ def main():
 	Hook entry point. Wraps _main_inner in typed exception handlers so the
 	"always exit 0" invariant survives any failure mode.
 	"""
-	args = parse_args()
 	envelope_text = None
 	try:
+		# parse_args() is INSIDE the guard on purpose: argparse calls sys.exit(2)
+		# (raising SystemExit) on an unrecognized flag or a non-integer --chunk /
+		# --max-entries — i.e. a settings.json command-line typo. SystemExit derives
+		# from BaseException, NOT Exception, so the broad `except Exception` below
+		# does not catch it; without the explicit `except SystemExit` clause a typo'd
+		# flag would crash every SessionStart with a nonzero exit and no envelope,
+		# breaking the "always exit 0" invariant. (Latent today — the registered args
+		# are valid — but first-line defense against a future settings.json edit.)
+		args = parse_args()
 		envelope_text = _main_inner(args)
+	except SystemExit:
+		envelope_text = build_error_envelope(
+			"BAD ARGS", "invalid hook argument — check the settings.json command line"
+		)
+		log_error()
 	except SchemaDriftError as exc:
 		envelope_text = build_error_envelope(
 			"SCHEMA DRIFT", f"memory.db schema mismatch: {exc}"

@@ -73,5 +73,12 @@ CLAUDE_OUTPUT=$(echo "$PROMPT" | claude -p \
     log "OK: save completed (session=$SESSION_ID, ${#CLAUDE_OUTPUT} chars output)" || \
     log "FAIL: claude -p exited with error (session=$SESSION_ID, stderr=$(head -1 /tmp/claude/sessionend-stderr-${SESSION_ID}.txt 2>/dev/null))"
 
+# Chase this session's final memory write with the anti-sycophancy auditor (Phase 7.4).
+# The session-end agent above just saved/updated the self-record; audit it now. Detached so it
+# does not extend SessionEnd teardown; self-gates (skips if unchanged) and single-flight-locked,
+# same as the Stop-hook launch. Self-skips if claude/deps are missing.
+nohup python3 "$HOME/.claude/audit/run-memory-audit.py" --cwd "${CWD:-$HOME/Claude}" >/dev/null 2>&1 &
+disown 2>/dev/null || true
+
 # Clean up
 rm -f "$EXCERPT" "/tmp/claude/sessionend-stderr-${SESSION_ID}.txt"
