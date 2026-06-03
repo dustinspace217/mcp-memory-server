@@ -2,12 +2,12 @@
 
 *Plan doc for the Memory Usability Overhaul (extends `2026-04-13-memory-usability-overhaul.md`, which ends at Phase 6 / Confidence Decay, TODO). Grounded against live code + DB (schema v10) and verified by four review agents + three CC-internals verification passes — not recall.*
 
-## Status (updated 2026-06-03 — 7.3 spec rewritten to v4; building the ungated core)
-Phase: **7 of 7** (Experiential Texture Continuity) — implementation in progress.
+## Status (updated 2026-06-03 — CAPTURE LAYER built + committed; LOAD + AUDIT remain, both need Dustin)
+Phase: **7 of 7** (Experiential Texture Continuity) — capture core done; load + audit pending.
 **DESIGN PIVOTED v3 → v4** (see `## v4`): from isolated-*derivation* to in-context-*authoring* + isolated-*audit*, with **capture as the hard core**. The v3 "Architecture" and "7.3" sections are SUPERSEDED (kept for history). New `introspective` memoryType approved (first-person Claude stance; no schema change).
-Done: 7.0 (L0 overflow fix, 5→7); 7.1 write-policy verbatim-anchor rule; **7.2 consolidation-prompt experiential protection** (live prompt patched, `d5d0928`; **DEF-7-01 RESOLVED**); **7.3 build spec rewritten to v4 capture-as-core** (2026-06-03 — two layers: append-only raw experiential obs + an in-place-authored thread accumulator; sub-steps 7.3a–7.3e, gates marked).
-Next: build the ungated core in order — **7.3a** `introspective`/`narrative`/`relational` → `KNOWN_TYPES` (small code + TDD) → **7.3b** write-policy doc → **7.3c** `claude-self` entity + first dogfood capture → **7.3d** thread accumulator. Then 7.5 load hook. **7.4 audit is GATED** (env-var hook guard + live isolation probe + `claude -p` permission — need Dustin's OK). 7.1 L2-legibility render still pending (non-gating).
-Blocked: nothing ungated. **No schema change.** The audit step (7.4) gates land when we reach it.
+Done: 7.0 (L0 overflow fix); 7.1 verbatim-anchor rule; 7.2 consolidation protection (`d5d0928`; **DEF-7-01 RESOLVED**); **7.3 v4 build spec**; **7.3a** `introspective`/`narrative`/`relational` → single-sourced `KNOWN_MEMORY_TYPES` (commit `1fb71a1`, tsc clean); **7.3b** write-policy documents `introspective`; **7.3c** global `claude-self` entity + first dogfooded introspective captures (fresh-context correction / audit-the-author / control-byte humility); **7.3d** per-project thread authored on `mcp-memory-server-continuity-thread` (read by NAME; supersede-in-place). **The whole CAPTURE LAYER (raw obs + thread) is live.**
+Next (both need Dustin — they touch his live harness / need a gate): **7.5 load hook** — a SessionStart sibling hook reading `memory.db` to load the thread into a demarcated block; building the *script* is ungated but REGISTERING it in his settings.json changes every session, so do it with his OK. **7.4 audit (GATED)** — env-var self-skip guard in `load-l0-context.py` + `claude -p` permission + a one-time live isolation probe. Non-gating leftovers: 7.1 L2-legibility render; the §3.3 usage protocol (Dustin's track).
+Blocked: the remaining steps are not *blocked* but are **checkpoint-gated** on Dustin (harness change + permission/probe). **No schema change** throughout.
 
 ## v1 → v2 → v3 changelog (the design moved twice; read this)
 - **v1 (pull):** register-triggered on-demand pull. **Wrong frame** (Dustin caught it): on-demand-only loads nothing at session start → no baseline continuity. Continuity needs the thread *present at start* = in the load path = bounded cost.
