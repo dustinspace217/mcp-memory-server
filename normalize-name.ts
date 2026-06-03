@@ -31,8 +31,8 @@
  *   2. throw if empty after trim
  *   3. NFC unicode normalize (so 'café' written two different ways collapses)
  *   4. lowercase
- *   5. strip separator characters: whitespace, hyphen, underscore,
- *      slash, dot, backslash, colon
+ *   5. strip separator characters: C0 control chars, whitespace, hyphen,
+ *      underscore, slash, dot, backslash, colon
  *   6. throw if empty after stripping
  *
  * Examples:
@@ -64,11 +64,19 @@ export function normalizeEntityName(input: string): string {
   const folded = trimmed.normalize('NFC').toLowerCase();
 
   // Step 3: strip the separator class.
-  // Characters stripped: whitespace (\s), hyphen (-), underscore (_),
-  // forward slash (/), dot (.), backslash (\\), colon (:).
+  // Characters stripped: C0 control chars (\u0000-\u001f), whitespace (\s),
+  // hyphen (-), underscore (_), forward slash (/), dot (.), backslash (\\), colon (:).
   // Using a regex character class with the global flag means every
   // run of separators is removed in one pass.
-  const stripped = folded.replace(/[\s\-_/.\\:]+/g, '');
+  //
+  // Why \u0000-\u001f explicitly (it is NOT redundant with \s): JS \s matches only the
+  // whitespace C0 chars (\t \n \v \f \r) plus space and some Unicode spaces -- it does
+  // NOT match \x00-\x08 or \x0e-\x1f. We strip the WHOLE C0 range because a stored
+  // normalized_name is used as an identity key delimited by char(31) (0x1f) inside
+  // getConnectedContext's recursive-CTE path / cycle guard. A name containing 0x1f would
+  // split a path mid-name and corrupt cycle detection, so stripping all C0 controls here
+  // guarantees the delimiter can never collide with name content.
+  const stripped = folded.replace(/[\s\u0000-\u001f\-_/.\\:]+/g, '');
 
   // Step 4: ensure something is left after stripping. A name like
   // '---' or '   ' would normalize to empty here -- reject it.

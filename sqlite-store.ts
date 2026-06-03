@@ -38,6 +38,12 @@ import {
   type CheckDuplicateInput,
   type CheckDuplicatesResponse,
   type DuplicateMatch,
+  type ConnectedContextOptions,
+  type ConnectedContextResult,
+  type ConnectedNode,
+  type PrecedentMatch,
+  type FindPrecedentsResult,
+  type FindPrecedentsOptions,
 } from './types.js';
 import { JsonlStore } from './jsonl-store.js';
 import {
@@ -98,6 +104,31 @@ const EVICTION_CHECK_INTERVAL = 1000;
 // 'unknown' is the fallback when the env var isn't set — makes misconfigured
 // instances visible rather than silently producing untagged observations.
 const SOURCE_INSTANCE = process.env.MEMORY_INSTANCE_NAME || 'unknown';
+
+/**
+ * Final ranking stage for findPrecedents: gate by the minSimilarity floor, rank by similarity
+ * DESC, cap at `limit`, and round similarity to 3 decimals for display.
+ *
+ * The ORDER here is load-bearing (Finding E): the floor and the sort run on the RAW cosine, and
+ * rounding is the LAST, display-only step (after slice). Rounding before the floor would let a
+ * 0.2496 cosine round up to 0.250 and slip past a 0.25 floor (a boundary leak surfacing a
+ * sub-floor precedent as if it cleared the bar — a Goal-A drift); rounding before the sort could
+ * also reorder near-ties. Extracted as a pure function so this invariant is unit-testable WITHOUT
+ * loading the embedding model (per the project's compute-expensive-testing rule: exercise the
+ * logic around the expensive resource cheaply, the resource itself in a small opt-in suite).
+ *
+ * @param precedents - hydrated matches carrying RAW cosine in `.similarity`
+ * @param minSimilarity - cosine floor; gates on the raw value
+ * @param limit - max matches to return
+ * @returns filtered + raw-DESC-sorted + capped matches, with `.similarity` rounded for display
+ */
+export function rankAndFloorPrecedents(precedents: PrecedentMatch[], minSimilarity: number, limit: number): PrecedentMatch[] {
+  return precedents
+    .filter(p => p.similarity >= minSimilarity)        // gate on raw cosine
+    .sort((a, b) => b.similarity - a.similarity)        // rank on raw cosine
+    .slice(0, limit)
+    .map(p => ({ ...p, similarity: Math.round(p.similarity * 1000) / 1000 })); // round for display only
+}
 
 /**
  * SQLite-backed knowledge graph store. Uses WAL mode for concurrent read performance
@@ -748,6 +779,18 @@ export class SqliteStore implements GraphStore {
     // Drop+recreate: v5 migration changed the schema, old non-partial index is stale.
     this.db.exec('DROP INDEX IF EXISTS idx_relations_to_entity;');
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_relations_to_entity_active ON relations(to_entity) WHERE superseded_at = '';`);
+    // Mirror index on from_entity for the out-direction leg of multi-hop traversal
+    // (getConnectedContext): the `edges` CTE is materialized ONCE per call (the recursive walk
+    // joins against it), and this index lets that one materialization seek by from_entity
+    // instead of full-scanning relations. Partial (active-only). NOTE: the partial predicate
+    // only applies on the no-asOf path, where `superseded_at = ''` is a top-level conjunct.
+    // When opts.asOf is set, temporalRelFilter emits `... AND (superseded_at = '' OR
+    // superseded_at > ?)` — a disjunction the partial index can't satisfy, so asOf walks fall
+    // back to a relations scan. Negligible at current scale (a once-per-call scan); if asOf
+    // traversal ever gets hot on a large corpus, add a non-partial (from_entity, created_at,
+    // superseded_at) index — but only if profiling shows the materialization is the bottleneck.
+    // This is an index, not a schema_version change.
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_relations_from_entity_active ON relations(from_entity) WHERE superseded_at = '';`);
 
     // Pagination indexes for keyset queries on (updated_at DESC, id DESC).
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_entities_project_updated ON entities(project, updated_at DESC, id DESC);');
@@ -2687,6 +2730,338 @@ export class SqliteStore implements GraphStore {
 
     const relations = this.getConnectedRelations(displayNames, asOf);
     return { entities, relations };
+  }
+
+  /**
+   * Walks the relation graph outward from `seedEntity` up to maxHops, returning the
+   * structurally-connected neighborhood: lightweight nodes (name/type/hopDistance/path,
+   * NO observations) plus the active edges among them. Surfaces INDIRECT facts that
+   * recency/semantic search misses — e.g. a sanction two hops from a loan applicant —
+   * because the walk follows graph structure, not textual similarity.
+   *
+   * How it works: a non-recursive `edges` CTE materializes the direction-aware edge list
+   * (out: from->to, in: to->from, both: either) over ACTIVE relations; the recursive `walk`
+   * follows it from the seed. The `path` column (char(31)-separated normalized names) is
+   * BOTH the cycle guard — a candidate already on the path is skipped, so cycles terminate —
+   * and the shortest-path source. GROUP BY node with a single MIN(depth) collapses multi-path
+   * arrivals to the nearest hop (SQLite assigns the bare `path` from that same min-depth row).
+   * char(31) is a safe delimiter: normalizeEntityName strips the whole C0 control range
+   * (\u0000-\u001f, which INCLUDES 0x1f = char(31)) plus whitespace/separators, so it can never
+   * occur inside a stored normalized_name — see normalize-name.ts Step 3, where this exact
+   * traversal invariant is the documented reason C0 stripping is not redundant with \s.
+   *
+   * Returns STRUCTURE ONLY (no observations) so deep/broad walks stay cheap on the caller's
+   * context budget — fetch full content for the nodes that matter via openNodes.
+   *
+   * WORKLOAD NOTE (not a correctness bug; profile before optimizing): the cycle guard is
+   * per-PATH, not global — `walk` materializes every distinct SIMPLE path to each node before
+   * the outer `GROUP BY node` collapses them to MIN(depth). maxNodes caps the RETURNED rows in
+   * JS, AFTER the CTE runs; it does NOT bound the CTE's work. So from a high-degree hub at large
+   * maxHops with direction:'both' (which doubles every undirected edge into two directed edges),
+   * intermediate simple-path count grows ~d·(d-1)^(h-1) and the synchronous better-sqlite3
+   * .all() can block the single-threaded server. Safe at this server's scale (low avg degree),
+   * and the maxHops ceiling (6) bounds h — but if a hubby corpus ever makes this hot, the fix is
+   * a global visited-set / closure-table walk, decided by EXPLAIN QUERY PLAN + a degree-30
+   * fixture, NOT a reflexive rewrite. Tracked as DEF-CG-01 in the causal-relations design doc.
+   *
+   * @param seedEntity - entity to traverse from (any surface form)
+   * @param opts - maxHops (default 3), direction ('out'|'in'|'both', default 'both'),
+   *               maxNodes (cap, default 50), relationTypes (case-insensitive type filter on
+   *               the walked edges), asOf (point-in-time), projectId (scope reached nodes to
+   *               that project + global; advisory, applied at hydration before the cap).
+   */
+  async getConnectedContext(seedEntity: string, opts: ConnectedContextOptions = {}): Promise<ConnectedContextResult> {
+    const maxHops = opts.maxHops ?? 3;
+    const maxNodes = opts.maxNodes ?? 50;
+    const direction = opts.direction ?? 'both';
+
+    // Normalize the seed to the stored identity form. A name that can't be normalized
+    // (or that matches nothing) yields an empty neighborhood rather than throwing — read op.
+    let seedNorm: string;
+    try {
+      seedNorm = normalizeEntityName(seedEntity);
+    } catch {
+      return { seed: seedEntity, nodes: [], relations: [], cycles: [], truncated: false };
+    }
+
+    // Direction-aware edge list. Each arm filters relations by the temporal window (active,
+    // or active-as-of when opts.asOf is set) and, optionally, by relation_type. The type
+    // filter is CASE-INSENSITIVE (UPPER both sides) so a 'works_for' edge matches a
+    // 'WORKS_FOR' filter — callers shouldn't have to know the stored casing.
+    const relFilter = this.temporalRelFilter(opts.asOf, '');
+    let typeClause = '';
+    let typeParams: string[] = [];
+    if (opts.relationTypes && opts.relationTypes.length > 0) {
+      typeClause = ` AND UPPER(relation_type) IN (${opts.relationTypes.map(() => '?').join(',')})`;
+      typeParams = opts.relationTypes.map(t => t.toUpperCase());
+    }
+    const armWhere = `WHERE ${relFilter.clause}${typeClause}`;
+    const armParams: (string | number)[] = [...relFilter.params, ...typeParams];
+    const outArm = `SELECT from_entity AS src, to_entity AS dst FROM relations ${armWhere}`;
+    const inArm = `SELECT to_entity AS src, from_entity AS dst FROM relations ${armWhere}`;
+    const edgesSql =
+      direction === 'out' ? outArm :
+      direction === 'in' ? inArm :
+      `${outArm} UNION ALL ${inArm}`;
+    // Bind one set of arm params per arm present (out arm unless direction 'in'; in unless 'out').
+    const edgeParams: (string | number)[] = [];
+    if (direction !== 'in') edgeParams.push(...armParams);
+    if (direction !== 'out') edgeParams.push(...armParams);
+
+    // Recursive walk. Seed anchors at depth 0; each hop appends the neighbor to the path
+    // unless it's already there (cycle guard — wrap path AND candidate in char(31) so the
+    // seed at the path's head is matched). maxHops bounds depth.
+    const walkRows = this.db.prepare(`
+      WITH RECURSIVE
+        edges(src, dst) AS (${edgesSql}),
+        walk(node, depth, path) AS (
+          SELECT ?, 0, ?
+          UNION ALL
+          SELECT e.dst, walk.depth + 1, walk.path || char(31) || e.dst
+          FROM walk JOIN edges e ON e.src = walk.node
+          WHERE walk.depth < ?
+            AND instr(char(31) || walk.path || char(31), char(31) || e.dst || char(31)) = 0
+        )
+      SELECT node, MIN(depth) AS depth, path
+      FROM walk
+      GROUP BY node
+    `).all(...edgeParams, seedNorm, seedNorm, maxHops) as { node: string; depth: number; path: string }[];
+
+    // Reached nodes (exclude the seed at depth 0), nearest-hop first then name.
+    const reached = walkRows
+      .filter(r => r.depth >= 1)
+      .sort((a, b) => a.depth - b.depth || a.node.localeCompare(b.node));
+
+    // Translate normalized -> display name + entityType for the seed and every reached node,
+    // scoped to the requested project when projectId is set (project = ? OR global). Only
+    // ACTIVE entities surface — a relation can point at a soft-deleted identity, which is a
+    // dead end for usable context.
+    //
+    // Hydrate + scope BEFORE applying maxNodes (not at the cap, not after): an out-of-project
+    // or soft-deleted node must not consume a cap slot, or `truncated` would lie (report true
+    // when nothing in-scope was actually truncated) and in-scope nodes that would have fit
+    // could be dropped. So we resolve the full reached set first, then keep only nodes that
+    // hydrated in-scope, then cap that filtered set. Project scoping is advisory (see CLAUDE.md
+    // Known Limitations): the walk itself still traverses foreign nodes structurally, so an
+    // in-scope node reachable only via a foreign intermediate is still returned, with the
+    // foreign intermediate shown by its normalized name in `path`.
+    const SEP = String.fromCharCode(31);
+    const reachedNorms = new Set<string>([seedNorm]);
+    for (const r of reached) reachedNorms.add(r.node);
+    const entFilter = this.temporalEntFilter(opts.asOf, '');
+    const projClause = opts.projectId ? ' AND (project = ? OR project IS NULL)' : '';
+    const projParams: string[] = opts.projectId ? [opts.projectId] : [];
+    const dispMap = new Map<string, { name: string; entityType: string }>();
+    const normList = [...reachedNorms];
+    for (let i = 0; i < normList.length; i += CHUNK_SIZE) {
+      const chunk = normList.slice(i, i + CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db.prepare(
+        `SELECT normalized_name, name, entity_type AS entityType FROM entities
+         WHERE normalized_name IN (${placeholders}) AND ${entFilter.clause}${projClause}`
+      ).all(...chunk, ...entFilter.params, ...projParams) as { normalized_name: string; name: string; entityType: string }[];
+      for (const row of rows) dispMap.set(row.normalized_name, { name: row.name, entityType: row.entityType });
+    }
+
+    // The SEED is the anchor the caller named, NOT a reached node — project scoping applies to the
+    // NEIGHBORHOOD, not the seed. When projectId is set and the seed belongs to a DIFFERENT project,
+    // the project-filtered loop above won't have hydrated it. Resolve it here independently of the
+    // project clause (temporal filter only) so: (a) `seed` reports the canonical display name, not
+    // the raw caller string, and (b) the display-name inSet filter below keeps the seed's edges into
+    // the scoped project instead of silently dropping them (the surface-variant edge-drop caught in
+    // review). The guard skips this for the common in-project / no-projectId case (already hydrated).
+    if (!dispMap.has(seedNorm)) {
+      const seedRow = this.db.prepare(
+        `SELECT name, entity_type AS entityType FROM entities WHERE normalized_name = ? AND ${entFilter.clause}`
+      ).get(seedNorm, ...entFilter.params) as { name: string; entityType: string } | undefined;
+      if (seedRow) dispMap.set(seedNorm, { name: seedRow.name, entityType: seedRow.entityType });
+    }
+
+    // Keep only reached nodes that resolved to an in-scope active entity, THEN cap. Filtering
+    // before the cap is what makes `truncated` honest (see the hydration note above).
+    const inScope = reached.filter(r => dispMap.has(r.node));
+    const truncated = inScope.length > maxNodes;
+    const capped = inScope.slice(0, maxNodes);
+
+    // Build result nodes; skip reached identities with no active entity (dead ends).
+    const nodes: ConnectedNode[] = [];
+    for (const r of capped) {
+      const disp = dispMap.get(r.node);
+      if (!disp) continue;
+      nodes.push({
+        name: disp.name,
+        entityType: disp.entityType,
+        hopDistance: r.depth,
+        path: r.path.split(SEP).filter(Boolean).map(p => dispMap.get(p)?.name ?? p),
+      });
+    }
+
+    // Edges among the seed + reached nodes. Reuse the audited relation query (handles
+    // normalized->display translation + dedup), then keep only edges whose BOTH endpoints
+    // are in the returned set, so the relations describe exactly the returned subgraph.
+    const seedDisp = dispMap.get(seedNorm)?.name ?? seedEntity;
+    const inSet = new Set<string>([seedDisp, ...nodes.map(n => n.name)]);
+    const relations = this.getConnectedRelations([...inSet], opts.asOf).filter(r => inSet.has(r.from) && inSet.has(r.to));
+
+    // Mechanically detect directed cycles among the returned edges so circular logic is
+    // flagged in the result rather than left for the caller to notice. The subgraph edge set
+    // is bounded by maxNodes, so a plain recursive DFS is plenty.
+    const cycles = this.detectDirectedCycles(relations);
+
+    return { seed: seedDisp, nodes, relations, cycles, truncated };
+  }
+
+  /**
+   * Detects directed cycles among a set of relations via DFS with recursion-stack (gray/black)
+   * coloring: a back-edge to a node currently on the stack closes a cycle, which we reconstruct
+   * from the stack. De-duplicated by node SET, so the same loop discovered from different entry
+   * points isn't reported twice. Operates on the already-bounded subgraph edge set, so plain
+   * recursion is safe at this scale.
+   *
+   * @param relations - directed edges (from -> to, display names)
+   * @returns one array per distinct cycle: nodes round the loop with the entry node repeated at
+   *          the end (e.g. ['A','B','C','A']); empty array if acyclic.
+   */
+  private detectDirectedCycles(relations: Relation[]): string[][] {
+    const adj = new Map<string, string[]>();
+    for (const r of relations) {
+      if (!adj.has(r.from)) adj.set(r.from, []);
+      adj.get(r.from)!.push(r.to);
+    }
+    const WHITE = 0, GRAY = 1, BLACK = 2;
+    const color = new Map<string, number>();
+    const stack: string[] = [];
+    const cycles: string[][] = [];
+    const seen = new Set<string>();
+    const visit = (node: string): void => {
+      color.set(node, GRAY);
+      stack.push(node);
+      for (const next of adj.get(node) ?? []) {
+        const c = color.get(next) ?? WHITE;
+        if (c === GRAY) {
+          // Back-edge: `next` is an ancestor on the current stack — cycle found.
+          const idx = stack.indexOf(next);
+          if (idx >= 0) {
+            const loop = stack.slice(idx);
+            // Collision-proof dedup key: JSON.stringify of the sorted node set. A delimiter-joined
+            // string (even with a control char) can collide if a display name contains the delimiter,
+            // and an invisible control byte in source is unreviewable. JSON quoting escapes any
+            // character and the array structure is unambiguous, so distinct node sets never collide.
+            const key = JSON.stringify([...loop].sort());
+            if (!seen.has(key)) {
+              seen.add(key);
+              cycles.push([...loop, next]); // repeat entry node to close the loop visually
+            }
+          }
+        } else if (c === WHITE) {
+          visit(next);
+        }
+      }
+      stack.pop();
+      color.set(node, BLACK);
+    };
+    for (const node of adj.keys()) {
+      if ((color.get(node) ?? WHITE) === WHITE) visit(node);
+    }
+    return cycles;
+  }
+
+  /**
+   * Retrieves observations RANKED by cosine similarity to `query`, reusing the same sqlite-vec
+   * KNN path as dedup but ranking + returning instead of threshold-gating. Fills the "find the
+   * most similar prior decision" gap (search_nodes orders by recency; get_connected_context by
+   * structure). Over-fetches KNN candidates, filters to active obs on active entities with optional
+   * project/memoryType scoping, ranks by similarity, applies the floor, caps at limit.
+   *
+   * Degrades to { precedents: [], modelReady, vectorSearchEnabled } when the vec table or model is
+   * unavailable — it does NOT fall back to LIKE/recency, which would mislabel recency-ordered rows
+   * as similarity precedents (a silent-failure footgun). The flags tell the caller why it's empty.
+   *
+   * @param query - situation/scenario text to find precedents for
+   * @param projectId - optional project scope (project + global), pre-normalized by the caller
+   * @param opts - memoryType filter, limit (default 5), minSimilarity floor (default 0.25)
+   */
+  async findPrecedents(query: string, projectId?: string, opts: FindPrecedentsOptions = {}): Promise<FindPrecedentsResult> {
+    const limit = opts.limit ?? 5;
+    const minSimilarity = opts.minSimilarity ?? 0.25;
+    const modelReady = this.embeddingPipeline.state.status === 'ready';
+    const vectorSearchEnabled = this.vecTableExists;
+
+    // Similarity ranking is impossible without the model + vec table. Return empty + flags
+    // rather than throwing or recency-falling-back.
+    if (!vectorSearchEnabled || !modelReady) {
+      return { precedents: [], modelReady, vectorSearchEnabled };
+    }
+
+    const embedding = await this.embeddingPipeline.embed(query);
+    if (!embedding) return { precedents: [], modelReady, vectorSearchEnabled };
+
+    // Over-fetch: KNN ranks over ALL observations, but we then filter by active/project/memoryType,
+    // so fetch more candidates than `limit` to still have enough after filtering. k is a validated
+    // integer interpolated into the query (sqlite-vec's MATCH ... k = N syntax here, mirroring the
+    // dedup paths, does not bind k as a parameter).
+    const k = Math.min(Math.max(limit * 5, 50), 200);
+    const knnRows = this.db.prepare(`
+      SELECT v.observation_id, v.distance FROM vec_observations v
+      WHERE v.embedding MATCH ? AND k = ${k}
+    `).all(
+      Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+    ) as { observation_id: string; distance: number }[];
+
+    if (knnRows.length === 0) return { precedents: [], modelReady, vectorSearchEnabled };
+
+    // L2 distance on unit-normalized vectors -> cosine similarity: 1 - dist²/2 (same as dedup).
+    const simById = new Map<number, number>();
+    for (const r of knnRows) {
+      simById.set(parseInt(r.observation_id, 10), 1 - (r.distance * r.distance) / 2);
+    }
+
+    // Hydrate only ACTIVE observations on ACTIVE entities, applying project/memoryType filters.
+    const ids = [...simById.keys()];
+    const precedents: PrecedentMatch[] = [];
+    for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+      const chunk = ids.slice(i, i + CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const filters: string[] = [];
+      const params: (string | number)[] = [...chunk];
+      if (projectId) { filters.push('(e.project = ? OR e.project IS NULL)'); params.push(projectId); }
+      if (opts.memoryType) { filters.push('o.memory_type = ?'); params.push(opts.memoryType); }
+      const rows = this.db.prepare(`
+        SELECT o.id, o.content, o.importance, o.memory_type, o.context_layer, o.created_at, e.name AS entityName
+        FROM observations o JOIN entities e ON o.entity_id = e.id
+        WHERE o.id IN (${placeholders})
+          AND o.superseded_at = '' AND o.tombstoned_at = ''
+          AND e.superseded_at = '' AND e.tombstoned_at = ''
+          ${filters.length ? 'AND ' + filters.join(' AND ') : ''}
+      `).all(...params) as Array<{
+        id: number; content: string; importance: number; memory_type: string | null;
+        context_layer: string | null; created_at: string; entityName: string;
+      }>;
+      for (const row of rows) {
+        precedents.push({
+          entityName: row.entityName,
+          observationId: String(row.id),
+          content: row.content,
+          // RAW cosine here, not rounded — the minSimilarity floor and the ranking sort below
+          // must gate/order on the TRUE similarity. Rounding is display-only and is applied at
+          // the return boundary; rounding before the floor would let a 0.2496 cosine round up to
+          // 0.250 and slip past a 0.25 floor (boundary leak). Filter/sort on truth, round for show.
+          similarity: simById.get(row.id) ?? 0,
+          importance: row.importance ?? 3.0,
+          memoryType: row.memory_type,
+          contextLayer: row.context_layer,
+          createdAt: row.created_at,
+        });
+      }
+    }
+
+    return {
+      // Gate on the floor + rank by raw cosine + cap + round-for-display, in that order — see the
+      // rankAndFloorPrecedents JSDoc for why rounding must be last (Finding E boundary leak).
+      precedents: rankAndFloorPrecedents(precedents, minSimilarity, limit),
+      modelReady,
+      vectorSearchEnabled,
+    };
   }
 
   /**

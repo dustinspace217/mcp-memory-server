@@ -147,6 +147,316 @@ describe.each<[string, string, StoreFactory]>([
 	});
 
 	// ----------------------------------------------------------
+	// getConnectedContext (SqliteStore-only; JSONL throws)
+	// ----------------------------------------------------------
+	describe('getConnectedContext', () => {
+		it('reaches an indirect node and reports hop distance + path', async function() {
+			if (ext === 'jsonl') return;
+			// Joanna in miniature: A —WORKS_FOR→ B —UNDER_SANCTION→ C. From A, C is 2 hops out —
+			// exactly the indirect disqualifier that recency/semantic search would miss.
+			await store.createEntities([
+				{ name: 'A', entityType: 'person', observations: [] },
+				{ name: 'B', entityType: 'company', observations: [] },
+				{ name: 'C', entityType: 'sanction', observations: [] },
+			]);
+			await store.createRelations([
+				{ from: 'A', to: 'B', relationType: 'WORKS_FOR' },
+				{ from: 'B', to: 'C', relationType: 'UNDER_SANCTION' },
+			]);
+			const result = await store.getConnectedContext('A', { maxHops: 2 });
+			const names = result.nodes.map(n => n.name);
+			expect(names).toContain('B');
+			expect(names).toContain('C');
+			const c = result.nodes.find(n => n.name === 'C');
+			expect(c?.hopDistance).toBe(2);
+			expect(c?.path).toEqual(['A', 'B', 'C']);
+			expect(result.relations.some(r => r.from === 'B' && r.to === 'C')).toBe(true);
+			expect(result.truncated).toBe(false);
+		});
+
+		it('bounds the walk by maxHops', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'A', entityType: 't', observations: [] },
+				{ name: 'B', entityType: 't', observations: [] },
+				{ name: 'C', entityType: 't', observations: [] },
+			]);
+			await store.createRelations([
+				{ from: 'A', to: 'B', relationType: 'r' },
+				{ from: 'B', to: 'C', relationType: 'r' },
+			]);
+			const result = await store.getConnectedContext('A', { maxHops: 1 });
+			const names = result.nodes.map(n => n.name);
+			expect(names).toContain('B');
+			expect(names).not.toContain('C'); // C is 2 hops; beyond maxHops 1
+		});
+
+		it('terminates on cycles, visiting each reachable node once', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'A', entityType: 't', observations: [] },
+				{ name: 'B', entityType: 't', observations: [] },
+				{ name: 'C', entityType: 't', observations: [] },
+			]);
+			await store.createRelations([
+				{ from: 'A', to: 'B', relationType: 'r' },
+				{ from: 'B', to: 'C', relationType: 'r' },
+				{ from: 'C', to: 'A', relationType: 'r' }, // cycle back to the seed
+			]);
+			const result = await store.getConnectedContext('A', { maxHops: 10 });
+			const names = result.nodes.map(n => n.name).sort();
+			expect(names).toEqual(['B', 'C']); // seed A excluded; each reachable node once, no infinite loop
+		});
+
+		it('respects direction (out vs both)', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'A', entityType: 't', observations: [] },
+				{ name: 'B', entityType: 't', observations: [] },
+			]);
+			// Edge points B -> A. From A: 'out' finds nothing; 'both' finds B via the inbound edge.
+			await store.createRelations([{ from: 'B', to: 'A', relationType: 'r' }]);
+			const outResult = await store.getConnectedContext('A', { maxHops: 2, direction: 'out' });
+			expect(outResult.nodes.map(n => n.name)).not.toContain('B');
+			const bothResult = await store.getConnectedContext('A', { maxHops: 2, direction: 'both' });
+			expect(bothResult.nodes.map(n => n.name)).toContain('B');
+		});
+
+		it('filters the walk by relationTypes (case-insensitive)', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'A', entityType: 't', observations: [] },
+				{ name: 'B', entityType: 't', observations: [] },
+				{ name: 'C', entityType: 't', observations: [] },
+			]);
+			await store.createRelations([
+				{ from: 'A', to: 'B', relationType: 'knows' },
+				{ from: 'A', to: 'C', relationType: 'works_for' }, // lowercase on purpose
+			]);
+			// Filter to WORKS_FOR (uppercase) — must still match the lowercase-stored edge.
+			const result = await store.getConnectedContext('A', { maxHops: 1, relationTypes: ['WORKS_FOR'] });
+			const names = result.nodes.map(n => n.name);
+			expect(names).toContain('C');
+			expect(names).not.toContain('B');
+		});
+
+		it('honors asOf (point-in-time traversal)', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'A', entityType: 't', observations: [] },
+				{ name: 'B', entityType: 't', observations: [] },
+			]);
+			await store.createRelations([{ from: 'A', to: 'B', relationType: 'r' }]);
+			// Capture a moment when the edge is active, then invalidate it (a few ms later so
+			// the invalidation timestamp is strictly after the captured moment).
+			const whileActive = new Date().toISOString();
+			await new Promise(res => setTimeout(res, 5));
+			await store.invalidateRelations([{ from: 'A', to: 'B', relationType: 'r' }]);
+			// Current state: edge is inactive -> B not reached.
+			const current = await store.getConnectedContext('A', { maxHops: 1 });
+			expect(current.nodes.map(n => n.name)).not.toContain('B');
+			// As of when the edge was active -> B reached.
+			const past = await store.getConnectedContext('A', { maxHops: 1, asOf: whileActive });
+			expect(past.nodes.map(n => n.name)).toContain('B');
+		});
+
+		it('reports a directed cycle in the connected subgraph', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'A', entityType: 't', observations: [] },
+				{ name: 'B', entityType: 't', observations: [] },
+				{ name: 'C', entityType: 't', observations: [] },
+			]);
+			await store.createRelations([
+				{ from: 'A', to: 'B', relationType: 'r' },
+				{ from: 'B', to: 'C', relationType: 'r' },
+				{ from: 'C', to: 'A', relationType: 'r' }, // closes a directed cycle A->B->C->A
+			]);
+			const result = await store.getConnectedContext('A', { maxHops: 5, direction: 'out' });
+			expect(result.cycles.length).toBeGreaterThanOrEqual(1);
+			const cycleNodes = new Set(result.cycles.flat());
+			expect(cycleNodes.has('A') && cycleNodes.has('B') && cycleNodes.has('C')).toBe(true);
+		});
+
+		it('reports no cycles for an acyclic subgraph', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'A', entityType: 't', observations: [] },
+				{ name: 'B', entityType: 't', observations: [] },
+				{ name: 'C', entityType: 't', observations: [] },
+			]);
+			await store.createRelations([
+				{ from: 'A', to: 'B', relationType: 'r' },
+				{ from: 'B', to: 'C', relationType: 'r' },
+			]);
+			const result = await store.getConnectedContext('A', { maxHops: 5, direction: 'out' });
+			expect(result.cycles).toEqual([]);
+		});
+
+		it('reports distinct cycles whose node names would collide under naive concatenation', async function() {
+			if (ext === 'jsonl') return;
+			// Two genuinely distinct directed cycles whose sorted node-name sets concatenate to the
+			// SAME string: {'ab','c'} and {'a','bc'} both -> 'abc'. A delimiter-free dedup key would
+			// collapse them and silently drop one. Both must be reported.
+			await store.createEntities([
+				{ name: 'S', entityType: 't', observations: [] },
+				{ name: 'ab', entityType: 't', observations: [] },
+				{ name: 'c', entityType: 't', observations: [] },
+				{ name: 'a', entityType: 't', observations: [] },
+				{ name: 'bc', entityType: 't', observations: [] },
+			]);
+			await store.createRelations([
+				{ from: 'S', to: 'ab', relationType: 'r' },
+				{ from: 'ab', to: 'c', relationType: 'r' },
+				{ from: 'c', to: 'ab', relationType: 'r' },   // cycle 1: {ab, c}
+				{ from: 'S', to: 'a', relationType: 'r' },
+				{ from: 'a', to: 'bc', relationType: 'r' },
+				{ from: 'bc', to: 'a', relationType: 'r' },    // cycle 2: {a, bc}
+			]);
+			const result = await store.getConnectedContext('S', { maxHops: 4, direction: 'out' });
+			expect(result.cycles.length).toBe(2);
+		});
+
+		it('scopes reached nodes to projectId + global', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([{ name: 'Hub', entityType: 't', observations: [] }], undefined); // global
+			await store.createEntities([{ name: 'AlphaNode', entityType: 't', observations: [] }], 'alpha');
+			await store.createEntities([{ name: 'BetaNode', entityType: 't', observations: [] }], 'beta');
+			await store.createRelations([
+				{ from: 'Hub', to: 'AlphaNode', relationType: 'r' },
+				{ from: 'Hub', to: 'BetaNode', relationType: 'r' },
+			]);
+			const result = await store.getConnectedContext('Hub', { maxHops: 1, projectId: 'alpha' });
+			const names = result.nodes.map(n => n.name);
+			expect(names).toContain('AlphaNode');     // alpha is in scope
+			expect(names).not.toContain('BetaNode');  // beta is out of scope
+		});
+
+		it('caps results at maxNodes and sets truncated', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([
+				{ name: 'Hub', entityType: 't', observations: [] },
+				{ name: 'N1', entityType: 't', observations: [] },
+				{ name: 'N2', entityType: 't', observations: [] },
+				{ name: 'N3', entityType: 't', observations: [] },
+				{ name: 'N4', entityType: 't', observations: [] },
+				{ name: 'N5', entityType: 't', observations: [] },
+			]);
+			await store.createRelations([
+				{ from: 'Hub', to: 'N1', relationType: 'r' },
+				{ from: 'Hub', to: 'N2', relationType: 'r' },
+				{ from: 'Hub', to: 'N3', relationType: 'r' },
+				{ from: 'Hub', to: 'N4', relationType: 'r' },
+				{ from: 'Hub', to: 'N5', relationType: 'r' },
+			]);
+			const result = await store.getConnectedContext('Hub', { maxHops: 1, maxNodes: 3 });
+			expect(result.nodes).toHaveLength(3);
+			expect(result.truncated).toBe(true);
+		});
+
+		it('resolves an out-of-project seed canonically and keeps its edges into the scoped project', async function() {
+			if (ext === 'jsonl') return;
+			// The SEED is the anchor the caller named, NOT a "reached node" — project scoping applies to
+			// the neighborhood, not the seed itself. Regression guard for a silent edge-drop: an
+			// out-of-project seed addressed by a SURFACE VARIANT ('seed node' for stored 'Seed Node')
+			// must still (a) report its canonical display name in `seed` and (b) keep the seed->in-scope
+			// edge in `relations`. The bug (caught in review): hydrating the seed THROUGH the project
+			// filter left it unresolved when out-of-project, so `seed` echoed the raw variant and the
+			// display-name inSet filter silently dropped every seed-incident edge.
+			await store.createEntities([{ name: 'Seed Node', entityType: 't', observations: [] }], 'beta');
+			await store.createEntities([{ name: 'TargetNode', entityType: 't', observations: [] }], 'alpha');
+			await store.createRelations([{ from: 'Seed Node', to: 'TargetNode', relationType: 'r' }]);
+			// Address the seed by a surface variant AND scope to alpha (the seed's own project is beta).
+			const result = await store.getConnectedContext('seed node', { maxHops: 1, projectId: 'alpha' });
+			expect(result.seed).toBe('Seed Node'); // canonical display name, not the raw 'seed node'
+			expect(result.nodes.map(n => n.name)).toContain('TargetNode'); // in-scope neighbor still reached
+			expect(result.relations.some(r => r.from === 'Seed Node' && r.to === 'TargetNode')).toBe(true); // edge survives
+		});
+
+		it('applies maxNodes to in-scope nodes only (out-of-project nodes never consume cap slots)', async function() {
+			if (ext === 'jsonl') return;
+			// FINDING-B regression guard: the cap runs AFTER project filtering, so `truncated` reflects
+			// ONLY in-scope nodes. A cap-before-scope regression would report truncated=true with nothing
+			// in-scope dropped, or drop in-scope nodes that should have fit — silent Goal-A drift.
+			await store.createEntities([{ name: 'Hub', entityType: 't', observations: [] }], undefined); // global
+			for (const n of ['A1', 'A2', 'A3', 'A4']) await store.createEntities([{ name: n, entityType: 't', observations: [] }], 'alpha');
+			for (const n of ['B1', 'B2', 'B3', 'B4']) await store.createEntities([{ name: n, entityType: 't', observations: [] }], 'beta');
+			await store.createRelations(
+				['A1', 'A2', 'A3', 'A4', 'B1', 'B2', 'B3', 'B4'].map(to => ({ from: 'Hub', to, relationType: 'r' })),
+			);
+			// 4 in-scope (alpha) reachable, cap 3 -> truncated true, every returned node is alpha.
+			const clipped = await store.getConnectedContext('Hub', { maxHops: 1, projectId: 'alpha', maxNodes: 3 });
+			expect(clipped.nodes).toHaveLength(3);
+			expect(clipped.nodes.every(n => n.name.startsWith('A'))).toBe(true); // no beta leaked into the cap
+			expect(clipped.truncated).toBe(true); // 4 in-scope > cap 3
+		});
+
+		it('does not trip truncated when only out-of-project nodes exceed the cap', async function() {
+			if (ext === 'jsonl') return;
+			await store.createEntities([{ name: 'Hub', entityType: 't', observations: [] }], undefined);
+			for (const n of ['A1', 'A2', 'A3']) await store.createEntities([{ name: n, entityType: 't', observations: [] }], 'alpha');
+			for (let i = 1; i <= 10; i++) await store.createEntities([{ name: `B${i}`, entityType: 't', observations: [] }], 'beta');
+			await store.createRelations(
+				['A1', 'A2', 'A3', ...Array.from({ length: 10 }, (_, i) => `B${i + 1}`)].map(to => ({ from: 'Hub', to, relationType: 'r' })),
+			);
+			// Exactly 3 in-scope (alpha) + 10 out-of-scope (beta), cap 3 -> all 3 alpha returned, NOT truncated.
+			const result = await store.getConnectedContext('Hub', { maxHops: 1, projectId: 'alpha', maxNodes: 3 });
+			expect(result.nodes).toHaveLength(3);
+			expect(result.truncated).toBe(false); // the 10 beta nodes neither fill cap slots nor trip truncated
+		});
+
+		it('traverses through an out-of-project intermediate, rendering it by normalized name in path', async function() {
+			if (ext === 'jsonl') return;
+			// Advisory scoping (CLAUDE.md: project filtering is advisory, not a security boundary): the
+			// walk still traverses foreign nodes structurally, so an in-scope node reachable ONLY via a
+			// foreign intermediate IS returned. The intermediate is excluded from `nodes` but appears in
+			// the target's `path` by its NORMALIZED identity key (it never hydrated to a display name).
+			// Pins that documented contract so a regression (whole-path exclusion, crash on the missing
+			// dispMap entry, or a display-name leak) fails loud instead of silently changing behavior.
+			await store.createEntities([{ name: 'AlphaSeed', entityType: 't', observations: [] }], 'alpha');
+			await store.createEntities([{ name: 'Mid', entityType: 't', observations: [] }], 'beta');
+			await store.createEntities([{ name: 'Target', entityType: 't', observations: [] }], 'alpha');
+			await store.createRelations([
+				{ from: 'AlphaSeed', to: 'Mid', relationType: 'r' },
+				{ from: 'Mid', to: 'Target', relationType: 'r' },
+			]);
+			const result = await store.getConnectedContext('AlphaSeed', { maxHops: 2, projectId: 'alpha' });
+			const names = result.nodes.map(n => n.name);
+			expect(names).toContain('Target');  // reachable via the foreign hop
+			expect(names).not.toContain('Mid'); // foreign intermediate excluded from nodes
+			const target = result.nodes.find(n => n.name === 'Target')!;
+			expect(target.hopDistance).toBe(2);
+			// path[0] = seed display, path[1] = foreign intermediate as normalized key 'mid', path[2] = target.
+			expect(target.path).toEqual(['AlphaSeed', 'mid', 'Target']);
+		});
+
+		it('throws on the JSONL backend (SQLite-only feature)', async function() {
+			if (ext !== 'jsonl') return;
+			await expect(store.getConnectedContext('A')).rejects.toThrow(/not supported|JSONL/i);
+		});
+	});
+
+	// ----------------------------------------------------------
+	// findPrecedents — degraded path (Pool 1 has MEMORY_VECTOR_SEARCH=off, no model).
+	// The real similarity-ranking behavior is exercised in vector-integration.test.ts (Pool 2).
+	// ----------------------------------------------------------
+	describe('findPrecedents (degraded path)', () => {
+		it('returns empty + flags when vector search is unavailable, without throwing or recency-falling-back', async () => {
+			await store.createEntities([
+				{ name: 'DbDecision', entityType: 'decision', observations: ['chose SQLite over Postgres for the local single-user store'] },
+				{ name: 'Other', entityType: 'decision', observations: ['adopted tabs for indentation'] },
+			]);
+			// With vectors off there is NO similarity ranking available. The contract is: return
+			// empty with flags (so the caller knows WHY it's empty) — never silently fall back to
+			// recency-ordered LIKE results mislabeled as precedents.
+			const result = await store.findPrecedents('which database did we choose', undefined, { limit: 5 });
+			expect(result.precedents).toEqual([]);
+			expect(result.vectorSearchEnabled).toBe(false);
+			expect(typeof result.modelReady).toBe('boolean');
+		});
+	});
+
+	// ----------------------------------------------------------
 	// addObservations
 	// ----------------------------------------------------------
 	describe('addObservations', () => {

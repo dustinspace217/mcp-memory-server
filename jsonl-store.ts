@@ -32,6 +32,10 @@ import {
   type SummaryObservation,
   type SummaryEntity,
   type EntityTimelineResult,
+  type ConnectedContextOptions,
+  type ConnectedContextResult,
+  type FindPrecedentsResult,
+  type FindPrecedentsOptions,
   InvalidCursorError,
 } from './types.js';
 import {
@@ -546,6 +550,22 @@ export class JsonlStore implements GraphStore {
    */
   async entityTimeline(_entityName: string, _projectId?: string): Promise<EntityTimelineResult | null> {
     throw new Error('entity_timeline not supported in JSONL backend: migrate to SQLite');
+  }
+
+  /**
+   * Graph traversal is not supported in the JSONL backend (no indexed relational walk).
+   */
+  async getConnectedContext(_seedEntity: string, _opts?: ConnectedContextOptions): Promise<ConnectedContextResult> {
+    throw new Error('get_connected_context not supported in JSONL backend: migrate to SQLite');
+  }
+
+  /**
+   * Precedent retrieval needs vector similarity, which the JSONL backend has no support for.
+   * Returns the disabled-flags shape (not a throw) so callers degrade gracefully — matching
+   * checkDuplicates' JSONL behavior (modelReady: false).
+   */
+  async findPrecedents(_query: string, _projectId?: string, _opts?: FindPrecedentsOptions): Promise<FindPrecedentsResult> {
+    return { precedents: [], modelReady: false, vectorSearchEnabled: false };
   }
 
   /**

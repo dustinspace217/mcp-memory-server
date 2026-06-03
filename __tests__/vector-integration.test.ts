@@ -65,6 +65,81 @@ describe('Vector search integration', () => {
     expect(entityNames).toContain('dog-entity');
   });
 
+  it('find_precedents ranks observations by similarity DESC and honors memoryType + minSimilarity', async () => {
+    await store.createEntities([
+      { name: 'db-decision', entityType: 'decision', observations: ['We chose SQLite over Postgres because the store is single-user and local'] },
+      { name: 'lang-decision', entityType: 'decision', observations: ['We picked TypeScript with ES modules for the server'] },
+      { name: 'weather-note', entityType: 'note', observations: ['The weather in Seattle is rainy in winter'] },
+    ], undefined);
+    // Set memory types in-place (no content change, so embeddings are unaffected).
+    await store.setObservationMetadata([
+      { entityName: 'db-decision', content: 'We chose SQLite over Postgres because the store is single-user and local', memoryType: 'decision' },
+      { entityName: 'lang-decision', content: 'We picked TypeScript with ES modules for the server', memoryType: 'decision' },
+      { entityName: 'weather-note', content: 'The weather in Seattle is rainy in winter', memoryType: 'fact' },
+    ]);
+    // Let the background embedding sweep generate vectors for the new observations.
+    await new Promise(resolve => setTimeout(resolve, 2500));
+
+    const result = await store.findPrecedents('which database engine did we select for storage', undefined, { limit: 5, minSimilarity: 0.2 });
+    expect(result.vectorSearchEnabled).toBe(true);
+    expect(result.modelReady).toBe(true);
+    expect(result.precedents.length).toBeGreaterThan(0);
+    // Ranked similarity DESC.
+    for (let i = 1; i < result.precedents.length; i++) {
+      expect(result.precedents[i - 1].similarity).toBeGreaterThanOrEqual(result.precedents[i].similarity);
+    }
+    // Scores are valid cosine values in [0, 1].
+    for (const p of result.precedents) {
+      expect(p.similarity).toBeGreaterThanOrEqual(0);
+      expect(p.similarity).toBeLessThanOrEqual(1);
+    }
+    // The database decision is the most semantically similar to a database-engine query.
+    expect(result.precedents[0].content).toMatch(/SQLite/);
+
+    // memoryType filter: restricting to 'fact' must exclude the 'decision' observations.
+    const factsOnly = await store.findPrecedents('which database engine did we select', undefined, { memoryType: 'fact', minSimilarity: 0 });
+    expect(factsOnly.precedents.every(p => p.memoryType === 'fact')).toBe(true);
+    expect(factsOnly.precedents.some(p => /SQLite/.test(p.content))).toBe(false);
+
+    // minSimilarity floor: an unreachably high floor returns nothing (no silent fallback).
+    const highFloor = await store.findPrecedents('which database engine did we select', undefined, { minSimilarity: 0.999 });
+    expect(highFloor.precedents).toEqual([]);
+  });
+
+  it('find_precedents scopes to projectId + global (project=alpha sees alpha + global, not beta)', async () => {
+    // The projectId branch in findPrecedents (`e.project = ? OR e.project IS NULL`) is the one
+    // place that decides project-scoped recall still includes GLOBAL precedents while excluding
+    // OTHER projects. It lives in the Pool-2 vector path, so only a real-model test reaches it.
+    // Three near-identical observations on the same topic (so all rank similarly under KNN),
+    // one per scope: alpha, beta, global. A query scoped to 'alpha' must surface alpha + global
+    // and must NOT surface beta. Locks both halves of the OR plus cross-project exclusion.
+    await store.createEntities(
+      [{ name: 'cache-alpha', entityType: 'decision', observations: ['For project alpha we adopted an LRU cache to bound memory usage'] }],
+      'alpha',
+    );
+    await store.createEntities(
+      [{ name: 'cache-beta', entityType: 'decision', observations: ['For project beta we adopted an LRU cache to bound memory usage'] }],
+      'beta',
+    );
+    await store.createEntities(
+      [{ name: 'cache-global', entityType: 'decision', observations: ['Globally we standardized on an LRU cache to bound memory usage'] }],
+      undefined, // global (project = NULL)
+    );
+    // Let the background embedding sweep vectorize the three new observations.
+    await new Promise(resolve => setTimeout(resolve, 2500));
+
+    // minSimilarity 0 + generous limit so scoping — not the floor or the cap — is what filters.
+    const scoped = await store.findPrecedents(
+      'what caching approach did we choose to limit memory use',
+      'alpha',
+      { minSimilarity: 0, limit: 50 },
+    );
+    const names = scoped.precedents.map(p => p.entityName);
+    expect(names).toContain('cache-alpha');   // in-project: present
+    expect(names).toContain('cache-global');  // global: still present (the OR ... IS NULL half)
+    expect(names).not.toContain('cache-beta'); // other project: excluded
+  });
+
   it('should deduplicate LIKE + vector results', async () => {
     await store.createEntities([
       { name: 'dedup-test', entityType: 'test', observations: ['This is a deduplication test observation'] },

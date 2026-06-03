@@ -25,6 +25,15 @@ describe('normalizeEntityName', () => {
       expect(normalizeEntityName('phase-b-task-3')).toBe('phasebtask3');
     });
 
+    it('strips C0 control characters (incl. char(31), the traversal path delimiter)', () => {
+      // char(31) is the getConnectedContext path/cycle-guard delimiter; a stored normalized_name
+      // must never contain it (or the guard misbehaves). \\s does NOT cover the C0 range, so the
+      // normalizer strips \\u0000-\\u001f explicitly.
+      expect(normalizeEntityName('A\x1FB')).toBe('ab');
+      expect(normalizeEntityName('x\x00y')).toBe('xy');
+      expect(() => normalizeEntityName('\x1F\x01')).toThrow();
+    });
+
     it('strips underscores', () => {
       expect(normalizeEntityName('dustin_space')).toBe('dustinspace');
       expect(normalizeEntityName('snake_case_name')).toBe('snakecasename');

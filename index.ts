@@ -12,6 +12,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import type { GraphStore } from './types.js';
 import { JsonlStore, migrateJsonToJsonl } from './jsonl-store.js';
+import { RELATION_TYPE_GUIDANCE } from './relation-types.js';
 import { SqliteStore } from './sqlite-store.js';
 import { normalizeEntityName } from './normalize-name.js';
 
@@ -163,6 +164,27 @@ const RelationOutputSchema = RelationBaseSchema.extend({
   supersededAt: z.string().describe("'' = active, ISO timestamp = invalidated"),
 });
 
+// A node reached by get_connected_context. Structure only — no observation content
+// (call open_nodes for the full content of a node that matters).
+const ConnectedNodeOutputSchema = z.object({
+  name: z.string().describe("Canonical display name of the reached entity"),
+  entityType: z.string().describe("The entity's type"),
+  hopDistance: z.number().describe("Shortest number of edges from the seed (>= 1)"),
+  path: z.array(z.string()).describe("Shortest path of display names from the seed to this node (both ends inclusive)"),
+});
+
+// A precedent returned by find_precedents: an observation ranked by similarity to the query.
+const PrecedentMatchOutputSchema = z.object({
+  entityName: z.string(),
+  observationId: z.string(),
+  content: z.string(),
+  similarity: z.number().describe("Cosine similarity to the query, 0..1"),
+  importance: z.number(),
+  memoryType: z.string().nullable(),
+  contextLayer: z.string().nullable(),
+  createdAt: z.string(),
+});
+
 // Optional project scope for filtering tools. Omit to operate globally.
 // .trim() strips whitespace BEFORE .min(1) checks length, so whitespace-only
 // inputs like " " or "\t" are rejected instead of silently becoming global scope.
@@ -254,7 +276,7 @@ server.registerTool(
   "create_relations",
   {
     title: "Create Relations",
-    description: "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice",
+    description: "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice. " + RELATION_TYPE_GUIDANCE,
     inputSchema: { relations: z.array(RelationInputSchema).max(100) },
     outputSchema: { relations: z.array(RelationOutputSchema) }
   },
@@ -469,6 +491,71 @@ server.registerTool(
     return {
       content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
       structuredContent: { ...graph }
+    };
+  }
+);
+
+server.registerTool(
+  "get_connected_context",
+  {
+    title: "Get Connected Context",
+    description:
+      "Walk the relation graph outward from an entity (up to maxHops) and return its structurally-connected neighborhood: lightweight nodes (name, type, hop distance, shortest path) plus the edges among them. Surfaces INDIRECT facts that search/recall miss because they aren't textually similar to your query — e.g. a sanction two hops from a loan applicant. Use it before deciding anything about an entity. Returns structure only (no observation content) — call open_nodes for the full content of a node that matters. Also reports any directed cycles among the returned edges, to catch circular logic mechanically. Complements find_precedents (similar facts) and open_nodes (direct neighbors only).",
+    inputSchema: {
+      seedEntity: z.string().min(1).max(500).describe("Entity to traverse from (any surface form)"),
+      maxHops: z.number().int().min(1).max(6).optional().default(3)
+        .describe("How many edges deep to walk (default 3, max 6). 2 reaches an indirect disqualifier; raise toward 6 to trace a long root-cause chain."),
+      direction: z.enum(['out', 'in', 'both']).optional().default('both')
+        .describe("Edge directions to follow: out (from->to), in (to->from), or both (default)."),
+      maxNodes: z.number().int().min(1).max(200).optional().default(50)
+        .describe("Cap on returned nodes; sets truncated=true if more were reachable."),
+      relationTypes: z.array(z.string().min(1).max(500)).max(50).optional()
+        .describe("Restrict the walk to these relation types (case-insensitive). Omit to follow all edges; pass e.g. ['CAUSED_BY'] to trace causal chains only."),
+      projectId: ProjectIdSchema,
+      asOf: z.string().datetime({ offset: false }).optional()
+        .describe("ISO 8601 UTC timestamp (Z suffix only — no offsets). Walk the graph as it was at this moment. Omit for current state."),
+    },
+    outputSchema: {
+      seed: z.string(),
+      nodes: z.array(ConnectedNodeOutputSchema),
+      relations: z.array(RelationOutputSchema),
+      cycles: z.array(z.array(z.string())).describe("Directed cycles among the returned edges (each: nodes round the loop, entry repeated to close). Empty = acyclic. Use to catch circular logic."),
+      truncated: z.boolean(),
+    },
+  },
+  async ({ seedEntity, maxHops, direction, maxNodes, relationTypes, projectId, asOf }) => {
+    const result = await store.getConnectedContext(seedEntity, { maxHops, direction, maxNodes, relationTypes, projectId: normalizeProjectId(projectId), asOf });
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      structuredContent: { ...result }
+    };
+  }
+);
+
+server.registerTool(
+  "find_precedents",
+  {
+    title: "Find Precedents",
+    description:
+      "Retrieve past observations RANKED by semantic similarity (cosine) to `query` — the most similar PRIOR decisions/situations to a current one. Unlike search_nodes (recency-ordered recall) and get_connected_context (structural neighbors), this ranks by MEANING and returns a score per result. Pass memoryType:'decision' for decision precedents. If vectorSearchEnabled is false the model/vectors are unavailable — fall back to search_nodes for recall.",
+    inputSchema: {
+      query: z.string().min(1).max(5000).describe("Situation/scenario text to find precedents for"),
+      projectId: ProjectIdSchema,
+      memoryType: z.string().min(1).max(50).optional().describe("Optional filter; recommend 'decision' for precedent recall. Omit for all types."),
+      limit: z.number().int().min(1).max(50).optional().default(5).describe("Max precedents to return (default 5)"),
+      minSimilarity: z.number().min(0).max(1).optional().default(0.25).describe("Cosine floor; lower than dedup thresholds because precedents are related, not duplicates"),
+    },
+    outputSchema: {
+      precedents: z.array(PrecedentMatchOutputSchema),
+      modelReady: z.boolean(),
+      vectorSearchEnabled: z.boolean(),
+    },
+  },
+  async ({ query, projectId, memoryType, limit, minSimilarity }) => {
+    const result = await store.findPrecedents(query, normalizeProjectId(projectId), { memoryType, limit, minSimilarity });
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      structuredContent: { ...result }
     };
   }
 );

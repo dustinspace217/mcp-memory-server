@@ -107,6 +107,63 @@ export interface KnowledgeGraph {
   relations: Relation[];
 }
 
+/** A node reached during graph traversal. Lightweight STRUCTURE only — no observations.
+ *  Fetch full content for the nodes that matter via openNodes; keeping the traversal
+ *  result structure-only is what lets it go deep/broad without blowing the context budget. */
+export interface ConnectedNode {
+  name: string;          // canonical display name
+  entityType: string;
+  hopDistance: number;   // shortest number of edges from the seed (>= 1)
+  path: string[];        // shortest path of display names from the seed to this node (both ends inclusive)
+}
+
+/** Options for getConnectedContext traversal. All optional; defaults applied in the store. */
+export interface ConnectedContextOptions {
+  maxHops?: number;                    // edges to walk outward (default 3)
+  direction?: 'out' | 'in' | 'both';   // which edge directions to follow (default 'both')
+  relationTypes?: string[];            // restrict the walk to these relation types (default: all)
+  projectId?: string;                  // scope reached nodes to this project + global (default: all)
+  asOf?: string;                       // point-in-time: walk the graph as it was at this ISO 8601 UTC timestamp
+  maxNodes?: number;                   // cap on returned nodes (default 50); sets truncated=true when exceeded
+}
+
+/** Result of getConnectedContext: the structurally-connected neighborhood of a seed entity. */
+export interface ConnectedContextResult {
+  seed: string;             // the seed's display name (or the raw input if it matched no entity)
+  nodes: ConnectedNode[];   // reached nodes (excludes the seed itself), nearest-hop first
+  relations: Relation[];    // active edges among the seed + reached nodes
+  cycles: string[][];       // directed cycles detected among the returned edges (each = display
+                            //   names round the loop, entry node repeated to close); [] = acyclic.
+                            //   Flags circular logic mechanically rather than leaving it to be spotted.
+  truncated: boolean;       // true if more nodes were reachable than the maxNodes cap returned
+}
+
+/** A precedent returned by findPrecedents: an observation ranked by semantic similarity to a query. */
+export interface PrecedentMatch {
+  entityName: string;          // the entity the observation belongs to (display name)
+  observationId: string;       // the observation's row id (stringified)
+  content: string;
+  similarity: number;          // cosine similarity to the query, 0..1
+  importance: number;
+  memoryType: string | null;
+  contextLayer: string | null; // L0 / L1 / null (on-demand) — raw value, no L2-render coupling
+  createdAt: string;
+}
+
+/** Options for findPrecedents. */
+export interface FindPrecedentsOptions {
+  memoryType?: string;     // restrict to observations of this memory_type (e.g. 'decision')
+  limit?: number;          // max precedents to return (default 5)
+  minSimilarity?: number;  // cosine floor (default 0.25 — lower than dedup; precedents are related, not duplicate)
+}
+
+/** Result of findPrecedents. The flags tell the caller WHY precedents is empty when it is. */
+export interface FindPrecedentsResult {
+  precedents: PrecedentMatch[];
+  modelReady: boolean;          // embedding model loaded?
+  vectorSearchEnabled: boolean; // vec table present (MEMORY_VECTOR_SEARCH !== 'off')?
+}
+
 /** Pagination parameters for readGraph and searchNodes.
  *  cursor is an opaque base64-encoded string from a previous PaginatedKnowledgeGraph response.
  *  limit controls page size (1-100, default 40 in the implementation). */
@@ -407,6 +464,22 @@ export interface GraphStore {
    *  need full relation context for a known set of entities.
    *  @param asOf - Optional ISO 8601 UTC timestamp for point-in-time queries */
   openNodes(names: string[], projectId?: string, asOf?: string): Promise<Readonly<KnowledgeGraph>>;
+  /** Walks the relation graph outward from a seed entity up to maxHops, returning the
+   *  structurally-connected neighborhood (lightweight nodes + the active edges among them).
+   *  Surfaces INDIRECT facts that semantic/recency search misses because they aren't
+   *  textually similar to the seed (e.g. a sanction two hops from a loan applicant).
+   *  Cycle-safe; nearest hop wins. SQLite only — JSONL backend throws.
+   *  @param seedEntity - entity to traverse from (any surface form)
+   *  @param opts - traversal options (maxHops, direction, relationTypes, projectId, asOf, maxNodes) */
+  getConnectedContext(seedEntity: string, opts?: ConnectedContextOptions): Promise<Readonly<ConnectedContextResult>>;
+  /** Retrieves observations RANKED by semantic (cosine) similarity to `query` — the most similar
+   *  PRIOR decisions/situations, which search_nodes (recency) and get_connected_context (structure)
+   *  can't surface. Degrades to empty + flags when the model/vectors are unavailable; never silently
+   *  recency-falls-back. SQLite only; JSONL returns disabled flags.
+   *  @param query - situation/scenario to find precedents for
+   *  @param projectId - optional scope (project + global); pre-normalized by the caller
+   *  @param opts - memoryType filter, limit (default 5), minSimilarity floor (default 0.25) */
+  findPrecedents(query: string, projectId?: string, opts?: FindPrecedentsOptions): Promise<Readonly<FindPrecedentsResult>>;
   /** Lists all distinct project names that have at least one entity.
    *  Global entities (project === null) are excluded. */
   listProjects(): Promise<string[]>;
