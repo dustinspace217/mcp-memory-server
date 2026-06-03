@@ -2,12 +2,12 @@
 
 *Plan doc for the Memory Usability Overhaul (extends `2026-04-13-memory-usability-overhaul.md`, which ends at Phase 6 / Confidence Decay, TODO). Grounded against live code + DB (schema v10) and verified by four review agents + three CC-internals verification passes — not recall.*
 
-## Status (updated 2026-06-02 — v4 pivot; 7.2 done)
+## Status (updated 2026-06-03 — 7.3 spec rewritten to v4; building the ungated core)
 Phase: **7 of 7** (Experiential Texture Continuity) — implementation in progress.
-**DESIGN PIVOTED v3 → v4 this session** (see `## v4` below): from isolated-*derivation* to in-context-*authoring* + isolated-*audit*, with **capture as the hard core**. The v3 "Architecture" and "7.3" sections are SUPERSEDED (kept for history). New `introspective` memoryType approved (first-person Claude stance; no schema change).
-Done: 7.0 (L0 overflow fix, 5→7); 7.1 write-policy verbatim-anchor rule; **7.2 consolidation-prompt experiential protection** — live `~/.claude/prompts/memory-consolidation.md` patched + mirrored to `harness/prompts/` (pre-7.2 `969a747`, post `d5d0928`; local `.bak` + `memory.db.pre-texture-20260602.bak`). Delete-fix `4e5816a` (soft-delete) shipped first, unblocked 7.2 line 47. **DEF-7-01 RESOLVED.**
-Next: fully rewrite the 7.3 section around capture-as-core (the `## v4` section is the authoritative spec until then); then build. 7.1 L2-legibility render still pending (non-gating).
-Blocked: nothing. **No schema change.** Implementation gates (env-var hook guard + live isolation probe + `claude -p` permission) land at the audit step (7.4).
+**DESIGN PIVOTED v3 → v4** (see `## v4`): from isolated-*derivation* to in-context-*authoring* + isolated-*audit*, with **capture as the hard core**. The v3 "Architecture" and "7.3" sections are SUPERSEDED (kept for history). New `introspective` memoryType approved (first-person Claude stance; no schema change).
+Done: 7.0 (L0 overflow fix, 5→7); 7.1 write-policy verbatim-anchor rule; **7.2 consolidation-prompt experiential protection** (live prompt patched, `d5d0928`; **DEF-7-01 RESOLVED**); **7.3 build spec rewritten to v4 capture-as-core** (2026-06-03 — two layers: append-only raw experiential obs + an in-place-authored thread accumulator; sub-steps 7.3a–7.3e, gates marked).
+Next: build the ungated core in order — **7.3a** `introspective`/`narrative`/`relational` → `KNOWN_TYPES` (small code + TDD) → **7.3b** write-policy doc → **7.3c** `claude-self` entity + first dogfood capture → **7.3d** thread accumulator. Then 7.5 load hook. **7.4 audit is GATED** (env-var hook guard + live isolation probe + `claude -p` permission — need Dustin's OK). 7.1 L2-legibility render still pending (non-gating).
+Blocked: nothing ungated. **No schema change.** The audit step (7.4) gates land when we reach it.
 
 ## v1 → v2 → v3 changelog (the design moved twice; read this)
 - **v1 (pull):** register-triggered on-demand pull. **Wrong frame** (Dustin caught it): on-demand-only loads nothing at session start → no baseline continuity. Continuity needs the thread *present at start* = in the load path = bounded cost.
@@ -72,7 +72,51 @@ Patched `~/.claude/prompts/memory-consolidation.md` (commit `d5d0928`; pre-7.2 b
 - **Scope note:** a 6th edit (clarifying experiential importance 3/3/4 is intentional, not a default to bump) was added beyond the named scope, per the prompt-editing consistency discipline.
 - **harness gap:** `harness/install.sh`/`README.md` don't yet copy a `prompts/` dir, so a fresh bundle install wouldn't place this prompt → DEF-7-10.
 
-### 7.3 — Append-log convention + DERIVED digest — SUPERSEDED by `## v4` (now: capture-as-core, in-context author)
+### 7.3 — Capture-as-core (in-context authoring + the thread) — v4 BUILD SPEC
+*(The v3 "append-log → derived digest" wording is preserved two paragraphs down under "7.3 (v3)" for history. This is the authoritative build spec, derived from `## v4` above.)*
+
+**Two durable layers, both authored by the in-context agent (me):**
+
+1. **Raw layer — append-only experiential observations** (the verbatim record; conflict-free).
+   `introspective` / `narrative` / `relational` / `emotional` obs, each session appending its own,
+   never overwriting another session's. `introspective` (+ the global relational thread) lands on a
+   global `claude-self` entity; project-specific texture lands on that project's entities. This is
+   the source the thread compresses and the audit (7.4) cites against — so it must be verbatim-anchored
+   (7.1 rule). Concurrency-safe by construction (append-only; no shared mutable row).
+
+2. **Thread layer — one evolving accumulator, authored in place** (the "where we left off" record).
+   Authored as `prior thread + this session → updated thread` (accumulate, do NOT re-derive by reading
+   the whole raw log — that's the circularity Dustin caught). Contents: per-project work-state + recent
+   arc + unresolved threads + a thin, slow-changing global relational thread + named deepen-anchors
+   (pointers into the raw layer for directed expansion). Size-capped; the older arc self-compresses
+   (the Phase-6 decay analog). Loaded by the dedicated 7.5 hook (NOT the L0/L1 path), so it is free of
+   the L0-contention and project-only-L1 constraints.
+
+   **Thread storage (decision):** store each project's thread as a single superseded-in-place observation
+   on a per-project `continuity-thread` entity, and the thin global relational thread as a superseded-in-place
+   observation on `claude-self`. Supersede (not append) for the thread itself so there is exactly one
+   current "where we left off" per scope; `entity_timeline` preserves prior threads for the evolving-self
+   walk. **Concurrency:** per-project scoping means parallel instances on different projects never contend;
+   same-project parallel sessions are rare and shown honestly (the thread notes "parallel session active"
+   rather than faking a single tape). The thin global thread changes slowly (relational state), so
+   last-writer-wins is acceptable and `entity_timeline` recovers any clobbered version. (This is the
+   v2 single-mutable-digest risk, but bounded: per-project sharding removes the common-case contention,
+   and the raw append-only layer — never the thread — is the lossless record.)
+
+**Capture practice (the hard core — behavioral + convention, ungated):**
+- **Compress-as-you-go.** At each capture point — Stop-hook checkpoint (~every 10 turns), pre-compaction, session-end — fold the recent slice into the raw layer + update the thread. The full transcript is never held at once, so the size wall never appears.
+- **Watermark.** Track the last-captured point (e.g. a `lastCapturedAt` marker on `claude-self`) so a capture knows which slice is new and the backstop knows where to resume.
+- **Bounded backstop.** A backstop agent may read ONLY the transcript slice since the watermark (≤ 1 window) to fill gaps the in-context captures missed — never the whole transcript.
+- **`introspective` is scrutinized hardest** by the 7.4 audit and must be the most strictly verbatim-anchored (first-person self-claims are where flattery hides — Dustin's directive).
+
+**Build sub-steps (smallest-first, ungated → gated):**
+- **7.3a — `introspective` type wiring (ungated, small code):** add `introspective` (+ the also-missing `narrative` / `relational`) to `KNOWN_TYPES` (`index.ts`) so the `memoryType` filter recognizes them and stops emitting typo hints. No schema change (no CHECK constraint; this is a read-time filter hint only). TDD + test.
+- **7.3b — write-policy convention (ungated, doc):** document `introspective` in `reference_memory_write_policy.md` (the STORE table + the Experiential Continuity Types section) — what it is, how it differs from `emotional`, the verbatim-anchor requirement, and supersede-on-genuine-change for the evolving-self walk.
+- **7.3c — `claude-self` entity + first capture (ungated, data):** create the global `claude-self` entity; dogfood capture by authoring the first `introspective` observations in-context (this session is the first capture point).
+- **7.3d — thread accumulator + per-project `continuity-thread` entities (ungated, data + convention):** establish the thread record(s) and the accumulate-in-place authoring convention.
+- **7.3e — watermark + bounded backstop (partially gated):** the watermark is ungated convention/data; the backstop agent that reads a transcript slice may need the same `claude -p` permission as 7.4 — defer the agent to the 7.4 gate.
+
+### 7.3 (v3) — Append-log convention + DERIVED digest — SUPERSEDED (kept for history)
 - Formalize that L2 `narrative`/`emotional`/`relational` obs are an **append-only event log** — each session appends its own; never overwrite.
 - **Digest = derived view**, recomputed by a **single-writer** step (the weekly consolidator or a debounced post-session job; single writer → no concurrent-write race) from recent L2 obs. **Per-project work-state threads** + a thin, rarely-changing **global relational thread**. Recent arc verbatim; older arc compresses (a texture-decay analog; composes with Phase 6).
 

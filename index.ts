@@ -192,6 +192,15 @@ const ProjectIdSchema = z.string().trim().min(1).max(500)
   .describe("Project scope for filtering. Omit for global/unscoped.")
   .optional();
 
+// Canonical memory-type vocabulary. `memory_type` is free-form at the schema level (TEXT, no CHECK
+// constraint — any string writes fine), so this list is ONLY a read-time hint: when a memoryType
+// filter returns nothing AND the value isn't in this list, the tool appends a "did you mean one of
+// these?" note to catch typos. Single-sourced here (was duplicated inline in two handlers) so the
+// two hint sites can never drift. `introspective` / `narrative` / `relational` were added 2026-06-03
+// for the experiential-texture continuity work (Phase 7): `introspective` = first-person Claude
+// stance about a conversation; `narrative` / `relational` = experiential register / working dynamic.
+const KNOWN_MEMORY_TYPES = ['decision', 'procedure', 'architecture', 'problem', 'preference', 'status', 'fact', 'emotional', 'introspective', 'narrative', 'relational'];
+
 /**
  * Normalizes a projectId input: trims whitespace, lowercases, and converts
  * empty/undefined to undefined (so the store treats it as global).
@@ -462,10 +471,9 @@ server.registerTool(
     // memoryType silently returns empty and is indistinguishable from "no
     // entities of this type." The hint lists known types so the caller can
     // spot the mismatch.
-    const KNOWN_TYPES = ['decision', 'procedure', 'architecture', 'problem', 'preference', 'status', 'fact', 'emotional'];
     let text = JSON.stringify(result, null, 2);
-    if (memoryType && result.entities.length === 0 && !KNOWN_TYPES.includes(memoryType)) {
-      text += `\n\nNote: no results for memoryType '${memoryType}'. Known types: ${KNOWN_TYPES.join(', ')}.`;
+    if (memoryType && result.entities.length === 0 && !KNOWN_MEMORY_TYPES.includes(memoryType)) {
+      text += `\n\nNote: no results for memoryType '${memoryType}'. Known types: ${KNOWN_MEMORY_TYPES.join(', ')}.`;
     }
     return {
       content: [{ type: "text" as const, text }],
@@ -824,9 +832,8 @@ server.registerTool(
 
     // Hint when memoryType is set but no results found — a typo silently
     // returns empty, which is indistinguishable from "no entities of this type."
-    const KNOWN_TYPES = ['decision', 'procedure', 'architecture', 'problem', 'preference', 'status', 'fact', 'emotional'];
-    if (memoryType && obsCount === 0 && entCount === 0 && !KNOWN_TYPES.includes(memoryType)) {
-      text += `\n\nNote: no results for memoryType '${memoryType}'. Known types: ${KNOWN_TYPES.join(', ')}.`;
+    if (memoryType && obsCount === 0 && entCount === 0 && !KNOWN_MEMORY_TYPES.includes(memoryType)) {
+      text += `\n\nNote: no results for memoryType '${memoryType}'. Known types: ${KNOWN_MEMORY_TYPES.join(', ')}.`;
     }
 
     return {
