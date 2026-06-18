@@ -22,8 +22,10 @@ import io
 import json
 import os
 import sqlite3
+import pathlib
 import subprocess
 import sys
+import time
 import types
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -283,6 +285,26 @@ def test_hook_import_unavailable():
         hook.load_helpers, hook.read_payload = orig_helpers, orig_payload
 
 
+def test_warn_if_slow():
+    print("hook warn_if_slow fires above the threshold, silent below:")
+    orig = hook.HOOK_EXEC_LOG
+    tmp = pathlib.Path("/tmp/claude/test_slowwarn.log")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text("")
+    hook.HOOK_EXEC_LOG = tmp
+    try:
+        hook.warn_if_slow(time.monotonic() - 5.0, "TestSlow")   # 5s elapsed → over 4s threshold
+        hook.warn_if_slow(time.monotonic(), "TestFast")          # ~0s → silent
+        lines = tmp.read_text().splitlines()
+        check("slow run wrote exactly one WARN", len([l for l in lines if "slow SessionStart hook" in l]) == 1)
+        check("the WARN names the slow hook + is health-check-parseable",
+              any("TestSlow" in l and " | WARN:" in l for l in lines))
+        check("fast run wrote nothing", not any("TestFast" in l for l in lines))
+    finally:
+        hook.HOOK_EXEC_LOG = orig
+        tmp.unlink(missing_ok=True)
+
+
 # ── Part 4 — live hook subprocess smoke (read-only) ─────────────────────────────
 
 def _run_hook(chunk, source="startup"):
@@ -322,7 +344,7 @@ if __name__ == "__main__":
               test_format_plan_render, test_decay_date_edges, test_plan_chunks_basic,
               test_plan_chunks_oversized_truncation, test_render_blocks_flags,
               test_hook_overflow_warning, test_hook_empty_view, test_hook_import_unavailable,
-              test_live_hook_smoke):
+              test_warn_if_slow, test_live_hook_smoke):
         t()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
