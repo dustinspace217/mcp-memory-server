@@ -178,8 +178,29 @@ misused at obs level" — true, but the server IS obs-level, so that's a reason 
 artifact; (c) "bge-BASE (untuned) might beat MiniLM at obs retrieval" — possibly, but that abandons the
 concept-alignment entirely and is a different project (noted as optional future work), not this swap.
 
-**Decision.** NO-GO. The live server stays on MiniLM (no regression, no migration, no risk). The viewer
-keeps bge — its win is real, independent, and already confirmed by Dustin's eyes. The offline gate did
-exactly its job: it caught a silent ~89% retrieval regression BEFORE any live change. The 2026-06-19
-spec's off-ramp ("if marginal, STOP — the viewer win is already banked") fires decisively.
+**Decision.** NO-GO on adopting OUR TUNED model. The live server stays on MiniLM (no regression, no
+migration, no risk). The viewer keeps bge — its entity-clustering win is real and independent. The
+offline gate caught a silent retrieval regression BEFORE any live change.
+
+## Phase 2b CONTROL (2026-06-20) — bge-BASE vs MiniLM (corrects the framing above)
+Prompted by Dustin's pushback ("how is a vocabulary matcher better than a concept matcher? shouldn't
+concept-matching win retrieval?"). He was right to push — the "Phase 2" framing of *MiniLM/vocabulary
+beats concept* was WRONG and is corrected here.
+- Ran the CONTROL: untuned **bge-small-en-v1.5** vs MiniLM, same obs-level blind harness. **Crucial fix:**
+  bge retrieval is ASYMMETRIC — the query needs the instruction prefix "Represent this sentence for
+  searching relevant passages: " (passages don't). My first base run OMITTED it and bge-base leaned to a
+  loss; adding it is the fair test.
+- **Result (prefixed, fair): bge-base 8, MiniLM 9, 1 tie — a statistical DEAD HEAT** (1 judge/query, n=18).
+  Contrast: our TUNED bge lost 1–16. So the untuned base model is FINE; only our fine-tune regressed.
+- **Corrected conclusions:**
+  1. MiniLM is NOT a "vocabulary matcher" — it's a strong SEMANTIC model (canine→dog), which is why it
+     ties a strong concept model. The earlier "vocabulary beat concept" framing was wrong (mine).
+  2. Our tuned model failed for a SPECIFIC reason (entity-domain overfitting wrecked per-obs retrieval),
+     NOT because "concept matching loses." Confirmed: bge-base retrieves fine.
+  3. Server stays MiniLM for the HONEST reason: it's already ≈ as good as the best drop-in alternative on
+     this short/dense/jargon corpus. **No free win** in switching — tuned regresses, base ties.
+- Dustin's intuition (a good concept model should be competitive at retrieval) is VINDICATED. The viewer
+  split is unchanged and still right: layout/retrieval → MiniLM (faithful, ≈ best); edge suggester →
+  bge-tuned (entity-relatedness is its trained strength — the concept-over-vocabulary win at the right
+  granularity). Tooling: `concept_embeddings/phase2_base.py`.
 
