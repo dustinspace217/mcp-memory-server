@@ -2,7 +2,7 @@
 
 > Living open-items ledger for the memory system (mcp-memory-server + memory-graph-viz + the
 > ~/.claude hooks). Update this file as items close (check the box, add the resolving date/commit).
-> Last updated **2026-06-19** at the close of the decay + concept-aligned-embeddings marathon
+> Last updated **2026-06-20** (server-adoption gate concluded NO-GO; memory-graph-viz git-inited)
 > (conversation `fbe2a512-8519-41c6-be2d-db52f1a2a7a1`). Narrative/decision context lives in MCP:
 > entities `concept-aligned-embeddings`, `memory-graph-viz-continuity-thread`, `claude-self`.
 
@@ -14,13 +14,19 @@ re-scoped, rig-telemetry unblocked, weekly automation); L0 "22 chunks" diagnosed
 ---
 
 ## Embeddings follow-ons
-- [ ] **Server-side adoption** — switch the live server's similarity substrate from MiniLM to
-  `bge-tuned-obs` (so `search`/`find_precedents`/recall use concept-alignment, not just the viewer).
-  **Deliberate build, not overnight** (touches the live server). Full spec:
-  `docs/superpowers/plans/2026-06-19-embeddings-server-adoption.md`. *Most substantive open item.*
+- [x] **Server-side adoption — RESOLVED NO-GO (2026-06-20).** Phases 0-2 ran (mechanism map, ONNX
+  export + fidelity PASS at cosine 1.0, offline search-quality gate). The gate found our concept-tuned
+  bge **regresses** the server's obs-level `find_precedents` retrieval (blind 54-judge panel: MiniLM
+  16/18 vs bge 1/18). bge wins ENTITY-level clustering (→ the viewer) but loses OBS-level query
+  retrieval (→ the server). **Server stays on MiniLM; viewer keeps bge.** Full evidence + steelman in
+  `docs/superpowers/plans/2026-06-19-embeddings-server-adoption.md` ("Phase 2 RESULTS").
+- [ ] **(Optional, NEW) Retrieval-preserving server embedder** — separate project: test whether a
+  DIFFERENT model (bge-base untuned, or a retrieval-specialized model) beats MiniLM at *obs-level*
+  retrieval. Our concept-tuned bge does not. Only worth it if MiniLM's obs retrieval proves a real
+  bottleneck — no evidence it does yet.
 - [ ] **More/better training data** — judge a sample of *far* pairs as hard negatives (the candidate
-  set is only MiniLM-near pairs). The lever for an even bigger model win; costs another judging
-  workflow. Optional — only if server-search proves it's worth more.
+  set is only MiniLM-near pairs). Was the lever for a bigger *entity*-clustering win; the NO-GO above
+  means it would only help the viewer, not the server. Optional, viewer-only now.
 - [ ] **Viewer refresh** — re-run `concept_embeddings/bge_vectors.py` (venv) + `generate.py` to keep
   the concept-aligned viewer current as memory grows (currently a manual snapshot).
 - [ ] **Model versioning / periodic re-tune** as the judged dataset grows (vec table should record
@@ -49,6 +55,8 @@ re-scoped, rig-telemetry unblocked, weekly automation); L0 "22 chunks" diagnosed
   behavior" experiment (from 2026-06-10). Observational.
 
 ## Version control
-- [ ] **Commit/merge** — the decay branch `episodic-decay-gradient` is pushed but **not merged**; the
-  embeddings code (memory-graph-viz, unversioned) + `scripts/backfill_project.py` (untracked in
-  mcp-memory-server) are **uncommitted**.
+- [x] **memory-graph-viz git-inited (2026-06-20)** — `git init` + initial commit `7586e08` (code only;
+  weights/data/HTML-snapshots gitignored for size + privacy). Phase 1/2 server-adoption tooling
+  committed (`087efe1`, `e33721d`). `scripts/backfill_project.py` committed earlier (`a577a57`).
+- [ ] **Merge the decay branch** — `episodic-decay-gradient` (mcp-memory-server) is pushed but **not
+  merged**. The server-adoption spec/backlog edits this session are also uncommitted on that branch.
