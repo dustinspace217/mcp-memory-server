@@ -37,6 +37,13 @@ describe('SqliteStore vector infrastructure', () => {
 		}
 
 		const envPath = path.join(testDir, `test-vec-off-${Date.now()}.db`);
+		// Save/RESTORE the prior value — `delete` here used to strip the value
+		// vitest.config.ts injected for the whole worker, so the remaining tests
+		// in this file silently built VECTOR-ENABLED stores and kicked off real
+		// model loads even in the model-free Pool 1 run (QA 2026-06-09, m1: the
+		// "Vector search disabled" stderr appeared ×3 when 5 stores were built —
+		// the missing two were this leak).
+		const prevVectorSearch = process.env.MEMORY_VECTOR_SEARCH;
 		process.env.MEMORY_VECTOR_SEARCH = 'off';
 		try {
 			const offStore = new SqliteStore(envPath);
@@ -44,14 +51,23 @@ describe('SqliteStore vector infrastructure', () => {
 			expect(offStore.vectorState.status).toBe('unavailable');
 			await offStore.close();
 		} finally {
-			delete process.env.MEMORY_VECTOR_SEARCH;
+			if (prevVectorSearch === undefined) {
+				delete process.env.MEMORY_VECTOR_SEARCH;
+			} else {
+				process.env.MEMORY_VECTOR_SEARCH = prevVectorSearch;
+			}
 			for (const suffix of ['', '-wal', '-shm']) {
 				try { await fs.unlink(envPath + suffix); } catch { /* ignore */ }
 			}
 		}
 	});
 
-	it('should return LIKE results even when vector search is loading', async () => {
+	// Renamed 2026-06-09: under the safe-by-default config this store runs with
+	// vectors OFF ('unavailable'), not 'loading' — the assertion (LIKE results
+	// regardless of vector state) is unchanged and is the actual contract. A
+	// deterministic true-'loading' test needs a mocked never-resolving
+	// transformers import — tracked in the stabilization pass (DEF-1-08).
+	it('should return LIKE results regardless of vector search state', async () => {
 		await store.createEntities([
 			{ name: 'TestEntity', entityType: 'test', observations: ['hello world'] },
 		]);

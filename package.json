@@ -16,6 +16,7 @@
     "prepare": "npm run build",
     "watch": "tsc --watch",
     "test": "vitest run",
+    "test:vector": "MEMORY_VECTOR_SEARCH=on vitest run __tests__/vector-integration.test.ts",
     "test:watch": "vitest"
   },
   "dependencies": {
