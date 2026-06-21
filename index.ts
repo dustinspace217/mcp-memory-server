@@ -234,7 +234,16 @@ const SkippedEntitySchema = z.object({
 // Plain object (not z.object()) because registerTool's outputSchema expects { [key]: ZodType }.
 const PaginatedOutputSchema = {
   entities: z.array(EntityOutputSchema),
-  relations: z.array(RelationOutputSchema),
+  // Page-local relations: a relation is included ONLY when both of its endpoints are
+  // on the current page. This is a deliberate consequence of keyset pagination — it is
+  // NOT a complete relation set, even after paginating every page (cross-page edges,
+  // e.g. a hub→file `contains` edge whose endpoints land on different pages, drop from
+  // every page). For an entity's full relations use open_nodes; for orphan/connectivity
+  // analysis use get_connected_context or query the store directly. (Surfaced at the
+  // tool boundary 2026-06-08 after a consolidation agent trusted this list for orphan
+  // detection and created 36 false-orphan edges; the limitation was documented in
+  // CLAUDE.md but invisible to callers that don't read it.)
+  relations: z.array(RelationOutputSchema).describe("Page-local: only relations whose BOTH endpoints appear on the current page. NOT a complete relation set even across all pages — use open_nodes (full relations for specific entities) or get_connected_context (connectivity/orphan analysis) instead."),
   nextCursor: z.string().nullable().describe("Cursor for the next page, or null if this is the last page"),
   totalCount: z.number().describe("Total number of matching entities across all pages"),
 };
@@ -430,7 +439,7 @@ server.registerTool(
   "read_graph",
   {
     title: "Read Graph",
-    description: "Read the knowledge graph. Returns entities sorted by most recently updated, paginated. Use the returned nextCursor to fetch subsequent pages. Omit cursor for the first page.",
+    description: "Read the knowledge graph. Returns entities sorted by most recently updated, paginated. Use the returned nextCursor to fetch subsequent pages. Omit cursor for the first page. NOTE: the returned `relations` are PAGE-LOCAL — a relation appears only when both its endpoints are on the current page, so the relation set is incomplete even after paginating all pages. Do NOT use it for orphan/connectivity analysis; use open_nodes for an entity's full relations, or get_connected_context for traversal.",
     inputSchema: {
       projectId: ProjectIdSchema,
       cursor: z.string().max(10000).optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page."),
@@ -454,7 +463,7 @@ server.registerTool(
   "search_nodes",
   {
     title: "Search Nodes",
-    description: "Search for nodes in the knowledge graph. Returns matching entities sorted by most recently updated, paginated. Use the returned nextCursor to fetch subsequent pages. Omit cursor for the first page.",
+    description: "Search for nodes in the knowledge graph. Returns matching entities sorted by most recently updated, paginated. Use the returned nextCursor to fetch subsequent pages. Omit cursor for the first page. NOTE: the returned `relations` are PAGE-LOCAL — a relation appears only when both its endpoints are on the current page, so the relation set is incomplete even across all pages. Use open_nodes for an entity's full relations, or get_connected_context for traversal.",
     inputSchema: {
       query: z.string().min(1).max(5000).describe("The search query to match against entity names, types, and observation content"),
       projectId: ProjectIdSchema,
