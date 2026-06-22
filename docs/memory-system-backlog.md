@@ -59,12 +59,11 @@ re-scoped, rig-telemetry unblocked, weekly automation); L0 "22 chunks" diagnosed
 - [ ] **Digest MVP behavior check** — the ~2-week "does the auto-loaded self-digest measurably change
   behavior" experiment (from 2026-06-10). Observational.
 
-## mcp-memory-server code (deferred)
-- [ ] **A.5 — `open_nodes` escape-hatch wording** — index.ts's read_graph/search_nodes descriptions
-  say "use open_nodes for full relations"; they should say "open_nodes WITHOUT projectId", because
-  project-scoped `open_nodes` uses the SAME both-endpoints AND-filter (sqlite-store.ts:2704-2728,
-  VERIFIED 2026-06-21). Doc-string only. Workspace-review finding A.5, never applied. Dustin wants to
-  do this as a test-run of the new SQLite MCP server (needs a session restart to load it).
+## mcp-memory-server code
+- [x] **A.5 — `open_nodes` escape-hatch wording DONE (2026-06-21)** — index.ts read_graph/search_nodes +
+  PaginatedOutputSchema descriptions now say "open_nodes WITHOUT a projectId" (project-scoped open_nodes
+  applies the same both-endpoints AND-filter, dropping cross-project edges — **11+ confirmed in the live
+  graph** via the new `sqlite-ro` MCP server, its first test-run). Doc-string only; build green.
 
 ## Version control
 - [x] **memory-graph-viz git-inited (2026-06-20)** — `git init` + initial commit `7586e08` (code only;
