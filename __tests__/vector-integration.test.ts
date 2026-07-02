@@ -405,17 +405,29 @@ describe('Vector search integration', () => {
     try {
       const store1 = new SqliteStore(guardPath);
       await store1.init();
+      // A REAL active observation to anchor the fake vector row — cross-exam
+      // #87 caught the first version using observation_id '999999', which the
+      // orphan cleanup (running right after the guard) would delete even with
+      // the guard's DELETE removed, making the count assertion half-vacuous.
+      // Anchored to an active observation, only the GUARD explains count=0.
+      await store1.createEntities([
+        { name: 'GuardAnchor', entityType: 'test', observations: ['anchor observation for the vec guard'] },
+      ]);
       store1.shutdown();
       await store1.close();
 
-      // Simulate a pre-switch world: one fake vector row + a stale model name.
+      // Simulate a pre-switch world: one stale-model vector row (anchored to
+      // the real observation) + a stale model name in vec_config.
       const sqliteVec = await import('sqlite-vec');
       const db = new Database(guardPath);
       try {
         sqliteVec.load(db); // vec0 module needed to touch the virtual table
+        const obsId = (db.prepare(`SELECT id FROM observations WHERE content = ?`)
+          .get('anchor observation for the vec guard') as { id: number }).id;
+        db.prepare(`DELETE FROM vec_observations`).run(); // drop any sweep-written rows for determinism
         const fake = new Float32Array(384).fill(0.5);
         db.prepare(`INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)`)
-          .run(Buffer.from(fake.buffer), '999999');
+          .run(Buffer.from(fake.buffer), String(obsId));
         db.prepare(`UPDATE vec_config SET model_name = 'fake/old-model' WHERE id = 1`).run();
         expect((db.prepare('SELECT count(*) AS n FROM vec_observations').get() as { n: number }).n).toBe(1);
       } finally {
@@ -434,7 +446,18 @@ describe('Vector search integration', () => {
       const check = new Database(guardPath);
       try {
         sqliteVec.load(check);
-        expect((check.prepare('SELECT count(*) AS n FROM vec_observations').get() as { n: number }).n).toBe(0);
+        // Race-proof assertion (the sweep may legitimately re-embed the anchor
+        // between the guard's clear and this read): under BOTH outcomes the
+        // STALE all-0.5 fake must be gone — 0 rows = cleared, sweep pending;
+        // 1 row = cleared + freshly swept (a real MiniLM vector is never a
+        // constant 0.5 fill). Nothing else removes a row anchored to an ACTIVE
+        // observation, so the fake's absence proves the guard's DELETE ran.
+        const rows = check.prepare('SELECT embedding FROM vec_observations').all() as { embedding: Buffer }[];
+        expect(rows.length).toBeLessThanOrEqual(1);
+        for (const r of rows) {
+          const vec = new Float32Array(r.embedding.buffer, r.embedding.byteOffset, 4);
+          expect(vec[0]).not.toBeCloseTo(0.5, 6);
+        }
         const cfg = check.prepare('SELECT model_name FROM vec_config WHERE id = 1').get() as { model_name: string };
         expect(cfg.model_name).toBe('Xenova/all-MiniLM-L6-v2'); // resolved current model (env unset)
       } finally {

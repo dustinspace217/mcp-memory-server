@@ -29,6 +29,12 @@ export const EMBED_MODEL = process.env.MEMORY_EMBED_MODEL || DEFAULT_EMBED_MODEL
  * SILENT ~4% cosine drift, not an error, so this must switch WITH the model. */
 export const EMBED_POOLING: 'mean' | 'cls' =
   process.env.MEMORY_EMBED_POOLING === 'cls' ? 'cls' : 'mean';
+// A typo'd value ('CLS', 'Mean') silently mapping to 'mean' would reproduce
+// the exact silent ~4% drift this knob exists to prevent — warn loudly
+// (cross-exam #87). Startup-time check, stderr only.
+if (process.env.MEMORY_EMBED_POOLING && !['mean', 'cls'].includes(process.env.MEMORY_EMBED_POOLING)) {
+  console.error(`WARNING: MEMORY_EMBED_POOLING='${process.env.MEMORY_EMBED_POOLING}' is not 'mean' or 'cls' — falling back to 'mean'. A pooling/model mismatch is a SILENT cosine drift, not an error; fix the env value.`);
+}
 
 /** Query-side instruction prefix, env-overridable (default: none, correct for
  * MiniLM's symmetric embedding). Retrieval-specialized models are ASYMMETRIC:

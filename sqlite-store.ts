@@ -1108,16 +1108,20 @@ export class SqliteStore implements GraphStore {
         // makes a mixed-model index impossible rather than silently wrong. The
         // background sweep re-embeds everything with the new model, so a model
         // switch is one env flip + one restart, self-healing. Rollback is the
-        // same flip back. Racing instances: the loser reads the already-updated
-        // config and no-ops (IMMEDIATE keeps the read under the write lock).
-        const vecCfg = this.db.prepare('SELECT model_name FROM vec_config WHERE id = 1').get() as { model_name: string } | undefined;
-        if (vecCfg && vecCfg.model_name !== EMBED_MODEL) {
-          console.error(`Embedding model changed (${vecCfg.model_name} -> ${EMBED_MODEL}): clearing vec_observations for a full re-embed by the background sweep`);
-          this.db.transaction(() => {
+        // same flip back. The READ lives INSIDE the IMMEDIATE transaction — the
+        // whole point is reading under the write lock so a racing loser sees
+        // the winner's committed update and no-ops (cross-exam #87 caught the
+        // first version reading outside the transaction while claiming this).
+        // Clear-then-update order also makes a crash between the two safe:
+        // vectors gone + stale config just re-clears an empty table next start.
+        this.db.transaction(() => {
+          const vecCfg = this.db.prepare('SELECT model_name FROM vec_config WHERE id = 1').get() as { model_name: string } | undefined;
+          if (vecCfg && vecCfg.model_name !== EMBED_MODEL) {
+            console.error(`Embedding model changed (${vecCfg.model_name} -> ${EMBED_MODEL}): clearing vec_observations for a full re-embed by the background sweep`);
             this.db.prepare('DELETE FROM vec_observations').run();
             this.db.prepare('UPDATE vec_config SET model_name = ? WHERE id = 1').run(EMBED_MODEL);
-          }).immediate();
-        }
+          }
+        }).immediate();
 
         // Startup consistency check: find stale embeddings and delete them.
         // Catches both truly orphaned vec rows (observation was CASCADE-deleted)

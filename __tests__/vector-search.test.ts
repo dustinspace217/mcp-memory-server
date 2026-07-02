@@ -114,4 +114,26 @@ describe('embedder configuration', () => {
 		// Empty prefix (the MiniLM default): identity for both kinds.
 		expect(prefixedInput('find the cat', 'query', '')).toBe('find the cat');
 	});
+
+	it("warns and falls back to 'mean' on an unrecognized MEMORY_EMBED_POOLING (typo guard)", async () => {
+		// A typo'd 'CLS' silently mapping to 'mean' reproduces the exact silent
+		// cosine drift the knob exists to prevent — the module warns at load.
+		// vi.resetModules forces a fresh import so the stubbed env is re-read
+		// (env resolution is baked at module load; cross-exam #87 follow-up).
+		const { vi } = await import('vitest');
+		vi.stubEnv('MEMORY_EMBED_POOLING', 'CLS');
+		vi.resetModules();
+		const warnings: string[] = [];
+		const orig = console.error;
+		console.error = (msg: unknown) => { warnings.push(String(msg)); };
+		try {
+			const fresh = await import('../embedding.js');
+			expect(fresh.EMBED_POOLING).toBe('mean'); // fallback, not a crash
+			expect(warnings.some(w => w.includes("MEMORY_EMBED_POOLING='CLS'"))).toBe(true);
+		} finally {
+			console.error = orig;
+			vi.unstubAllEnvs();
+			vi.resetModules();
+		}
+	});
 });
