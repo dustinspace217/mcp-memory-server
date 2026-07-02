@@ -5,7 +5,7 @@
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { promises as fs } from 'fs';
-import { EmbeddingPipeline, EMBEDDING_DIM, EMBED_MODEL, DEFAULT_EMBED_MODEL, type VectorState } from './embedding.js';
+import { EmbeddingPipeline, EMBEDDING_DIM, EMBED_MODEL, DEFAULT_EMBED_MODEL, SIMILAR_THRESHOLD, DUPLICATE_THRESHOLD, PRECEDENT_FLOOR, type VectorState } from './embedding.js';
 import {
   createObservation,
   ENTITY_TIMESTAMP_SENTINEL,
@@ -1922,7 +1922,9 @@ export class SqliteStore implements GraphStore {
               // sqlite-vec default metric is L2 (Euclidean), not squared L2,
               // so we must square it ourselves before dividing by 2.
               const similarity = 1 - (knn.distance * knn.distance) / 2;
-              if (similarity <= 0.85) continue;
+              // SIMILAR_THRESHOLD (default 0.85) is model-geometry-coupled and
+              // env-overridable — see embedding.ts for the G3 recalibration story.
+              if (similarity <= SIMILAR_THRESHOLD) continue;
 
               // Check that this observation belongs to the same entity AND is not
               // the just-inserted observation itself (filter by content != obs.content)
@@ -3595,7 +3597,10 @@ export class SqliteStore implements GraphStore {
    */
   async findPrecedents(query: string, projectId?: string, opts: FindPrecedentsOptions = {}): Promise<FindPrecedentsResult> {
     const limit = opts.limit ?? 5;
-    const minSimilarity = opts.minSimilarity ?? 0.25;
+    // PRECEDENT_FLOOR (default 0.25) is model-geometry-coupled and env-
+    // overridable — see embedding.ts. (The MCP tool schema fills its own
+    // default from the same constant, so this fallback covers direct callers.)
+    const minSimilarity = opts.minSimilarity ?? PRECEDENT_FLOOR;
     const rerank = opts.rerank ?? false;
     const modelReady = this.embeddingPipeline.state.status === 'ready';
     const vectorSearchEnabled = this.vecTableExists;
@@ -4398,9 +4403,11 @@ export class SqliteStore implements GraphStore {
           // Convert L2 distance on normalized vectors to cosine similarity.
           // For unit vectors: cos_sim = 1 - (L2_dist² / 2).
           const similarity = 1 - (knn.distance * knn.distance) / 2;
-          // 0.80 threshold — slightly more permissive than the 0.85 post-write check
-          // because this is advisory (better to show a borderline match than miss it).
-          if (similarity <= 0.80) continue;
+          // DUPLICATE_THRESHOLD (default 0.80) — slightly more permissive than
+          // the SIMILAR_THRESHOLD post-write check because this is advisory
+          // (better to show a borderline match than miss it). Model-geometry-
+          // coupled and env-overridable — see embedding.ts.
+          if (similarity <= DUPLICATE_THRESHOLD) continue;
 
           // Verify this observation belongs to the same entity and is active
           const obsRow = this.db.prepare(`

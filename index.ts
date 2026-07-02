@@ -15,6 +15,10 @@ import { JsonlStore, migrateJsonToJsonl } from './jsonl-store.js';
 import { RELATION_TYPE_GUIDANCE } from './relation-types.js';
 import { SqliteStore } from './sqlite-store.js';
 import { normalizeEntityName } from './normalize-name.js';
+// Cosine gates are model-geometry-coupled and env-overridable (see embedding.ts);
+// the tool schemas quote/default from the resolved values so the advertised
+// numbers can never drift from the enforced ones.
+import { SIMILAR_THRESHOLD, DUPLICATE_THRESHOLD, PRECEDENT_FLOOR } from './embedding.js';
 
 // --- Store configuration ---
 // Determines which backend to use and where to store data.
@@ -275,7 +279,7 @@ const PaginatedOutputSchema = {
 
 const server = new McpServer({
   name: "memory-server",
-  version: "1.3.0",
+  version: "1.3.1",
 });
 
 server.registerTool(
@@ -358,7 +362,7 @@ server.registerTool(
         similarExisting: z.array(z.object({
           content: z.string(),
           similarity: z.number(),
-        })).optional().describe("Semantically similar existing observations (cosine > 0.85). Present when embedding model is ready."),
+        })).optional().describe(`Semantically similar existing observations (cosine > ${SIMILAR_THRESHOLD}). Present when embedding model is ready.`),
       }))
     }
   },
@@ -589,7 +593,7 @@ server.registerTool(
       projectId: ProjectIdSchema,
       memoryType: z.string().min(1).max(50).optional().describe("Optional filter; recommend 'decision' for precedent recall. Omit for all types."),
       limit: z.number().int().min(1).max(50).optional().default(5).describe("Max precedents to return (default 5)"),
-      minSimilarity: z.number().min(0).max(1).optional().default(0.25).describe("Cosine floor; lower than dedup thresholds because precedents are related, not duplicates"),
+      minSimilarity: z.number().min(0).max(1).optional().default(PRECEDENT_FLOOR).describe(`Cosine floor (default ${PRECEDENT_FLOOR}); lower than dedup thresholds because precedents are related, not duplicates`),
       rerank: z.boolean().optional().describe("EXPERIMENTAL (default false): graph-aware rerank — fuses the cosine ranking with personalized PageRank over the relation graph (seeded by the matches' entities) and a BM25 full-text list. Reorders within the floor-gated candidates only; similarity values stay raw cosines. rerankApplied in the response confirms it ran."),
     },
     outputSchema: {
@@ -900,7 +904,7 @@ server.registerTool(
   {
     title: "Check Duplicates",
     description: "Pre-write duplicate check. Embeds candidate observations and queries for " +
-      "semantically similar existing observations (cosine > 0.80) on the same entity. " +
+      `semantically similar existing observations (cosine > ${DUPLICATE_THRESHOLD}) on the same entity. ` +
       "Does NOT write anything — use before add_observations to avoid redundancy. " +
       "Returns modelReady: false if embeddings are unavailable (JSONL backend or model not loaded).",
     inputSchema: {

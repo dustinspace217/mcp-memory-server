@@ -61,6 +61,41 @@ export function prefixedInput(text: string, kind: EmbedKind, prefix: string = QU
 /** Dimensionality of the embedding vectors. Must match the vec0 table definition. */
 export const EMBEDDING_DIM = 384;
 
+/**
+ * Parses a cosine-threshold env override: a finite number in [0, 1], else the
+ * default with a loud stderr warning. Same typo-guard rationale as
+ * EMBED_POOLING above — a silently-ignored garbage value would leave the
+ * server running MiniLM-tuned gates against a different model's geometry.
+ */
+function thresholdFromEnv(envName: string, fallback: number): number {
+  const raw = process.env[envName];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 1) {
+    console.error(`WARNING: ${envName}='${raw}' is not a number in [0,1] — falling back to ${fallback}. Thresholds are model-geometry-coupled; fix the env value.`);
+    return fallback;
+  }
+  return n;
+}
+
+/**
+ * Cosine-similarity gates, env-overridable BECAUSE they are model-geometry-
+ * coupled: every embedding model distributes cosines differently (granite-r2's
+ * random-pair median is ~0.77 where MiniLM's is ~0.11 — recalibration run
+ * 2026-07-02, scripts/recalibrate-thresholds.py), so a model switch that
+ * doesn't move these gates silently breaks dedup and the precedent floor.
+ * They live HERE, next to the model/pooling/prefix envs, so the whole
+ * geometry moves as one unit in the MCP registration; the defaults remain the
+ * historical MiniLM-tuned values (deployments that don't set MEMORY_EMBED_MODEL
+ * keep byte-identical behavior, and rollback = drop the env block).
+ * Deviation from plan Task G3's "apply via the constants": editing the
+ * constants while DEFAULT_EMBED_MODEL stays MiniLM would run MiniLM deployments
+ * (including the test suite) on another model's thresholds.
+ */
+export const SIMILAR_THRESHOLD = thresholdFromEnv('MEMORY_SIMILAR_THRESHOLD', 0.85);   // addObservations similarExisting warning
+export const DUPLICATE_THRESHOLD = thresholdFromEnv('MEMORY_DUPLICATE_THRESHOLD', 0.80); // check_duplicates advisory match
+export const PRECEDENT_FLOOR = thresholdFromEnv('MEMORY_PRECEDENT_FLOOR', 0.25);      // find_precedents minSimilarity default
+
 /** Maximum consecutive pipeline failures before transitioning to 'failed' state.
  * After this many failures, the pipeline stops attempting inference until restart. */
 const MAX_CONSECUTIVE_FAILURES = 5;

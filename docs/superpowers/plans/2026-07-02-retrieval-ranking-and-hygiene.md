@@ -8,31 +8,85 @@
 > `docs/superpowers/specs/2026-07-02-retrieval-ranking-and-hygiene-design.md` — §12 is the quality
 > contract, §3 the verified facts, §4-§10 the DECIDED designs. Do not re-litigate decisions here.
 
-## Status (updated 2026-07-02, ~09:30 PDT)
-Phase: C + D of 7 — code COMPLETE with QA stabilization applied (Discussion #85); C cross-exam
-  in flight, synthesis pending
-Done: Phases A (Disc #82, Issue #83) + B (Disc #84) closed. Phase C: v13 vocab migration
-  (0dc6e94; live-copy probe: 128→119 distinct spellings) + write-time canonicalization both
-  backends; stabilization: relationTypeKey trim guard, mass-retire map-trap test, dynamic-
-  collision + idempotency fixture, within-batch fixture, JSONL ambiguity fixture, ratchet
-  documentation, create_relations description note; pre-deploy live-DB rescan confirmed the map
-  current (no variants leaked since the audit). Phase D: memoryType-MANDATORY directive in
-  sessionend/precompact prompts + checkpoint gate message; null-typed backlog quota (50/run,
-  oldest-first) in the consolidation prompt; repo mirror synced (was badly stale). Both pools
-  green (651 + 12 = 663).
-Next: close #87 (cross-exam replies + synthesis, in flight), then the arc is DONE except the two
-  agent-budget gates. Version bumped to 1.3.0; Version History written; G2 harness committed
-  (memory-graph-viz 23460dd — phase3_candidates.py, granite-s-r2 + arctic-s vs MiniLM).
-Blocked: nothing. OPEN GATES (agent-budget, deliberate): DEF-RR-02 rerank blind panel;
-  G2 judge panel (then G3 cutover, CONDITIONAL on ≥12/18 + Dustin's go).
+## Status (updated 2026-07-02, ~16:00 PDT)
+Phase: ARC COMPLETE, both gates RUN (Dustin's go, same day). Merged to main.
+Done: Phases A–G1 (Discussions #82/#84/#85/#86/#87) + the post-arc follow-up: Issue #83 fixed
+  (per-row-unique strip marker), durable memory retry queue + PreCompact 420/480s ceilings
+  (Discussion #88), BOTH blind panels run — DEF-RR-02 rerank FAILED 3/18 (default stays false,
+  gate CLOSED as NO-GO), G2 granite-s-r2 WON 14/18 (arctic-s 11/18 fail) → G3 CUTOVER ARMED:
+  MCP registration env now carries granite (onnx-community ONNX mirror, cls pooling) + the
+  percentile-mapped thresholds 0.969/0.934/0.798 (recalibrate-thresholds.py run 2026-07-02);
+  thresholds made env-config (geometry-coupled, moved WITH the model — see deviation log);
+  ONNX↔ST fidelity verified (cosine ≈ 1.000); full cutover dry-run on a live-DB copy.
+  691 tests green (676 + 15).
+Next: nothing pending. The cutover fires on the next MCP server restart (v11–v15 migrations +
+  vec_config guard clears MiniLM vectors → granite re-embeds in background). Rollback = remove
+  the env block from the registration (vec_config self-heals the re-embed back).
+Blocked: nothing.
 
-## Deferments register — FINAL RECONCILIATION (2026-07-02)
+## Deferments register — FINAL RECONCILIATION (2026-07-02, gates updated ~16:00)
 | ID | Sev | Title | Status at arc close |
 |---|---|---|---|
 | DEF-RR-01 | MED | as_of_valid query filtering | OPEN by design (record-only valid time; build on demonstrated query need) |
-| DEF-RR-02 | MED | Flip find_precedents rerank default | OPEN — blind panel ≥12/18 required; param shipped dark |
 | DEF-RR-03 | LOW | access_count as eviction signal | OPEN indefinite (comment-only note at the v12 migration) |
 | DEF-RR-04 | LOW | Two-connection migration race test | OPEN indefinite (child-process harness; IMMEDIATE fix verified by trace ×3 lenses) |
+
+### Resolved
+| ID | Resolution |
+|---|---|
+| DEF-RR-02 | **CLOSED as NO-GO** (2026-07-02 blind panel): rerank-on won 3/18 against rerank-off (12 outright losses, 2 judge-ties, 1 structural tie) — the graph-aware fusion HURT blind-judged relevance, not merely failed to help. Default stays `false` permanently under the current fusion weights; the param remains available for experimentation. Any future re-attempt needs a redesigned fusion (weights/seeding), a fresh panel, and should treat 3/18 as the baseline to beat. Panel: 18 standing queries (phase2_prep set), 3 blinded judges, sides seeded-random, keys sequestered. |
+
+## Phase G RESULTS + gate outcomes (2026-07-02 afternoon — both gates run on Dustin's go)
+
+**Quantitative (phase3_candidates.py, corpus export 2026-06-18: 1166 obs / 253 entities):**
+| model | precision@5 | MRR |
+|---|---|---|
+| MiniLM (incumbent) | 0.171 | 0.443 |
+| granite-s-r2 | **0.248** | **0.536** |
+| arctic-s | 0.171 | 0.450 |
+
+**Blind panels (18 standing queries each, 3 blinded judges per panel, sides seeded-random,
+keys sequestered from judge-readable paths, decision rule ≥12/18):**
+- **granite-s-r2 vs MiniLM: 14 wins / 3 losses / 1 judge-tie → PASS.** Consistent with the
+  quant signal in both direction and magnitude.
+- **arctic-s vs MiniLM: 11 wins / 6 losses / 1 judge-tie → FAIL** (just under, and dominated
+  by granite regardless).
+- **rerank-on vs rerank-off (DEF-RR-02): 3 wins / 12 losses / 2 judge-ties / 1 structural
+  tie → FAIL decisively.** See the register's Resolved row — this is a NO-GO, not a
+  didn't-reach-threshold.
+
+**G3 cutover (granite) — executed same day, ARMED for the next MCP restart:**
+- Server-side loadability verified empirically: `onnx-community/granite-embedding-small-english-r2-ONNX`
+  (the ibm-granite repo has NO onnx/ dir) loads through the server's own EmbeddingPipeline
+  (ModernBERT supported by the installed @huggingface/transformers), 384-dim unit vectors.
+- Pooling verified from the model's own 1_Pooling/config.json: **CLS** (`MEMORY_EMBED_POOLING=cls`
+  — the exact silent-drift knob G1 built). No query prefix (granite r2 is symmetric per its card).
+- **ONNX↔ST fidelity: cosine ≈ 1.000** on probe texts (server ONNX vs the fp32
+  sentence-transformers geometry the panel judged) — the panel result transfers to the server.
+- **Threshold recalibration** (scripts/recalibrate-thresholds.py on a live-DB copy, 30 supersede-
+  chain near-dupes + 30 random pairs + 90 query-top-k cosines): granite's geometry runs hot
+  (random-pair median 0.774 vs MiniLM's 0.113). Percentile-held mapping: 0.85→**0.969**,
+  0.80→**0.934**, 0.25→**0.798**.
+- **Cutover dry-run on the copy:** guard fired (`Embedding model changed … clearing
+  vec_observations`), sweep re-embedded, find_precedents returns results under the new floor.
+- Live registration now carries the full env block (model + pooling + three thresholds);
+  rollback = remove the block (vec_config self-heals the re-embed back to MiniLM).
+
+**Post-arc deviation log (2026-07-02 afternoon):**
+1. **[behavioral-change, justified deviation from Task G3-as-written]** Thresholds became
+   env-configurable (`MEMORY_SIMILAR_THRESHOLD`/`MEMORY_DUPLICATE_THRESHOLD`/
+   `MEMORY_PRECEDENT_FLOOR`, resolved in embedding.ts beside the model/pooling/prefix envs)
+   instead of editing the constants. Editing constants while `DEFAULT_EMBED_MODEL` stays MiniLM
+   would have run every env-less deployment — including the whole test suite — on granite-tuned
+   gates against MiniLM geometry, and made the plan's own env-flip rollback incoherent. The
+   geometry now moves as ONE unit in the MCP registration. Tool descriptions interpolate the
+   resolved values so advertised numbers can't drift from enforced ones.
+2. **[scope-add, QA-driven]** Issue #83 fix + durable memory retry queue + PreCompact ceiling
+   raise (Dustin's direct asks, same session) — QA'd in Discussion #88; the new sandboxed
+   harness test caught a real dangling-staging-path bug in the queue producers on its first run.
+3. **[other]** Corpus vintage: the panel ran on the 2026-06-18 entities.json export (the corpus
+   the committed harness was built against). The A/B comparison is internal to each panel, so
+   vintage affects both sides equally.
 
 ### Phase F QA stabilization + Phase G1 (2026-07-02 ~14:30, Discussion #87 findings applied)
 1. **[behavioral-change — F review Major]** Timeline RELATIONS now carry valid-time (observations

@@ -115,6 +115,36 @@ describe('embedder configuration', () => {
 		expect(prefixedInput('find the cat', 'query', '')).toBe('find the cat');
 	});
 
+	it('cosine-threshold defaults are the MiniLM-tuned values when env is unset', async () => {
+		// The G3 cutover moves thresholds via env WITH the model (they're
+		// geometry-coupled); env-less deployments must keep the historical
+		// gates byte-identical.
+		const { SIMILAR_THRESHOLD, DUPLICATE_THRESHOLD, PRECEDENT_FLOOR } = await import('../embedding.js');
+		expect(SIMILAR_THRESHOLD).toBe(0.85);
+		expect(DUPLICATE_THRESHOLD).toBe(0.80);
+		expect(PRECEDENT_FLOOR).toBe(0.25);
+	});
+
+	it('threshold env overrides apply, and garbage values warn + fall back', async () => {
+		const { vi } = await import('vitest');
+		vi.stubEnv('MEMORY_PRECEDENT_FLOOR', '0.798');
+		vi.stubEnv('MEMORY_SIMILAR_THRESHOLD', 'not-a-number');
+		vi.resetModules();
+		const warnings: string[] = [];
+		const orig = console.error;
+		console.error = (msg: unknown) => { warnings.push(String(msg)); };
+		try {
+			const fresh = await import('../embedding.js');
+			expect(fresh.PRECEDENT_FLOOR).toBe(0.798);          // valid override applies
+			expect(fresh.SIMILAR_THRESHOLD).toBe(0.85);          // garbage falls back...
+			expect(warnings.some(w => w.includes("MEMORY_SIMILAR_THRESHOLD='not-a-number'"))).toBe(true); // ...loudly
+		} finally {
+			console.error = orig;
+			vi.unstubAllEnvs();
+			vi.resetModules();
+		}
+	});
+
 	it("warns and falls back to 'mean' on an unrecognized MEMORY_EMBED_POOLING (typo guard)", async () => {
 		// A typo'd 'CLS' silently mapping to 'mean' reproduces the exact silent
 		// cosine drift the knob exists to prevent — the module warns at load.
