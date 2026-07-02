@@ -771,6 +771,57 @@ export class SqliteStore implements GraphStore {
       currentVersion = 10;
     }
 
+    if (currentVersion < 11) {
+      // Migration 10 → 11: FTS5 full-text index over observation content.
+      //
+      // External-content FTS5 table + sync TRIGGERS (not code-level sync). Why
+      // triggers: evict.ts writes observations via raw SQL, deliberately bypassing
+      // GraphStore (the §12 observer-effect rule), and future migrations may too —
+      // DB-level triggers catch every writer; a code-level sync helper would miss
+      // them silently.
+      //
+      // The index holds ALL observations, active and superseded: supersede/delete
+      // only UPDATE superseded_at, which fires no content trigger. Active-only
+      // filtering therefore lives in exactly ONE place — the query-time
+      // `JOIN observations o ON o.id = obs_fts.rowid AND o.superseded_at = ''`.
+      // Keeping the triggers unconditional also keeps them correct: an
+      // external-content FTS5 'delete' command must be fed the EXACT content the
+      // index holds, which is only guaranteed when every content change flows
+      // through the same trigger set.
+      //
+      // tokenize: unicode61 with remove_diacritics 2 — folds case AND accents,
+      // an improvement over LIKE's ASCII-only case folding (Known Limitations).
+      //
+      // Race safety (Issue #78 — concurrent server instances migrate in parallel):
+      // IF NOT EXISTS on table + triggers makes losers no-op; 'rebuild' is
+      // idempotent (it derives the index from the content table).
+      this.db.transaction(() => {
+        this.db.exec(`
+          CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts USING fts5(
+            content,
+            content='observations',
+            content_rowid='id',
+            tokenize='unicode61 remove_diacritics 2'
+          );
+          CREATE TRIGGER IF NOT EXISTS obs_fts_ai AFTER INSERT ON observations BEGIN
+            INSERT INTO obs_fts(rowid, content) VALUES (new.id, new.content);
+          END;
+          CREATE TRIGGER IF NOT EXISTS obs_fts_ad AFTER DELETE ON observations BEGIN
+            INSERT INTO obs_fts(obs_fts, rowid, content) VALUES ('delete', old.id, old.content);
+          END;
+          CREATE TRIGGER IF NOT EXISTS obs_fts_au AFTER UPDATE OF content ON observations BEGIN
+            INSERT INTO obs_fts(obs_fts, rowid, content) VALUES ('delete', old.id, old.content);
+            INSERT INTO obs_fts(rowid, content) VALUES (new.id, new.content);
+          END;
+        `);
+        // Rebuild pulls every existing observations row into the index in one
+        // statement — this is what indexes the pre-v11 corpus.
+        this.db.exec(`INSERT INTO obs_fts(obs_fts) VALUES ('rebuild')`);
+        this.db.prepare('UPDATE schema_version SET version = 11').run();
+      })();
+      currentVersion = 11;
+    }
+
     // === Indexes (idempotent, run on every startup) ===
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)

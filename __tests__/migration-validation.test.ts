@@ -795,7 +795,11 @@ describe('Migration safety validation', () => {
     // Verify schema_version is now 9 (v7→v8 normalization + v8→v9 eviction columns).
     const db2 = new Database(dbPath);
     const version = (db2.prepare(`SELECT version FROM schema_version`).get() as { version: number }).version;
-    expect(version).toBe(10);
+    // "At least 8" (this test's subject is the v8 columns/rewrites below) rather
+    // than an exact final version, so this assertion doesn't break every time a
+    // later migration is added. The single exact current-version pin lives in
+    // knowledge-graph.test.ts ("fresh databases" test) by design.
+    expect(version).toBeGreaterThanOrEqual(8);
 
     // Verify normalized_name column was added with NOT NULL constraint.
     const v8Cols = db2.prepare(`PRAGMA table_info(entities)`).all() as { name: string; dflt_value: string | null; notnull: number }[];
@@ -1030,10 +1034,13 @@ describe('Migration safety validation', () => {
     const sqliteStore = new SqliteStore(dbPath);
     await sqliteStore.init();
 
-    // Verify: schema version is now 9.
+    // Verify: the migration chain ran through at least v9 (this test's subject).
+    // "At least" (matching the v6/v7 tests' convention) rather than an exact
+    // final version, so this assertion doesn't break every time a later
+    // migration is added — the v9 columns below are what this test pins.
     const db2 = new Database(dbPath, { readonly: true });
     const version = (db2.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
-    expect(version).toBe(10);
+    expect(version).toBeGreaterThanOrEqual(9);
 
     // Verify: entities has tombstoned_at and last_accessed_at columns.
     const entityCols = db2.prepare('PRAGMA table_info(entities)').all() as { name: string }[];
@@ -1066,6 +1073,103 @@ describe('Migration safety validation', () => {
 
     const relRow = db2.prepare('SELECT tombstoned_at FROM relations LIMIT 1').get() as { tombstoned_at: string };
     expect(relRow.tombstoned_at).toBe('');
+
+    db2.close();
+    await sqliteStore.close();
+  });
+
+  it('should migrate v10 → v11: create obs_fts and index pre-existing observations', async () => {
+    // Create a v10 database directly (full v9 schema + source_instance), then verify
+    // that SqliteStore auto-migrates it to v11:
+    //   - creates the obs_fts external-content FTS5 table + the three sync triggers
+    //   - the 'rebuild' step indexes observations that existed BEFORE the migration
+    //     (this is the property the one-time migration exists for)
+    const id = Date.now();
+    dbPath = path.join(testDir, `test-v10-to-v11-${id}.db`);
+    jsonlPath = path.join(testDir, `nonexistent-${id}.jsonl`); // not used, just for cleanup
+
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
+
+    // Build v10 schema directly (v8 layout + v9 eviction columns + v10 source_instance).
+    db.prepare(`CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL)`).run();
+    db.prepare(`INSERT INTO schema_version (id, version) VALUES (1, 10)`).run();
+
+    db.prepare(`CREATE TABLE entities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      project TEXT,
+      updated_at TEXT NOT NULL DEFAULT '0000-00-00T00:00:00.000Z',
+      created_at TEXT NOT NULL DEFAULT '0000-00-00T00:00:00.000Z',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      normalized_name TEXT NOT NULL DEFAULT '',
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      last_accessed_at TEXT NOT NULL DEFAULT ''
+    )`).run();
+
+    db.prepare(`CREATE TABLE observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      superseded_at TEXT NOT NULL DEFAULT '',
+      importance REAL NOT NULL DEFAULT 3.0,
+      context_layer TEXT,
+      memory_type TEXT,
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      source_instance TEXT NOT NULL DEFAULT 'unknown',
+      UNIQUE(entity_id, content, superseded_at)
+    )`).run();
+
+    db.prepare(`CREATE TABLE relations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_entity TEXT NOT NULL,
+      to_entity TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT '',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      UNIQUE(from_entity, to_entity, relation_type, superseded_at)
+    )`).run();
+
+    // Pre-existing observation — written BEFORE obs_fts exists, so only the
+    // migration's rebuild step can make it searchable (no trigger saw it).
+    const ts = '2026-06-01T12:00:00.000Z';
+    db.prepare(`INSERT INTO entities (name, entity_type, updated_at, created_at, normalized_name, last_accessed_at) VALUES (?, ?, ?, ?, ?, ?)`).run(
+      'PreV11Entity', 'concept', ts, ts, 'prev11entity', ts
+    );
+    const entityId = (db.prepare('SELECT id FROM entities WHERE name = ?').get('PreV11Entity') as { id: number }).id;
+    db.prepare(`INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)`).run(
+      entityId, 'the capybara lounged in the migration fixture', ts
+    );
+
+    db.close();
+
+    // Open with SqliteStore — should auto-migrate v10 → v11.
+    const sqliteStore = new SqliteStore(dbPath);
+    await sqliteStore.init();
+
+    const db2 = new Database(dbPath, { readonly: true });
+    const version = (db2.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+    expect(version).toBeGreaterThanOrEqual(11);
+
+    // Verify: obs_fts exists and the rebuild indexed the pre-existing row.
+    const hits = db2.prepare(
+      `SELECT o.entity_id FROM obs_fts
+       JOIN observations o ON o.id = obs_fts.rowid AND o.superseded_at = ''
+       WHERE obs_fts MATCH '"capybara"'`
+    ).all() as { entity_id: number }[];
+    expect(hits.length).toBe(1);
+    expect(hits[0].entity_id).toBe(entityId);
+
+    // Verify: all three sync triggers were created.
+    const triggers = db2.prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'obs_fts_%' ORDER BY name`
+    ).all() as { name: string }[];
+    expect(triggers.map(t => t.name)).toEqual(['obs_fts_ad', 'obs_fts_ai', 'obs_fts_au']);
 
     db2.close();
     await sqliteStore.close();

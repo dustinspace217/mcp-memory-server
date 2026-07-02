@@ -3557,7 +3557,8 @@ describe('SqliteStore-specific', () => {
 			// to store their endpoints in normalized form. v9 added tombstoned_at on
 			// entities/observations/relations and last_accessed_at on entities for eviction.
 			// v10 added source_instance to observations for multi-machine tracking.
-			expect(row!.version).toBe(10);
+			// v11 added the obs_fts FTS5 index over observation content + sync triggers.
+			expect(row!.version).toBe(11);
 		});
 	});
 
