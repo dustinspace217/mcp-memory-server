@@ -832,6 +832,45 @@ export class SqliteStore implements GraphStore {
       currentVersion = 11;
     }
 
+    if (currentVersion < 12) {
+      // Migration 11 → 12: access_count for retrieval strengthening (Phase B).
+      //
+      // WHY: last_accessed_at alone can't distinguish "touched once last week"
+      // from "reached for forty times" — the ACT-R activation term in
+      // rank-fusion.ts needs the count. Human memory strengthens with retrieval
+      // (the testing effect); this column is the substrate for that.
+      //
+      // PARITY RULE: access_count increments at EXACTLY the sites that write
+      // last_accessed_at — the touchEntities helpers AND the inline writers
+      // (createEntities' INSERT seeds 1; the four updated_at+last_accessed_at
+      // UPDATEs increment). One concept, two columns. WHY parity over
+      // "retrieval-only" counting: supersede-heavy entities (continuity
+      // threads, checkpointed every session) are among the most-used memories
+      // but are mostly WRITTEN — retrieval-only counting would rank them as
+      // never-accessed. readGraph and evict.ts's raw SQL write neither column.
+      // No backfill — there is no historical access data to backfill from;
+      // DEFAULT 0 = "never counted", which activationScore ranks last (-Infinity).
+      //
+      // DEF-RR-03 (deliberately not wired): access_count could later feed the
+      // eviction tiers as a retention signal; left as a comment-only note.
+      //
+      // Race safety: same try-catch-duplicate-column pattern as v10 (Issue #78 —
+      // concurrent instances race the ALTER; losers continue to the version bump).
+      this.db.transaction(() => {
+        try {
+          this.db.prepare(
+            `ALTER TABLE entities ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0`
+          ).run();
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!msg.includes('duplicate column name')) throw err;
+          // Another process already added the column — safe to continue.
+        }
+        this.db.prepare('UPDATE schema_version SET version = 12').run();
+      })();
+      currentVersion = 12;
+    }
+
     // === Indexes (idempotent, run on every startup) ===
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
@@ -1059,11 +1098,19 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
-   * Updates `last_accessed_at` on one or more entities to the current timestamp.
-   * Called by methods that represent intentional access: search_nodes, open_nodes,
-   * entity_timeline, and all write operations. NOT called by read_graph (bulk) or
-   * the eviction sweep (which uses raw SQL to avoid the observer effect — see §12
-   * of the v1.1 design spec).
+   * Updates `last_accessed_at` AND increments `access_count` on one or more
+   * entities. Called by methods that represent intentional access: search_nodes,
+   * open_nodes, entity_timeline, and all write operations. NOT called by
+   * read_graph (bulk) or the eviction sweep (which uses raw SQL to avoid the
+   * observer effect — see §12 of the v1.1 design spec).
+   *
+   * access_count (v12) follows the PARITY RULE: it increments at exactly the
+   * sites that write last_accessed_at — these helpers plus the inline writers
+   * (createEntities' INSERT, the four updated_at+last_accessed_at UPDATEs).
+   * Together the two columns feed the ACT-R activation term (rank-fusion.ts)
+   * that reranks relevance-mode search results toward frequently-and-recently-
+   * accessed memories. If you add a new last_accessed_at write site, it must
+   * increment access_count too (the v12 migration comment has the rationale).
    *
    * Accepts entity IDs (integers) to avoid re-lookups. Uses IN-clause chunking
    * (same CHUNK_SIZE as openNodes) for large batches. Silently ignores empty input.
@@ -1079,7 +1126,7 @@ export class SqliteStore implements GraphStore {
       const chunk = unique.slice(i, i + CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(', ');
       this.db.prepare(
-        `UPDATE entities SET last_accessed_at = ? WHERE id IN (${placeholders}) AND superseded_at = ''`
+        `UPDATE entities SET last_accessed_at = ?, access_count = access_count + 1 WHERE id IN (${placeholders}) AND superseded_at = ''`
       ).run(now, ...chunk);
     }
   }
@@ -1098,7 +1145,7 @@ export class SqliteStore implements GraphStore {
       const chunk = unique.slice(i, i + CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(', ');
       this.db.prepare(
-        `UPDATE entities SET last_accessed_at = ? WHERE normalized_name IN (${placeholders}) AND superseded_at = ''`
+        `UPDATE entities SET last_accessed_at = ?, access_count = access_count + 1 WHERE normalized_name IN (${placeholders}) AND superseded_at = ''`
       ).run(now, ...chunk);
     }
   }
@@ -1387,8 +1434,11 @@ export class SqliteStore implements GraphStore {
     // INSERT now writes both `name` (display, preserved as the caller supplied) and
     // `normalized_name` (identity key, used by the partial unique index for collision detection).
     // last_accessed_at is set to creation time — the act of creating is the strongest access signal.
+    // access_count starts at 1, not 0: ACT-R counts the encoding as the first
+    // presentation, and the parity rule (access_count increments exactly where
+    // last_accessed_at updates) keeps the two columns one concept, not two.
     const insertEntity = this.db.prepare(
-      'INSERT OR IGNORE INTO entities (name, normalized_name, entity_type, project, updated_at, created_at, last_accessed_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO entities (name, normalized_name, entity_type, project, updated_at, created_at, last_accessed_at, access_count) VALUES (?, ?, ?, ?, ?, ?, ?, 1)'
     );
     // Lookups go through normalized_name now (the identity key). Filter superseded_at = ''
     // so we only see the active row, not historical soft-deleted rows that may share
@@ -1587,7 +1637,7 @@ export class SqliteStore implements GraphStore {
     // Prepared statement to bump updated_at and last_accessed_at when observations
     // are added to an entity — writes are the strongest access signal.
     const updateTimestamp = this.db.prepare(
-      'UPDATE entities SET updated_at = ?, last_accessed_at = ? WHERE id = ?'
+      'UPDATE entities SET updated_at = ?, last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?'
     );
 
     const results: AddObservationResult[] = [];
@@ -1829,7 +1879,7 @@ export class SqliteStore implements GraphStore {
     // Prepared statement to bump updated_at and last_accessed_at when observations
     // are retired from an entity — writes are the strongest access signal.
     const updateTimestamp = this.db.prepare(
-      'UPDATE entities SET updated_at = ?, last_accessed_at = ? WHERE id = ?'
+      'UPDATE entities SET updated_at = ?, last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?'
     );
 
     const txn = this.db.transaction(() => {
@@ -1932,7 +1982,7 @@ export class SqliteStore implements GraphStore {
     );
     // Bump entity's updated_at and last_accessed_at — writes are the strongest access signal.
     const updateTimestamp = this.db.prepare(
-      'UPDATE entities SET updated_at = ?, last_accessed_at = ? WHERE id = ?'
+      'UPDATE entities SET updated_at = ?, last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?'
     );
 
     // better-sqlite3 transactions are synchronous -- the outer async wrapper
@@ -3893,7 +3943,7 @@ export class SqliteStore implements GraphStore {
       // observation modified — writes are the strongest access signal.
       if (touchedEntityIds.size > 0) {
         const updateEntity = this.db.prepare(
-          'UPDATE entities SET updated_at = ?, last_accessed_at = ? WHERE id = ?'
+          'UPDATE entities SET updated_at = ?, last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?'
         );
         for (const id of touchedEntityIds) {
           updateEntity.run(now, now, id);

@@ -1171,6 +1171,15 @@ describe('Migration safety validation', () => {
     ).all() as { name: string }[];
     expect(triggers.map(t => t.name)).toEqual(['obs_fts_ad', 'obs_fts_ai', 'obs_fts_au']);
 
+    // Verify: v12 also ran (migrations are sequential) — access_count exists
+    // and pre-existing entities default to 0 (never counted, not backfilled:
+    // there is no historical access data to backfill from).
+    expect(version).toBeGreaterThanOrEqual(12);
+    const entCols = db2.prepare('PRAGMA table_info(entities)').all() as { name: string }[];
+    expect(entCols.map(c => c.name)).toContain('access_count');
+    const preexisting = db2.prepare('SELECT access_count FROM entities WHERE name = ?').get('PreV11Entity') as { access_count: number };
+    expect(preexisting.access_count).toBe(0);
+
     db2.close();
     await sqliteStore.close();
   });

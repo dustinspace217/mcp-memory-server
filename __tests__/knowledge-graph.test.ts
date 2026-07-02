@@ -3558,7 +3558,8 @@ describe('SqliteStore-specific', () => {
 			// entities/observations/relations and last_accessed_at on entities for eviction.
 			// v10 added source_instance to observations for multi-machine tracking.
 			// v11 added the obs_fts FTS5 index over observation content + sync triggers.
-			expect(row!.version).toBe(11);
+			// v12 added access_count on entities for retrieval strengthening.
+			expect(row!.version).toBe(12);
 		});
 	});
 

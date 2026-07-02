@@ -112,6 +112,36 @@ describe('last_accessed_at access discipline', () => {
     expect(afterOpen >= afterCreate).toBe(true);
   });
 
+  it('access_count increments with the same discipline as last_accessed_at (v12)', async () => {
+    // Phase B retrieval strengthening: every touch ALSO increments access_count,
+    // with the identical boundary — intentional access counts, bulk reads don't.
+    // (The eviction sweep's raw SQL writes neither — evict.ts contains no
+    // access_count reference; grep-verifiable, and the observer-effect tests
+    // above pin the last_accessed_at half of that discipline.)
+    function readCount(name: string): number {
+      const db = new Database(dbPath);
+      try {
+        return (db.prepare(`SELECT access_count FROM entities WHERE name = ?`).get(name) as { access_count: number }).access_count;
+      } finally {
+        db.close();
+      }
+    }
+    await store.createEntities([
+      { name: 'CountTarget', entityType: 'test', observations: ['countable'] },
+    ]);
+    const afterCreate = readCount('CountTarget'); // creation is a write = one touch
+    expect(afterCreate).toBeGreaterThanOrEqual(1);
+
+    await store.openNodes(['CountTarget']);
+    expect(readCount('CountTarget')).toBe(afterCreate + 1);
+
+    await store.searchNodes('countable');
+    expect(readCount('CountTarget')).toBe(afterCreate + 2);
+
+    await store.readGraph(); // bulk read — must NOT count
+    expect(readCount('CountTarget')).toBe(afterCreate + 2);
+  });
+
   it('entityTimeline updates last_accessed_at (viewing history = intent)', async () => {
     await store.createEntities([
       { name: 'TimelineTarget', entityType: 'test', observations: ['obs'] },
