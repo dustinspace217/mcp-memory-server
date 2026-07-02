@@ -88,6 +88,10 @@ const ObservationSchema = z.object({
   contextLayer: z.enum(['L0', 'L1']).nullable().describe("Context layer: 'L0' = always loaded, 'L1' = session start, null = L2 (on-demand)"),
   memoryType: z.string().nullable().describe("Memory type tag (e.g., 'decision', 'preference', 'fact'). null = unclassified"),
   sourceInstance: z.string().describe("Which Claude Code instance created this observation (e.g., 'fedora', 'windows-mele')"),
+  // Declaring these here is load-bearing (SDK output validation strips
+  // undeclared keys): valid time (v14) — when the fact was true in the world.
+  validFrom: z.string().optional().describe("VALID-TIME start (set via set_observation_metadata) — present only when set"),
+  validUntil: z.string().optional().describe("VALID-TIME end — present only when set"),
 });
 
 /**
@@ -152,7 +156,12 @@ const RelationBaseSchema = z.object({
 const RelationInputSchema = z.object({
   from: EntityNameInputSchema.describe("The name of the entity where the relation starts"),
   to: EntityNameInputSchema.describe("The name of the entity where the relation ends"),
-  relationType: z.string().min(1).max(500).describe("The type of the relation")
+  relationType: z.string().min(1).max(500).describe("The type of the relation"),
+  // Valid time (v14): when the relationship was true IN THE WORLD, distinct from
+  // the system-managed createdAt/supersededAt (when the DB learned/retired it).
+  // Same Z-suffix-only validation as asOf so stored values compare lexicographically.
+  validFrom: z.string().datetime({ offset: false }).optional().describe("Optional VALID-TIME start: when the relationship became true in the world (ISO 8601 UTC, Z suffix). Distinct from createdAt (when the database learned it)."),
+  validUntil: z.string().datetime({ offset: false }).optional().describe("Optional VALID-TIME end: when the relationship stopped being true in the world (ISO 8601 UTC, Z suffix). Omit for still-true/unknown."),
 });
 
 // Output schema for relations returned by queries — includes system-managed temporal fields.
@@ -162,6 +171,8 @@ const RelationInputSchema = z.object({
 const RelationOutputSchema = RelationBaseSchema.extend({
   createdAt: z.string().describe("ISO 8601 UTC timestamp when relation was created, or sentinel for legacy data"),
   supersededAt: z.string().describe("'' = active, ISO timestamp = invalidated"),
+  validFrom: z.string().optional().describe("VALID TIME start (when the relationship was true in the world) — present only when the caller set it"),
+  validUntil: z.string().optional().describe("VALID TIME end — present only when the caller set it"),
 });
 
 // A node reached by get_connected_context. Structure only — no observation content
@@ -667,6 +678,9 @@ server.registerTool(
         supersededAt: z.string(),
         sourceInstance: z.string(),
         status: z.enum(['active', 'superseded', 'tombstoned']),
+        // Valid time (v14) — declared so SDK output validation doesn't strip it.
+        validFrom: z.string().optional(),
+        validUntil: z.string().optional(),
       })),
       relations: z.array(z.object({
         from: z.string(),
@@ -697,9 +711,10 @@ server.registerTool(
   "set_observation_metadata",
   {
     title: "Set Observation Metadata",
-    description: "Updates importance, context layer, and/or memory type on existing observations " +
+    description: "Updates importance, context layer, memory type, and/or VALID TIME on existing observations " +
       "without superseding them. Preserves the observation's identity, timestamps, and embeddings. " +
-      "Use this to promote observations to L0/L1, adjust importance, or tag memory type. " +
+      "Use this to promote observations to L0/L1, adjust importance, tag memory type, or record when " +
+      "a fact was true IN THE WORLD (validFrom/validUntil — distinct from when the database learned it). " +
       "Observations are identified by (entityName, content) exact match.",
     inputSchema: {
       updates: z.array(z.object({
@@ -713,11 +728,15 @@ server.registerTool(
           .describe("'L0' = always loaded, 'L1' = session start, null = demote to on-demand (L2). Only updated if key present."),
         memoryType: z.string().min(1).max(50).nullable().optional()
           .describe("Memory type tag (e.g. 'decision','preference','fact','problem','procedure'). null = unclassified. Only updated if key present."),
+        validFrom: z.string().datetime({ offset: false }).nullable().optional()
+          .describe("VALID-TIME start: when the fact became true in the world (ISO 8601 UTC, Z suffix). null clears. Only updated if key present."),
+        validUntil: z.string().datetime({ offset: false }).nullable().optional()
+          .describe("VALID-TIME end: when the fact stopped being true in the world (ISO 8601 UTC, Z suffix). null clears. Only updated if key present."),
       }).refine(
         // At least one metadata field must be provided — otherwise the update is a no-op
         // and the caller gets a misleading "0 not found" response.
-        (obj) => obj.importance !== undefined || 'contextLayer' in obj || 'memoryType' in obj,
-        { message: "At least one of importance, contextLayer, or memoryType must be provided" }
+        (obj) => obj.importance !== undefined || 'contextLayer' in obj || 'memoryType' in obj || 'validFrom' in obj || 'validUntil' in obj,
+        { message: "At least one of importance, contextLayer, memoryType, validFrom, or validUntil must be provided" }
       )).min(1).max(100).describe("Observations to update"),
     },
     outputSchema: {

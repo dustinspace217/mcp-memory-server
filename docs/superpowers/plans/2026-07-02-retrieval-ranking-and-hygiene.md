@@ -20,9 +20,20 @@ Done: Phases A (Disc #82, Issue #83) + B (Disc #84) closed. Phase C: v13 vocab m
   sessionend/precompact prompts + checkpoint gate message; null-typed backlog quota (50/run,
   oldest-first) in the consolidation prompt; repo mirror synced (was badly stale). Both pools
   green (651 + 12 = 663).
-Next: Phase F Task F1 (valid-time migration v14), then Phase G; open agent-budget gates:
-  DEF-RR-02 (rerank blind panel) + G2 (embedding panel)
+Next: Phase F QA (slim), then Phase G Task G1 (env-configurable prefix-aware embedder + vec_config
+  v15); open agent-budget gates: DEF-RR-02 (rerank blind panel) + G2 (embedding panel)
 Blocked: nothing
+
+### Phase F code complete (2026-07-02 ~14:15)
+v14 valid-time on observations + relations (migration + full write/read surface:
+set_observation_metadata validFrom/validUntil with null-clears; RelationInput on create_relations;
+hydration in buildEntities/getConnectedRelations/entityTimeline; Zod in/out schemas incl. the
+SDK-strip-guard declarations). Live-copy probe: set → timeline/openNodes round-trip verified,
+absent stays absent. 680 tests green (666 + 14).
+**Deviation [process]:** the v14 migration landed before its tests (the surface tests were
+RED-first as required; the migration block was written in the same edit pass as the types — the
+forward-migration assertions then passed immediately rather than failing first). Recorded per
+TDD-strictness honesty; the surface plumbing (the risky part) was test-first throughout.
 
 ### Phase E CLOSED (2026-07-02 ~09:50, Discussion #86 full three-phase thread)
 Cross-exam refinements in the final commit: strict exact-zero pin (dyadic weights, toBe not

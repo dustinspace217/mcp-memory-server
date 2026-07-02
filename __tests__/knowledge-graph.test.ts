@@ -130,6 +130,33 @@ describe.each<[string, string, StoreFactory]>([
 			expect(newRelations).toHaveLength(0);
 		});
 
+		it('carries valid-time on relations when supplied, omits it otherwise (v14)', async () => {
+			// VALID TIME is when the relationship was true IN THE WORLD, distinct
+			// from createdAt/supersededAt (when the database learned/retired it).
+			await store.createEntities([
+				{ name: 'Employer', entityType: 'org', observations: [] },
+				{ name: 'Worker', entityType: 'person', observations: [] },
+				{ name: 'OtherOrg', entityType: 'org', observations: [] },
+			]);
+			const created = await store.createRelations([
+				{ from: 'Worker', to: 'Employer', relationType: 'worked_at', validFrom: '2019-03-01T00:00:00.000Z', validUntil: '2023-06-30T00:00:00.000Z' },
+				{ from: 'Worker', to: 'OtherOrg', relationType: 'worked_at' }, // no valid time
+			]);
+			expect(created[0].validFrom).toBe('2019-03-01T00:00:00.000Z');
+			expect(created[0].validUntil).toBe('2023-06-30T00:00:00.000Z');
+			expect(created[1].validFrom).toBeUndefined();
+			expect(created[1].validUntil).toBeUndefined();
+
+			// Round-trip through a read: the fields survive storage and hydration.
+			const graph = await store.openNodes(['Worker', 'Employer', 'OtherOrg']);
+			const withTime = graph.relations.find(r => r.to === 'Employer')!;
+			const without = graph.relations.find(r => r.to === 'OtherOrg')!;
+			expect(withTime.validFrom).toBe('2019-03-01T00:00:00.000Z');
+			expect(withTime.validUntil).toBe('2023-06-30T00:00:00.000Z');
+			expect(without.validFrom).toBeUndefined();
+			expect(without.validUntil).toBeUndefined();
+		});
+
 		// Write-time vocabulary canonicalization (v1.3.0 Phase C2, spec §6.3).
 		// ADVISORY, not an enum: it reuses an existing spelling when the incoming
 		// type's normalized key matches; genuinely novel types store verbatim.
@@ -3641,7 +3668,8 @@ describe('SqliteStore-specific', () => {
 			// v11 added the obs_fts FTS5 index over observation content + sync triggers.
 			// v12 added access_count on entities for retrieval strengthening.
 			// v13 normalized drifted relation-type spellings (explicit reviewed map).
-			expect(row!.version).toBe(13);
+			// v14 added valid_from/valid_until (bi-temporal valid time) to observations + relations.
+			expect(row!.version).toBe(14);
 		});
 	});
 
@@ -4230,6 +4258,39 @@ describe('SqliteStore-specific', () => {
 	//   resolution via surface variants (normalized_name).
 	// ----------------------------------------------------------
 	describe('setObservationMetadata', () => {
+
+		it('sets and clears valid-time on observations (v14)', async () => {
+			await store.createEntities([
+				{ name: 'ValidTimeTest', entityType: 'fact', observations: ['worked at Acme'] },
+			]);
+			// Absent by default.
+			const before = await store.readGraph();
+			expect(before.entities[0].observations[0].validFrom).toBeUndefined();
+			expect(before.entities[0].observations[0].validUntil).toBeUndefined();
+
+			// Set both bounds via metadata update (no content change, no supersede).
+			const updated = await store.setObservationMetadata([
+				{ entityName: 'ValidTimeTest', content: 'worked at Acme', validFrom: '2019-03-01T00:00:00.000Z', validUntil: '2023-06-30T00:00:00.000Z' },
+			]);
+			expect(updated).toBe(1);
+			const after = await store.readGraph();
+			expect(after.entities[0].observations[0].validFrom).toBe('2019-03-01T00:00:00.000Z');
+			expect(after.entities[0].observations[0].validUntil).toBe('2023-06-30T00:00:00.000Z');
+
+			// Explicit null clears (the 'key in object' convention, like contextLayer).
+			await store.setObservationMetadata([
+				{ entityName: 'ValidTimeTest', content: 'worked at Acme', validUntil: null },
+			]);
+			const cleared = await store.readGraph();
+			expect(cleared.entities[0].observations[0].validFrom).toBe('2019-03-01T00:00:00.000Z'); // untouched (key absent)
+			expect(cleared.entities[0].observations[0].validUntil).toBeUndefined();
+
+			// entity_timeline surfaces valid time too — the timeline is exactly
+			// where transaction time and valid time diverge visibly.
+			const timeline = await store.entityTimeline('ValidTimeTest');
+			expect(timeline!.observations[0].validFrom).toBe('2019-03-01T00:00:00.000Z');
+			expect(timeline!.observations[0].validUntil).toBeUndefined();
+		});
 
 		it('updates importance without changing content or timestamps', async () => {
 			// Create an entity with a known observation.

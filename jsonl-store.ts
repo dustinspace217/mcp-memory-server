@@ -207,6 +207,9 @@ export class JsonlStore implements GraphStore {
               // JSONL files may or may not have these fields serialized.
               createdAt: typeof item.createdAt === 'string' ? item.createdAt : ENTITY_TIMESTAMP_SENTINEL,
               supersededAt: typeof item.supersededAt === 'string' ? item.supersededAt : '',
+              // Valid time (v14): optional — absent in files predating it.
+              ...(typeof item.validFrom === 'string' && item.validFrom ? { validFrom: item.validFrom } : {}),
+              ...(typeof item.validUntil === 'string' && item.validUntil ? { validUntil: item.validUntil } : {}),
             });
           }
         } catch (processError) {
@@ -237,7 +240,10 @@ export class JsonlStore implements GraphStore {
       })),
       ...graph.relations.map(r => JSON.stringify({
         type: "relation", from: r.from, to: r.to, relationType: r.relationType,
-        createdAt: r.createdAt, supersededAt: r.supersededAt
+        createdAt: r.createdAt, supersededAt: r.supersededAt,
+        // Valid time (v14): undefined values are dropped by JSON.stringify,
+        // so unspecified fields never appear in the file.
+        validFrom: r.validFrom, validUntil: r.validUntil
       })),
     ];
     const tmpPath = this.memoryFilePath + '.tmp';
@@ -447,6 +453,9 @@ export class JsonlStore implements GraphStore {
           relationType: relType,
           createdAt: ENTITY_TIMESTAMP_SENTINEL,
           supersededAt: '',
+          // Valid time (v14) — carried when the caller supplied it.
+          ...(r.validFrom ? { validFrom: r.validFrom } : {}),
+          ...(r.validUntil ? { validUntil: r.validUntil } : {}),
         };
         newRelations.push(fullRelation);
       }

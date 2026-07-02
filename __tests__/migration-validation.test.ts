@@ -1195,6 +1195,19 @@ describe('Migration safety validation', () => {
     const preexisting = db2.prepare('SELECT access_count FROM entities WHERE name = ?').get('PreV11Entity') as { access_count: number };
     expect(preexisting.access_count).toBe(0);
 
+    // Verify: v14 also ran — valid_from/valid_until exist on BOTH tables with
+    // the empty-string (unspecified) sentinel on pre-existing rows.
+    expect(version).toBeGreaterThanOrEqual(14);
+    const obsColsV14 = db2.prepare('PRAGMA table_info(observations)').all() as { name: string }[];
+    expect(obsColsV14.map(c => c.name)).toContain('valid_from');
+    expect(obsColsV14.map(c => c.name)).toContain('valid_until');
+    const relColsV14 = db2.prepare('PRAGMA table_info(relations)').all() as { name: string }[];
+    expect(relColsV14.map(c => c.name)).toContain('valid_from');
+    expect(relColsV14.map(c => c.name)).toContain('valid_until');
+    const preexistingObs = db2.prepare('SELECT valid_from, valid_until FROM observations LIMIT 1').get() as { valid_from: string; valid_until: string };
+    expect(preexistingObs.valid_from).toBe('');
+    expect(preexistingObs.valid_until).toBe('');
+
     db2.close();
     await sqliteStore.close();
   });

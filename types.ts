@@ -23,6 +23,13 @@ export interface Observation {
   contextLayer: string | null;  // null = L2 (on-demand), 'L0' = always loaded, 'L1' = session start
   memoryType: string | null;    // null = unclassified
   sourceInstance: string;        // which Claude instance created this observation (from MEMORY_INSTANCE_NAME env var)
+  /** VALID TIME (v14, bi-temporal-lite — Phase F): when the fact was true IN THE
+   *  WORLD, distinct from createdAt/supersededAt (when the DATABASE learned or
+   *  retired it). Caller-supplied ISO 8601 UTC; absent = unspecified. Set via
+   *  set_observation_metadata (add_observations keeps its string-array shape).
+   *  No query filtering yet — display/record only (DEF-RR-01). */
+  validFrom?: string;
+  validUntil?: string;
 }
 
 /**
@@ -43,23 +50,30 @@ export interface Entity {
   createdAt: string;       // ISO 8601 UTC, or ENTITY_TIMESTAMP_SENTINEL for legacy data
 }
 
-/** Input type for creating/deleting relations — just the triple, no temporal fields.
- * Used by createRelations() and deleteRelations() callers. */
+/** Input type for creating/deleting relations — the triple plus optional VALID
+ * TIME (when the relationship was true in the world; system temporal fields
+ * stay system-managed). Used by createRelations() and deleteRelations() callers
+ * (deleteRelations ignores the valid-time fields — matching is by triple). */
 export interface RelationInput {
   from: string;
   to: string;
   relationType: string;
+  validFrom?: string;   // ISO 8601 UTC; absent = unspecified (v14)
+  validUntil?: string;  // ISO 8601 UTC; absent = unspecified (v14)
 }
 
 /** Full relation as returned by queries — includes temporal tracking fields.
  * createdAt: ISO 8601 UTC when the relation was established (sentinel for legacy).
- * supersededAt: '' = active, ISO timestamp = invalidated. */
+ * supersededAt: '' = active, ISO timestamp = invalidated.
+ * validFrom/validUntil: VALID TIME (v14) — present only when the caller set them. */
 export interface Relation {
   from: string;
   to: string;
   relationType: string;
   createdAt: string;
   supersededAt: string;
+  validFrom?: string;
+  validUntil?: string;
 }
 
 /** Input for invalidate_relations — identifies relations to retire. */
@@ -77,6 +91,11 @@ export interface TimelineObservation {
   sourceInstance: string;
   /** 'active' = current, 'superseded' = retired by newer version, 'tombstoned' = content stripped by eviction. */
   status: 'active' | 'superseded' | 'tombstoned';
+  /** Valid time (v14) — present only when set. The timeline is exactly where
+   *  transaction time and valid time diverge visibly: createdAt/supersededAt
+   *  say when the DB learned/retired the fact; these say when it was true. */
+  validFrom?: string;
+  validUntil?: string;
 }
 
 /** Relation entry in an entity timeline — includes invalidated relations. */
@@ -361,6 +380,8 @@ export interface SetObservationMetadataInput {
   importance?: number;          // 1.0-5.0; only updated if provided
   contextLayer?: string | null; // 'L0', 'L1', or null (demote to L2); only updated if key is present
   memoryType?: string | null;   // free-form tag or null (unclassified); only updated if key is present
+  validFrom?: string | null;    // VALID TIME start (v14); ISO string sets, null clears; only updated if key is present
+  validUntil?: string | null;   // VALID TIME end (v14); ISO string sets, null clears; only updated if key is present
 }
 
 /** A single observation in a context layer response. L0 observations omit updatedAt

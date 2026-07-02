@@ -920,6 +920,41 @@ export class SqliteStore implements GraphStore {
       currentVersion = 13;
     }
 
+    if (currentVersion < 14) {
+      // Migration 13 → 14: VALID TIME (bi-temporal-lite, Phase F).
+      //
+      // The schema so far tracks TRANSACTION time only — created_at/superseded_at
+      // say when the DATABASE learned or retired a fact, not when the fact was
+      // true IN THE WORLD ("worked at X from 2019 to 2023" learned yesterday).
+      // Goal A explicitly wants "currently true vs was true at time T"; these
+      // columns are the missing half. Caller-supplied (no LLM date extraction —
+      // that's Graphiti-scale complexity, rejected at the audit), empty-string
+      // sentinel = unspecified (same convention as superseded_at). No query
+      // filtering yet — record/display only (DEF-RR-01: an as_of_valid param
+      // waits for a demonstrated query need).
+      //
+      // Race safety: try-catch-duplicate-column per ALTER (Issue #78 pattern)
+      // inside an IMMEDIATE transaction (house migration rule since v11).
+      this.db.transaction(() => {
+        for (const stmt of [
+          `ALTER TABLE observations ADD COLUMN valid_from TEXT NOT NULL DEFAULT ''`,
+          `ALTER TABLE observations ADD COLUMN valid_until TEXT NOT NULL DEFAULT ''`,
+          `ALTER TABLE relations ADD COLUMN valid_from TEXT NOT NULL DEFAULT ''`,
+          `ALTER TABLE relations ADD COLUMN valid_until TEXT NOT NULL DEFAULT ''`,
+        ]) {
+          try {
+            this.db.prepare(stmt).run();
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!msg.includes('duplicate column name')) throw err;
+            // Another process already added this column — safe to continue.
+          }
+        }
+        this.db.prepare('UPDATE schema_version SET version = 14').run();
+      }).immediate();
+      currentVersion = 14;
+    }
+
     // === Indexes (idempotent, run on every startup) ===
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
@@ -1613,8 +1648,9 @@ export class SqliteStore implements GraphStore {
       `SELECT name FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
     // INSERT stores the NORMALIZED form for from_entity / to_entity (post-v8).
+    // valid_from/valid_until (v14): caller-supplied valid time, '' = unspecified.
     const insert = this.db.prepare(
-      'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type, created_at, valid_from, valid_until) VALUES (?, ?, ?, ?, ?, ?)'
     );
 
     // ── Relation-type canonicalization (Phase C2, spec §6.3) ─────────────────
@@ -1670,7 +1706,7 @@ export class SqliteStore implements GraphStore {
         }
         const key = relationTypeKey(r.relationType);
         const relType = typeKeyMap.get(key) ?? r.relationType; // undefined (novel) / null (ambiguous) → verbatim
-        const info = insert.run(fromNorm, toNorm, relType, now);
+        const info = insert.run(fromNorm, toNorm, relType, now, r.validFrom ?? '', r.validUntil ?? '');
         if (info.changes > 0) {
           // Within-batch convergence: a novel type just written becomes the
           // spelling later items in this same batch canonicalize onto.
@@ -1686,6 +1722,8 @@ export class SqliteStore implements GraphStore {
             relationType: relType,
             createdAt: now,
             supersededAt: '',
+            ...(r.validFrom ? { validFrom: r.validFrom } : {}),
+            ...(r.validUntil ? { validUntil: r.validUntil } : {}),
           });
         }
       }
@@ -2253,11 +2291,13 @@ export class SqliteStore implements GraphStore {
 
       const obsRows = this.db.prepare(`
         SELECT o.entity_id AS entityId, o.content, o.created_at AS createdAt,
-               o.importance, o.context_layer, o.memory_type, o.source_instance
+               o.importance, o.context_layer, o.memory_type, o.source_instance,
+               o.valid_from, o.valid_until
         FROM observations o
         WHERE o.entity_id IN (${placeholders}) AND ${obsFilter.clause}
       `).all(...chunk, ...obsFilter.params) as { entityId: number; content: string; createdAt: string;
-        importance: number; context_layer: string | null; memory_type: string | null; source_instance: string }[];
+        importance: number; context_layer: string | null; memory_type: string | null; source_instance: string;
+        valid_from: string; valid_until: string }[];
 
       for (const o of obsRows) {
         if (!obsMap.has(o.entityId)) obsMap.set(o.entityId, []);
@@ -2268,6 +2308,10 @@ export class SqliteStore implements GraphStore {
           contextLayer: o.context_layer ?? null,
           memoryType: o.memory_type ?? null,
           sourceInstance: o.source_instance ?? 'unknown',
+          // Valid time (v14): '' sentinel = unspecified → field ABSENT in output,
+          // matching the optional-field conventions elsewhere in the API.
+          ...(o.valid_from ? { validFrom: o.valid_from } : {}),
+          ...(o.valid_until ? { validUntil: o.valid_until } : {}),
         });
       }
     }
@@ -2347,14 +2391,24 @@ export class SqliteStore implements GraphStore {
           COALESCE(et.name, r.to_entity)   AS "to",
           r.relation_type AS relationType,
           r.created_at    AS createdAt,
-          r.superseded_at AS supersededAt
+          r.superseded_at AS supersededAt,
+          r.valid_from    AS vf,
+          r.valid_until   AS vu
         FROM relations r
         LEFT JOIN entities ef ON ef.normalized_name = r.from_entity AND ef.superseded_at = ''
         LEFT JOIN entities et ON et.normalized_name = r.to_entity   AND et.superseded_at = ''
         WHERE (r.from_entity IN (${placeholders}) OR r.to_entity IN (${placeholders}))
           AND ${relFilter.clause}
-      `).all(...chunk, ...chunk, ...relFilter.params) as Relation[];
-      results.push(...rows);
+      `).all(...chunk, ...chunk, ...relFilter.params) as (Relation & { vf: string; vu: string })[];
+      // Valid time (v14): '' sentinel → field absent (optional-field convention).
+      for (const row of rows) {
+        const { vf, vu, ...rel } = row;
+        results.push({
+          ...rel,
+          ...(vf ? { validFrom: vf } : {}),
+          ...(vu ? { validUntil: vu } : {}),
+        });
+      }
     }
 
     // Deduplicate: chunked queries may return the same relation if its endpoints
@@ -3799,10 +3853,10 @@ export class SqliteStore implements GraphStore {
     // name, sorted chronologically. Unlike buildEntities() which filters
     // superseded_at = '', this returns everything for the timeline view.
     const obsRows = this.db.prepare(`
-      SELECT content, created_at, superseded_at, tombstoned_at, source_instance
+      SELECT content, created_at, superseded_at, tombstoned_at, source_instance, valid_from, valid_until
       FROM observations WHERE entity_id IN (${idPlaceholders})
       ORDER BY created_at ASC
-    `).all(...allEntityIds) as { content: string; created_at: string; superseded_at: string; tombstoned_at: string; source_instance: string }[];
+    `).all(...allEntityIds) as { content: string; created_at: string; superseded_at: string; tombstoned_at: string; source_instance: string; valid_from: string; valid_until: string }[];
 
     // Map DB rows to TimelineObservation with computed status field.
     // Three states: active (superseded_at=''), tombstoned (tombstoned_at!='', content stripped
@@ -3815,6 +3869,10 @@ export class SqliteStore implements GraphStore {
       status: o.tombstoned_at !== '' ? 'tombstoned' as const
             : o.superseded_at === '' ? 'active' as const
             : 'superseded' as const,
+      // Valid time (v14): the timeline is exactly where transaction time and
+      // valid time diverge visibly — surface when set ('' sentinel = absent).
+      ...(o.valid_from ? { validFrom: o.valid_from } : {}),
+      ...(o.valid_until ? { validUntil: o.valid_until } : {}),
     }));
 
     // Fetch ALL relations (active AND superseded) involving this entity.
@@ -4159,6 +4217,16 @@ export class SqliteStore implements GraphStore {
         if ('memoryType' in u) {
           setClauses.push('memory_type = ?');
           params.push(u.memoryType ?? null);
+        }
+        // Valid time (v14): string sets, explicit null clears back to the ''
+        // (unspecified) sentinel — same key-presence convention as contextLayer.
+        if ('validFrom' in u) {
+          setClauses.push('valid_from = ?');
+          params.push(u.validFrom ?? '');
+        }
+        if ('validUntil' in u) {
+          setClauses.push('valid_until = ?');
+          params.push(u.validUntil ?? '');
         }
 
         // Nothing to update — skip this entry.

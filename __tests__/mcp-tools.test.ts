@@ -595,6 +595,30 @@ describe('MCP Tool Handler Integration', () => {
 			expect(RerankSchema.safeParse({ query: 'foo', rerank: 'yes' }).success).toBe(false);
 		});
 
+		// ----- valid-time validation (v14, Phase F) -----
+		// Mirrors the production fields: same `.datetime({ offset: false })` chain
+		// as asOf, so stored values compare lexicographically against Z-suffixed
+		// system timestamps. Nullable on set_observation_metadata (null clears).
+		it('accepts Z-suffixed valid-time and rejects offsets/date-only (create_relations shape)', () => {
+			const VT = z.object({
+				validFrom: z.string().datetime({ offset: false }).optional(),
+				validUntil: z.string().datetime({ offset: false }).optional(),
+			});
+			expect(VT.safeParse({ validFrom: '2019-03-01T00:00:00.000Z' }).success).toBe(true);
+			expect(VT.safeParse({}).success).toBe(true);
+			expect(VT.safeParse({ validFrom: '2019-03-01T00:00:00+05:00' }).success).toBe(false);
+			expect(VT.safeParse({ validUntil: '2023-06-30' }).success).toBe(false);
+		});
+
+		it('accepts null valid-time on set_observation_metadata (clear semantics)', () => {
+			const VT = z.object({
+				validUntil: z.string().datetime({ offset: false }).nullable().optional(),
+			});
+			expect(VT.safeParse({ validUntil: null }).success).toBe(true);
+			expect(VT.safeParse({ validUntil: '2023-06-30T00:00:00.000Z' }).success).toBe(true);
+			expect(VT.safeParse({ validUntil: 'yesterday' }).success).toBe(false);
+		});
+
 		it('accepts omitting asOf (treats as undefined / current state)', () => {
 			const result = ReadGraphInputSchema.safeParse({});
 			expect(result.success).toBe(true);
