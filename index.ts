@@ -248,6 +248,7 @@ const PaginatedOutputSchema = {
   relations: z.array(RelationOutputSchema).describe("Page-local: only relations whose BOTH endpoints appear on the current page. NOT a complete relation set even across all pages — use open_nodes WITHOUT a projectId (full relations for specific entities; project-scoped open_nodes drops cross-project edges) or get_connected_context (connectivity/orphan analysis) instead."),
   nextCursor: z.string().nullable().describe("Cursor for the next page, or null if this is the last page"),
   totalCount: z.number().describe("Total number of matching entities across all pages"),
+  rankingUnavailable: z.boolean().optional().describe("Present (true) only when orderBy:'relevance' was requested but the backend cannot rank (JSONL has no FTS index) and results fell back to recency order."),
 };
 
 const server = new McpServer({
@@ -465,19 +466,23 @@ server.registerTool(
   "search_nodes",
   {
     title: "Search Nodes",
-    description: "Search for nodes in the knowledge graph. Returns matching entities sorted by most recently updated, paginated. Use the returned nextCursor to fetch subsequent pages. Omit cursor for the first page. NOTE: the returned `relations` are PAGE-LOCAL — a relation appears only when both its endpoints are on the current page, so the relation set is incomplete even across all pages. Use open_nodes (without a projectId) for an entity's full relations, or get_connected_context for traversal.",
+    description: "Search for nodes in the knowledge graph. Default order is most-recently-updated, paginated (use the returned nextCursor for subsequent pages; omit cursor for the first page). Pass orderBy:'relevance' to get the BEST-MATCHING entities instead — a rank fusion of substring, full-text (BM25), and semantic-vector matches, top-k only (no cursor, no asOf). Prefer relevance when hunting for the right memory by topic; prefer recency (default) when scanning what changed lately or when paginating. NOTE: the returned `relations` are PAGE-LOCAL — a relation appears only when both its endpoints are on the current page, so the relation set is incomplete even across all pages. Use open_nodes (without a projectId) for an entity's full relations, or get_connected_context for traversal.",
     inputSchema: {
       query: z.string().min(1).max(5000).describe("The search query to match against entity names, types, and observation content"),
       projectId: ProjectIdSchema,
-      cursor: z.string().max(10000).optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page."),
+      cursor: z.string().max(10000).optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page. Not compatible with orderBy:'relevance'."),
       limit: z.number().int().min(1).max(100).optional().default(40).describe("Max entities per page (default 40, max 100)"),
-      asOf: z.string().datetime({ offset: false }).optional().describe("ISO 8601 UTC timestamp (Z suffix only — no offsets). Returns graph state as it was at this moment. Omit for current state. When paginating, you MUST re-pass the same asOf on every page request — the cursor fingerprint encodes the temporal context, and a mismatched (or missing) asOf on a follow-up page will be rejected with InvalidCursorError."),
+      asOf: z.string().datetime({ offset: false }).optional().describe("ISO 8601 UTC timestamp (Z suffix only — no offsets). Returns graph state as it was at this moment. Omit for current state. When paginating, you MUST re-pass the same asOf on every page request — the cursor fingerprint encodes the temporal context, and a mismatched (or missing) asOf on a follow-up page will be rejected with InvalidCursorError. Not compatible with orderBy:'relevance'."),
       memoryType: z.string().min(1).max(50).optional().describe("Filter results to entities that have at least one observation with this memory_type (e.g., 'decision', 'procedure', 'preference'). Omit to search all types."),
+      orderBy: z.enum(['recency', 'relevance']).optional().describe("'recency' (default): updated_at DESC with cursor pagination — the historical behavior. 'relevance': fused ranking (substring + BM25 + vector), returns the top `limit` results with nextCursor always null; rejects cursor and asOf."),
     },
     outputSchema: PaginatedOutputSchema,
   },
-  async ({ query, projectId, cursor, limit, asOf, memoryType }) => {
-    const result = await store.searchNodes(query, normalizeProjectId(projectId), { cursor, limit }, asOf, memoryType);
+  async ({ query, projectId, cursor, limit, asOf, memoryType, orderBy }) => {
+    // Cross-field validation (cursor/asOf vs orderBy:'relevance') happens in the
+    // store's guard, not here: registerTool takes a per-field ZodRawShape, which
+    // has no cross-field refinement hook. The store throws a caller-readable error.
+    const result = await store.searchNodes(query, normalizeProjectId(projectId), { cursor, limit }, asOf, memoryType, orderBy);
     // When memoryType is set but no results found, add a hint — a typo in
     // memoryType silently returns empty and is indistinguishable from "no
     // entities of this type." The hint lists known types so the caller can

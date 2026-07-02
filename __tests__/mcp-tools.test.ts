@@ -117,6 +117,8 @@ const SearchNodesInputSchema = z.object({
 	asOf: AsOfSchema,
 	memoryType: z.string().min(1).max(50).optional()
 		.describe("Filter results to entities with at least one observation matching this memory_type"),
+	orderBy: z.enum(['recency', 'relevance']).optional()
+		.describe("'recency' (default) or 'relevance' (RRF-ranked top-k, no cursor/asOf)"),
 });
 
 /** Schema for read_graph input — optional projectId, cursor, limit, asOf */
@@ -563,6 +565,26 @@ describe('MCP Tool Handler Integration', () => {
 		it('rejects date-only asOf (no time component) on search_nodes', () => {
 			const result = SearchNodesInputSchema.safeParse({ query: 'foo', asOf: '2026-04-11' });
 			expect(result.success).toBe(false);
+		});
+
+		// ----- orderBy parameter validation (search_nodes relevance mode) -----
+		// The enum gate is Zod's job; the cursor/asOf incompatibility is enforced
+		// by the store-level guard (searchNodes throws), because registerTool's
+		// inputSchema is a per-field ZodRawShape with no cross-field refinement
+		// hook. The store guard's behavior is pinned in fts-search.test.ts.
+
+		it('accepts orderBy relevance and recency on search_nodes', () => {
+			expect(SearchNodesInputSchema.safeParse({ query: 'foo', orderBy: 'relevance' }).success).toBe(true);
+			expect(SearchNodesInputSchema.safeParse({ query: 'foo', orderBy: 'recency' }).success).toBe(true);
+		});
+
+		it('accepts omitted orderBy (defaults to recency behavior)', () => {
+			expect(SearchNodesInputSchema.safeParse({ query: 'foo' }).success).toBe(true);
+		});
+
+		it('rejects unknown orderBy values on search_nodes', () => {
+			expect(SearchNodesInputSchema.safeParse({ query: 'foo', orderBy: 'importance' }).success).toBe(false);
+			expect(SearchNodesInputSchema.safeParse({ query: 'foo', orderBy: '' }).success).toBe(false);
 		});
 
 		it('accepts omitting asOf (treats as undefined / current state)', () => {
