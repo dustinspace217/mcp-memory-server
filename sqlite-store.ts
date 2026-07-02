@@ -44,7 +44,9 @@ import {
   type PrecedentMatch,
   type FindPrecedentsResult,
   type FindPrecedentsOptions,
+  type SearchOrderBy,
 } from './types.js';
+import { fuseRanks, toFtsQuery } from './rank-fusion.js';
 import { JsonlStore } from './jsonl-store.js';
 import {
   type CursorPayload,
@@ -2397,7 +2399,22 @@ export class SqliteStore implements GraphStore {
    * @param pagination - Optional cursor and limit for paginated results; omit for all results
    * @returns PaginatedKnowledgeGraph with matching entities, relations, nextCursor, and totalCount
    */
-  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string, memoryType?: string): Promise<PaginatedKnowledgeGraph> {
+  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string, memoryType?: string, orderBy?: SearchOrderBy): Promise<PaginatedKnowledgeGraph> {
+    // Relevance mode is top-k only: rank is query-relative and shifts under
+    // mutation, so a keyset cursor over it would silently skip or duplicate
+    // results; and the FTS index holds only current content, so historical
+    // (asOf) ranking would be quietly wrong. Reject both loudly rather than
+    // degrade silently — the Zod layer in index.ts rejects these first for MCP
+    // callers; this guard covers direct GraphStore consumers.
+    if (orderBy === 'relevance') {
+      if (pagination?.cursor) {
+        throw new Error("orderBy:'relevance' does not support cursor pagination — ranked results are top-k; omit the cursor");
+      }
+      if (asOf) {
+        throw new Error("orderBy:'relevance' does not support asOf — the FTS index reflects current content only; use recency order for historical queries");
+      }
+    }
+
     const fingerprint = searchNodesFingerprint(projectId, query, asOf, memoryType);
 
     // When pagination is undefined, return all results (backward compat).
@@ -2474,6 +2491,16 @@ export class SqliteStore implements GraphStore {
       cteParams.push(normalizedProject);
     }
     cteSql += ')';
+
+    // ── Relevance mode: fuse LIKE / FTS / vector candidate lists, return top-k ──
+    // Branches here (after the CTE is assembled, before the recency outer query)
+    // so both modes share ONE definition of "what matches" — the matched_ids CTE
+    // with its project/memoryType/temporal filters. The recency path below is
+    // untouched: existing callers (SessionStart hooks, paginating consumers) see
+    // byte-identical behavior when orderBy is omitted.
+    if (orderBy === 'relevance') {
+      return this.searchNodesRanked(cteSql, cteParams, query, normalizedProject, memoryType, clampLimit(pagination?.limit));
+    }
 
     // Build WHERE conditions for the outer query on the entities table.
     // id IN (matched_ids) restricts to search matches; cursor condition paginates.
@@ -2683,6 +2710,204 @@ export class SqliteStore implements GraphStore {
     // Unscoped + unpaginated: OR logic for relations (at least one endpoint matches)
     const relations = this.getConnectedRelations(allEntityNamesList, asOf);
     return { entities, relations, nextCursor, totalCount };
+  }
+
+  /**
+   * Relevance-ranked search: fuses three entity-level candidate lists with
+   * weighted Reciprocal Rank Fusion (rank-fusion.ts) and returns the top-k.
+   *
+   * Receives: the matched_ids CTE (SQL + params) already assembled by
+   * searchNodes — so LIKE matching, project scoping, and memoryType filtering
+   * have ONE definition shared by both modes — plus the raw query for the FTS
+   * and vector lists, and the clamped page limit.
+   * Returns: PaginatedKnowledgeGraph with nextCursor always null (ranked
+   * results are top-k by design — see the guard in searchNodes) and totalCount
+   * = size of the fused candidate union.
+   *
+   * The three lists and their weights (design: 2026-07-02 spec §4.5):
+   *   1.0 LIKE  — substring recall over name/normalized/type/obs content,
+   *               recency-ordered (its natural order; recency is a reasonable
+   *               relevance prior among equal substring matches)
+   *   1.0 FTS   — BM25 over observation content (precision: quoted-token AND)
+   *   1.0 vector— KNN semantic matches, best-cosine-first (skipped unless the
+   *               embedding model is ready — same graceful degradation as the
+   *               recency path's augmentation)
+   * Phase B adds a 0.5-weight activation list computed over this union.
+   */
+  private async searchNodesRanked(
+    cteSql: string,
+    cteParams: (string | number)[],
+    query: string,
+    normalizedProject: string | undefined,
+    memoryType: string | undefined,
+    limit: number,
+  ): Promise<PaginatedKnowledgeGraph> {
+    // List 1 — LIKE candidates from the shared CTE, recency-ordered (no cursor,
+    // no LIMIT: the fused union IS the honest totalCount, and the corpus is
+    // hundreds of entities — a full candidate list is microseconds here).
+    const likeIds = (this.db.prepare(`
+      ${cteSql}
+      SELECT e.id FROM entities e JOIN matched_ids m ON m.id = e.id
+      ORDER BY e.updated_at DESC, e.id DESC
+    `).all(...cteParams) as { id: number }[]).map(r => r.id);
+
+    // List 2 — FTS/BM25 candidates, best score per entity. bm25() is
+    // lower-is-better in SQLite FTS5, hence MIN + ASC. The superseded_at=''
+    // join is the active-only filter (the index deliberately holds all rows —
+    // see the v11 migration comment). try/catch: a MATCH failure (sanitizer
+    // gap, malformed index) must degrade to no-FTS-list, not fail the search —
+    // same best-effort contract as the vector augmentation.
+    let ftsIds: number[] = [];
+    try {
+      // bm25() is an FTS5 AUXILIARY function: SQLite only allows it inside a
+      // plain full-text query on the FTS table itself. Both a direct aggregate
+      // (MIN(bm25(...)) + GROUP BY) AND a joined subquery fail with "unable to
+      // use function bm25 in the requested context" — the second because the
+      // query flattener folds the subquery back into the outer aggregate.
+      // Empirically verified 2026-07-02 (both forms failed in the test suite).
+      // The robust form: a MATERIALIZED CTE that is a PURE single-table
+      // full-text query (MATCH + bm25 in the SELECT list, nothing else);
+      // MATERIALIZED blocks the flattener, and all joins/filters/aggregation
+      // operate on the CTE's already-plain rows.
+      let ftsSql = `
+        WITH scored AS MATERIALIZED (
+          SELECT rowid AS obs_rowid, bm25(obs_fts) AS score
+          FROM obs_fts WHERE obs_fts MATCH ?
+        )
+        SELECT o.entity_id AS id, MIN(s.score) AS best
+        FROM scored s
+        JOIN observations o ON o.id = s.obs_rowid AND o.superseded_at = ''
+        JOIN entities e ON e.id = o.entity_id AND e.superseded_at = ''`;
+      const ftsParams: (string | number)[] = [toFtsQuery(query)];
+      if (memoryType) {
+        ftsSql += ' WHERE o.memory_type = ?';
+        ftsParams.push(memoryType);
+      }
+      if (normalizedProject) {
+        ftsSql += memoryType ? ' AND' : ' WHERE';
+        ftsSql += ' (e.project = ? OR e.project IS NULL)';
+        ftsParams.push(normalizedProject);
+      }
+      ftsSql += ' GROUP BY o.entity_id ORDER BY best ASC LIMIT 200';
+      ftsIds = (this.db.prepare(ftsSql).all(...ftsParams) as { id: number }[]).map(r => r.id);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`FTS candidate list failed (degrading to LIKE+vector): ${msg}`);
+    }
+
+    // List 3 — vector KNN candidates mapped to entities, best-cosine-first.
+    // Mirrors the recency path's augmentation block (same k policy, same
+    // active/project/memoryType hydration filters, same never-throw contract);
+    // differs in that KNN ORDER is preserved into an entity ranking:
+    // walking knnRows best-first and keeping first-seen entity ids ranks each
+    // entity by its single best-matching observation.
+    let vecIds: number[] = [];
+    if (this.vecTableExists && this.embeddingPipeline.state.status === 'ready') {
+      try {
+        const queryEmbedding = await this.embeddingPipeline.embed(query);
+        if (queryEmbedding) {
+          const baseK = limit * 2;
+          const knnK = Math.min(memoryType ? Math.max(baseK, 200) : baseK, 500);
+          const knnRows = this.db.prepare(`
+            SELECT observation_id, distance
+            FROM vec_observations
+            WHERE embedding MATCH ? AND k = ${knnK}
+          `).all(
+            Buffer.from(queryEmbedding.buffer, queryEmbedding.byteOffset, queryEmbedding.byteLength),
+          ) as { observation_id: string; distance: number }[];
+
+          if (knnRows.length > 0) {
+            const obsIds = knnRows.map(r => parseInt(r.observation_id, 10));
+            // Hydrate obs → entity with the same filters as the LIKE CTE.
+            const obsToEntity = new Map<number, number>();
+            for (let i = 0; i < obsIds.length; i += CHUNK_SIZE) {
+              const chunk = obsIds.slice(i, i + CHUNK_SIZE);
+              const placeholders = chunk.map(() => '?').join(',');
+              let vecSql = `
+                SELECT o.id AS obsId, e.id AS entId FROM observations o
+                JOIN entities e ON o.entity_id = e.id AND e.superseded_at = ''
+                WHERE o.id IN (${placeholders}) AND o.superseded_at = ''
+              `;
+              const vecParams: (string | number)[] = [...chunk];
+              if (memoryType) {
+                vecSql += ' AND o.memory_type = ?';
+                vecParams.push(memoryType);
+              }
+              if (normalizedProject) {
+                vecSql += ' AND (e.project = ? OR e.project IS NULL)';
+                vecParams.push(normalizedProject);
+              }
+              const rows = this.db.prepare(vecSql).all(...vecParams) as { obsId: number; entId: number }[];
+              for (const r of rows) obsToEntity.set(r.obsId, r.entId);
+            }
+            // knnRows is already distance-ordered; first-seen = best per entity.
+            const seen = new Set<number>();
+            for (const r of knnRows) {
+              const entId = obsToEntity.get(parseInt(r.observation_id, 10));
+              if (entId !== undefined && !seen.has(entId)) {
+                seen.add(entId);
+                vecIds.push(entId);
+              }
+            }
+          }
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`Vector candidate list failed (degrading to LIKE+FTS): ${msg}`);
+      }
+    }
+
+    // Fuse, rank (score DESC, id DESC for determinism on ties), take top-k.
+    const fused = fuseRanks<number>([
+      { weight: 1.0, ids: likeIds },
+      { weight: 1.0, ids: ftsIds },
+      { weight: 1.0, ids: vecIds },
+    ]);
+    const ranked = [...fused.entries()]
+      .sort((a, b) => (b[1] - a[1]) || (b[0] - a[0]))
+      .map(([id]) => id);
+    const totalCount = ranked.length;
+    const pageIds = ranked.slice(0, limit);
+
+    if (pageIds.length === 0) {
+      return { entities: [], relations: [], nextCursor: null, totalCount };
+    }
+
+    // Hydrate in fused order (SQL IN gives no ordering guarantee — reorder by map).
+    // limit is clamped to <=100, safely under the 900-variable chunking threshold.
+    const ph = pageIds.map(() => '?').join(',');
+    const rows = this.db.prepare(`
+      SELECT name, entity_type AS entityType, project, updated_at, created_at, id
+      FROM entities WHERE id IN (${ph}) AND superseded_at = ''
+    `).all(...pageIds) as { name: string; entityType: string; project: string | null; updated_at: string; created_at: string; id: number }[];
+    const rowById = new Map(rows.map(r => [r.id, r]));
+    const orderedRows = pageIds.flatMap(id => {
+      const row = rowById.get(id);
+      return row ? [row] : [];
+    });
+    const entities = this.buildEntities(orderedRows, undefined);
+
+    // Touch last_accessed_at — targeted search expresses intent, same as the
+    // recency path. (Relevance mode never has asOf; the guard rejected it.)
+    if (entities.length > 0) {
+      this.touchEntitiesByName(entities.map(e => normalizeEntityName(e.name)));
+    }
+
+    // Relations: both-endpoints-in-set, matching the paginated recency path's
+    // semantics — a ranked page is a curated set, and half-dangling edges would
+    // reference entities the caller can't see.
+    const entityNames = new Set(entities.map(e => e.name));
+    for (const entity of entities) {
+      try {
+        entityNames.add(normalizeEntityName(entity.name));
+      } catch {
+        // Name can't be normalized — display form is already in the set.
+      }
+    }
+    const allRelations = this.getConnectedRelations([...entityNames], undefined);
+    const relations = allRelations.filter(r => entityNames.has(r.from) && entityNames.has(r.to));
+
+    return { entities, relations, nextCursor: null, totalCount };
   }
 
   /**

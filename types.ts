@@ -181,7 +181,19 @@ export interface PaginationParams {
 export interface PaginatedKnowledgeGraph extends KnowledgeGraph {
   nextCursor: string | null;  // null = no more pages
   totalCount: number;         // Total matching entities (may vary between pages if data mutates)
+  /** Set true only when the caller asked for orderBy:'relevance' but the backend
+   *  can't rank (JSONL has no FTS index) and fell back to recency order. Absent
+   *  (not false) on the SQLite path — same optional-flag convention as
+   *  similarityCheckFailed on AddObservationResult. */
+  rankingUnavailable?: boolean;
 }
+
+/** Result ordering for searchNodes. 'recency' (default) = updated_at DESC with
+ *  keyset pagination — the historical behavior, stable for hooks that page.
+ *  'relevance' = weighted rank fusion of the LIKE / FTS(BM25) / vector candidate
+ *  lists, top-k only (no cursor; rank is query-relative and mutation-unstable,
+ *  so a keyset cursor over it would silently skip/duplicate). */
+export type SearchOrderBy = 'recency' | 'relevance';
 
 /**
  * Thrown when an opaque cursor string cannot be decoded or is structurally invalid.
@@ -457,8 +469,11 @@ export interface GraphStore {
    *  @param projectId - Optional project scope
    *  @param pagination - Optional cursor and limit
    *  @param asOf - Optional ISO 8601 UTC timestamp for point-in-time queries
-   *  @param memoryType - Optional filter: only return entities with at least one observation of this type (e.g., 'procedure', 'decision') */
-  searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string, memoryType?: string): Promise<Readonly<PaginatedKnowledgeGraph>>;
+   *  @param memoryType - Optional filter: only return entities with at least one observation of this type (e.g., 'procedure', 'decision')
+   *  @param orderBy - 'recency' (default, historical behavior) or 'relevance' (RRF over
+   *    LIKE/FTS/vector lists, top-k, no cursor). Incompatible with cursor and asOf —
+   *    SQLite throws; JSONL falls back to recency with rankingUnavailable: true. */
+  searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string, memoryType?: string, orderBy?: SearchOrderBy): Promise<Readonly<PaginatedKnowledgeGraph>>;
   /** Retrieves specific entities by exact name match plus connected relations.
    *  Non-existent names are silently skipped. Use this instead of readGraph when you
    *  need full relation context for a known set of entities.

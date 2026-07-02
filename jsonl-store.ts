@@ -22,6 +22,7 @@ import {
   type CreateEntitiesResult,
   type PaginationParams,
   type PaginatedKnowledgeGraph,
+  type SearchOrderBy,
   type SupersedeInput,
   type SetObservationMetadataInput,
   type CheckDuplicateInput,
@@ -809,9 +810,14 @@ export class JsonlStore implements GraphStore {
    * @param pagination - Optional cursor and limit for paginated results
    * @param asOf - Not supported in JSONL backend — throws if provided
    * @param memoryType - Optional filter: only return entities with matching observation type
+   * @param orderBy - 'relevance' is not supported here (no FTS index in JSONL);
+   *   the search falls back to recency order and sets rankingUnavailable: true,
+   *   the same degrade-with-a-flag pattern as vector search elsewhere. WHY not
+   *   throw like asOf does: a ranked search still has usable (recency) results,
+   *   whereas an as_of query answered from current state would be silently WRONG.
    * @returns PaginatedKnowledgeGraph with matching entities, relations, nextCursor, and totalCount
    */
-  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string, memoryType?: string): Promise<PaginatedKnowledgeGraph> {
+  async searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string, memoryType?: string, orderBy?: SearchOrderBy): Promise<PaginatedKnowledgeGraph> {
     if (asOf !== undefined) {
       throw new Error('as_of queries not supported in JSONL backend: migrate to SQLite');
     }
@@ -852,7 +858,13 @@ export class JsonlStore implements GraphStore {
       ? graph.relations.filter(r => filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to))
       : graph.relations.filter(r => filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to));
 
-    return this.paginateEntities(filteredEntities, filteredRelations, fingerprint, pagination);
+    const page = this.paginateEntities(filteredEntities, filteredRelations, fingerprint, pagination);
+    // Relevance ranking needs the FTS index that only the SQLite backend has;
+    // flag the fallback so callers can tell "ranked" from "recency-as-usual".
+    if (orderBy === 'relevance') {
+      return { ...page, rankingUnavailable: true };
+    }
+    return page;
   }
 
   /**
