@@ -54,9 +54,30 @@ describe('personalizedPageRank', () => {
 		const rank = personalizedPageRank([], new Map([['A', 1], ['B', 3]]));
 		// No spreading — each iteration re-deposits alpha · normalized seed.
 		// Seed weights need not be pre-normalized; B got 3× A's weight.
-		expect(rank.get('A')!).toBeGreaterThan(0);
-		expect(rank.get('B')!).toBeCloseTo(rank.get('A')! * 3, 12);
+		// ABSOLUTE values pin the internal normalization (review #86:
+		// the 3× ratio alone passes with normalization deleted — A=.5, B=1.5
+		// keeps the ratio; only alpha·w/Σ = .5·1/4 and .5·3/4 pins it):
+		expect(rank.get('A')!).toBeCloseTo(0.125, 12);
+		expect(rank.get('B')!).toBeCloseTo(0.375, 12);
 		expect(rank.size).toBe(2);
+	});
+
+	it('non-default alpha: kills the alpha↔(1−alpha) swap mutant (0.5 is a symmetry axis)', () => {
+		// At the default alpha=0.5 the share factor (1−alpha) and restart factor
+		// (alpha) are EQUAL, so swapping them anywhere is invisible to every
+		// default-alpha test (review finding). Hand walk at alpha=0.25 (share
+		// factor .75), chain A-B-C seeded {A:1}, 3 iterations:
+		//   iter1: A→B .75; restart A=.25            → A=.25,     B=.75
+		//   iter2: A→B .1875; B→A,C .28125 each;
+		//          restart A+=.25                    → A=.53125,  B=.1875,  C=.28125
+		//   iter3: A→B .3984375; B→A,C .0703125 each;
+		//          C→B .2109375; restart A+=.25      → A=.3203125, B=.609375, C=.0703125
+		// Note B > A — the low restart lets diffusion dominate, exactly the
+		// asymmetry the swap mutant erases.
+		const rank = personalizedPageRank([['A', 'B'], ['B', 'C']], new Map([['A', 1]]), { alpha: 0.25 });
+		expect(rank.get('A')!).toBeCloseTo(0.3203125, 12);
+		expect(rank.get('B')!).toBeCloseTo(0.609375, 12);
+		expect(rank.get('C')!).toBeCloseTo(0.0703125, 12);
 	});
 
 	it('is deterministic across runs (no randomness, stable iteration)', () => {

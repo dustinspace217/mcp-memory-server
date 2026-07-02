@@ -10,11 +10,23 @@
  */
 
 /**
+ * Default restart probability. Exported so callers that need to decompose a
+ * node's final rank into restart-mass vs received-diffusion (findPrecedents'
+ * rerank does: an isolated seed's rank is EXACTLY alpha × its normalized seed
+ * weight, so subtracting that term isolates the pure graph signal) use the
+ * same constant the walk used — a caller-side copy would silently drift.
+ */
+export const PPR_ALPHA = 0.5;
+
+/**
  * Personalized PageRank with a fixed, small iteration bound.
  *
  * Receives: undirected edges (each [a, b] — DIRECTION IS DELIBERATELY IGNORED:
  * relatedness flows both ways even when the stored verb is directed, e.g. an
- * incident is relevant to the rule it CAUSED and vice versa), plus seed nodes
+ * incident is relevant to the rule it CAUSED and vice versa; PARALLEL edges —
+ * the same pair related under several verbs, or both directions stored —
+ * duplicate the adjacency entry, implicitly weighting by multiplicity, which
+ * is deliberate: a pair connected three ways IS more related), plus seed nodes
  * with weights (e.g. cosine scores — they need not be normalized; they are
  * normalized internally).
  * Returns: Map of node → rank mass. Nodes never reached by diffusion are
@@ -37,7 +49,7 @@ export function personalizedPageRank(
 	seeds: ReadonlyMap<string, number>,
 	opts: { alpha?: number; iterations?: number } = {},
 ): Map<string, number> {
-	const alpha = opts.alpha ?? 0.5;
+	const alpha = opts.alpha ?? PPR_ALPHA;
 	const iterations = opts.iterations ?? 3;
 
 	// Adjacency list, undirected. Self-loops are dropped: a node diffusing to

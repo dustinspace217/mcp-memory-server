@@ -59,7 +59,7 @@ import {
 import { normalizeEntityName } from './normalize-name.js';
 import { checkAndEvict, type EvictionResult } from './evict.js';
 import { CORE_RELATION_TYPES, relationTypeKey, RELATION_VOCAB_FIXES } from './relation-types.js';
-import { personalizedPageRank } from './pagerank.js';
+import { personalizedPageRank, PPR_ALPHA } from './pagerank.js';
 
 /**
  * Checks if a file exists at the given path.
@@ -3582,7 +3582,10 @@ export class SqliteStore implements GraphStore {
     // reason (BM25 reorders candidates; it never nominates).
     const floored = precedents.filter(p => p.similarity >= minSimilarity);
     if (floored.length === 0) {
-      return { precedents: [], modelReady, vectorSearchEnabled, rerankApplied: true };
+      // Flag stays ABSENT: nothing fused. Consistent with the empty-KNN and
+      // embed-failure returns above — rerankApplied means "fusion ran over ≥1
+      // candidate", so all empty results read the same way (review finding).
+      return { precedents: [], modelReady, vectorSearchEnabled };
     }
     const flooredIds = new Set(floored.map(p => Number(p.observationId)));
 
@@ -3594,9 +3597,10 @@ export class SqliteStore implements GraphStore {
 
     // List 2 — parent-entity PageRank. Seeds = each candidate's entity at its
     // best cosine; edges = the ACTIVE relation graph (both endpoints normalized,
-    // ~500 rows — milliseconds of pure JS). Observations whose entity received
-    // no rank mass are EXCLUDED (absent = zero contribution), mirroring the
-    // activation list's never-boost-the-unconnected rule in searchNodesRanked.
+    // ~500 rows — milliseconds of pure JS). Note the edges are deliberately
+    // project-UNSCOPED: relatedness crosses project boundaries, and the
+    // CANDIDATES are already project-scoped by hydration — PPR only reorders
+    // them, so cross-project edges can inform the order but never leak entities.
     const seeds = new Map<string, number>();
     for (const p of floored) {
       const norm = entityNormByObsId.get(Number(p.observationId));
@@ -3605,13 +3609,25 @@ export class SqliteStore implements GraphStore {
       }
     }
     const edges = this.db.prepare(
-      `SELECT from_entity, to_entity FROM relations WHERE superseded_at = '' AND tombstoned_at = ''`
+      `SELECT from_entity, to_entity FROM relations WHERE superseded_at = ''`
     ).all() as { from_entity: string; to_entity: string }[];
     const ppr = personalizedPageRank(edges.map(e => [e.from_entity, e.to_entity] as const), seeds);
+    // The GRAPH signal is the diffusion a node RECEIVED, not its own restart
+    // mass: every seed exits the walk with rank ≥ PPR_ALPHA × its normalized
+    // seed weight regardless of connectivity (an isolated seed's rank is
+    // EXACTLY that — same multiplication each iteration, so the subtraction
+    // below is floating-point exact and the > 0 filter is safe). Without the
+    // subtraction the filter is dead code and list 2 degenerates into a
+    // rescaled copy of the cosine list for isolated entities (review #86:
+    // Phase E code-reviewer major — "never boost the unconnected" must be
+    // enforced by construction, not asserted in a comment).
+    const seedTotal = [...seeds.values()].reduce((sum, v) => sum + v, 0) || 1;
     const pprIds = floored
       .map(p => {
         const norm = entityNormByObsId.get(Number(p.observationId));
-        return { id: Number(p.observationId), score: norm !== undefined ? (ppr.get(norm) ?? 0) : 0, sim: p.similarity };
+        const restart = norm !== undefined ? PPR_ALPHA * ((seeds.get(norm) ?? 0) / seedTotal) : 0;
+        const received = norm !== undefined ? (ppr.get(norm) ?? 0) - restart : 0;
+        return { id: Number(p.observationId), score: received, sim: p.similarity };
       })
       .filter(x => x.score > 0)
       .sort((a, b) => (b.score - a.score) || (b.sim - a.sim) || (b.id - a.id))

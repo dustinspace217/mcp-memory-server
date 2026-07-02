@@ -171,9 +171,10 @@ export interface FindPrecedentsResult {
   modelReady: boolean;          // embedding model loaded?
   vectorSearchEnabled: boolean; // vec table present (MEMORY_VECTOR_SEARCH !== 'off')?
   /** Present (true) only when opts.rerank was requested AND the graph-aware
-   *  fusion actually ran. Absent when rerank was off, or when the degraded
-   *  path returned empty before reranking could apply — so the caller can
-   *  distinguish "reranked order" from "pure cosine order". */
+   *  fusion actually ran over at least one floor-gated candidate. Absent when
+   *  rerank was off, on the degraded path, and on EVERY empty result (nothing
+   *  fused) — so the caller can distinguish "reranked order" from "pure cosine
+   *  order", and empty results read uniformly. */
   rerankApplied?: boolean;
 }
 

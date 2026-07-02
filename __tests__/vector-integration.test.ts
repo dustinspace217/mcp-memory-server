@@ -359,6 +359,28 @@ describe('Vector search integration', () => {
     expect(plain.precedents.length).toBeGreaterThan(0);
   });
 
+  it('rerank: BM25 never resurrects a below-floor match (floor-before-fusion pin)', async () => {
+    // Review #86 gap #1: a lexically-strong decoy whose cosine falls
+    // below a high floor must NOT appear — the BM25 list is intersected with
+    // the floored set (reorders, never nominates). Construction: the target is
+    // the query verbatim (cosine ≈ 0.99+); the decoy embeds every query token
+    // in an unrelated sentence (strong BM25, cosine well under 0.9). The
+    // 0.9-floor-vs-~0.99-target margin is robust across embedding versions.
+    await store.createEntities([
+      { name: 'floor-target', entityType: 'note', observations: ['periodic error correction for the mount worm gear'] },
+      { name: 'floor-decoy', entityType: 'note', observations: ['my grocery list: periodic error correction mount worm gear apples bananas cheese'] },
+    ], undefined);
+    await new Promise(resolve => setTimeout(resolve, 2500)); // embedding sweep
+
+    const res = await store.findPrecedents('periodic error correction for the mount worm gear', undefined, { limit: 5, minSimilarity: 0.9, rerank: true });
+    const names = res.precedents.map(p => p.entityName);
+    expect(names).toContain('floor-target');
+    expect(names).not.toContain('floor-decoy'); // below floor; BM25 must not nominate it
+    for (const p of res.precedents) {
+      expect(p.similarity).toBeGreaterThanOrEqual(0.9);
+    }
+  });
+
   it('relevance mode vector list respects projectId scoping', async () => {
     await store.createEntities([
       { name: 'scoped-telescope', entityType: 'gear', observations: ['A refractor instrument for viewing far-off nebulae at night'] },

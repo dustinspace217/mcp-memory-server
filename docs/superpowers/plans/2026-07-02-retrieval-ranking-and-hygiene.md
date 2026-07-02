@@ -31,6 +31,26 @@ gates BEFORE fusion; BM25 intersected with the floored set — reorders, never n
 path). 672 tests green (659 + 13). DEF-RR-02 (blind gate before default flip) remains open —
 shipping dark as planned.
 
+### Phase E QA stabilization (2026-07-02 ~09:45, Discussion #86 findings applied)
+1. **[behavioral-change — the dead-filter major]** The PPR list's `score > 0` filter was dead code:
+   every floored candidate is a seed and every seed exits the walk with ≥ alpha·seedProb (restart
+   mass), so isolated entities were getting a rescaled-cosine boost — the comment claimed exclusion
+   the code didn't do. Fixed by subtracting the restart component (an isolated seed's rank is
+   EXACTLY alpha·seedProb — same multiplication each iteration, so the subtraction is FP-exact and
+   the > 0 filter is sound); `PPR_ALPHA` exported so the caller's decomposition can't drift from
+   the walk's constant. The graph signal is now received-diffusion only, by construction.
+2. **[behavioral-change — flag consistency]** Empty-floored return no longer sets `rerankApplied`
+   — all three empty paths read uniformly (flag = fusion ran over ≥1 candidate; types updated).
+   Redundant `tombstoned_at` predicate dropped from the edges query (sibling-path consistency).
+3. **[other — test rigor]** alpha=0.25 hand-walk added (test-analyzer: alpha=0.5 is a SYMMETRY
+   AXIS — an alpha↔(1−alpha) swap mutant survived all five default-alpha tests; the 0.25 walk's
+   B>A asymmetry kills it; derivation independently verified before adoption); absolute-value
+   normalization pin (the 3× ratio alone passed with normalization deleted); Pool 2 below-floor
+   BM25-decoy fixture (kills floor-removal and intersect-removal mutants). Parallel-edge
+   multiplicity weighting documented in pagerank JSDoc. Project-unscoped edges documented as
+   deliberate (candidates are already scoped by hydration; PPR reorders, never leaks).
+4. **[deferment]** DEF-RR-02 unchanged (blind gate before default flip). 674 tests (660 + 14).
+
 **Goal:** Relevance-ranked hybrid search, retrieval strengthening, graph hygiene, valid-time
 fields, graph-aware precedent rerank, and a gated embedding-model eval — the full approved output
 of the 2026-07-02 audit.
