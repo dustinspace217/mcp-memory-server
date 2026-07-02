@@ -301,6 +301,60 @@ describe('searchNodes relevance mode', () => {
 		expect(punct.entities.map(e => e.name)).toContain('DiacriticEnt');
 	});
 
+	it('activation reranks: an accessed entity beats an equal never-accessed one', async () => {
+		// Phase B2. Construction makes the outcome hand-derivable regardless of
+		// FTS tie-breaking: entity A is created normally (access_count ≥ 1, on
+		// the activation list); entity B is inserted via RAW SQL with a NEWER
+		// updated_at and access_count 0 — never accessed, so it contributes to
+		// LIKE/FTS but is EXCLUDED from the activation list (-Infinity).
+		// Hand math (weights: LIKE 1.0, FTS 1.0, activation 0.5):
+		//   B (LIKE rank 0, newer): 1/61 + fts_B
+		//   A (LIKE rank 1):        1/62 + fts_A + 0.5/61 (activation rank 0)
+		// Even in the worst FTS tie order (B first): A ≈ .0164+.0161+.0082=.0405
+		// vs B ≈ .0164+.0164=.0328 → A wins on activation alone.
+		await store.createEntities([
+			{ name: 'AccessedEnt', entityType: 'test', observations: ['activation probe target alpha'] },
+		]);
+		// Raw-insert the never-accessed twin (bypasses the store's touch-on-create;
+		// the FTS insert trigger indexes its observation automatically).
+		const db = new Database(dbPath);
+		try {
+			const future = new Date(Date.now() + 60_000).toISOString(); // strictly newer updated_at
+			db.prepare(
+				`INSERT INTO entities (name, normalized_name, entity_type, updated_at, created_at) VALUES (?, ?, ?, ?, ?)`
+			).run('ColdEnt', 'coldent', 'test', future, future);
+			const entId = (db.prepare(`SELECT id FROM entities WHERE name = 'ColdEnt'`).get() as { id: number }).id;
+			db.prepare(
+				`INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)`
+			).run(entId, 'activation probe target beta', future);
+		} finally {
+			db.close();
+		}
+		const rel = await store.searchNodes('activation probe', undefined, { limit: 10 }, undefined, undefined, 'relevance');
+		const names = rel.entities.map(e => e.name);
+		expect(names).toContain('ColdEnt');           // still a member (LIKE+FTS nominate it)
+		expect(names[0]).toBe('AccessedEnt');         // activation decides the order
+		// Recency mode control: the raw-inserted twin is newer → it wins there,
+		// proving the inversion above came from activation, not list membership.
+		const rec = await store.searchNodes('activation probe', undefined, { limit: 10 });
+		expect(rec.entities[0].name).toBe('ColdEnt');
+	});
+
+	it('activation never nominates: a hot but irrelevant entity stays out', async () => {
+		await seedRelevanceFixture();
+		await store.createEntities([
+			{ name: 'HotUnrelated', entityType: 'test', observations: ['completely different topic entirely'] },
+		]);
+		// Heat it up: repeated intentional access.
+		for (let i = 0; i < 5; i++) {
+			await store.openNodes(['HotUnrelated']);
+		}
+		const rel = await store.searchNodes('vector search', undefined, { limit: 10 }, undefined, undefined, 'relevance');
+		// Activation only RERANKS the LIKE/FTS/vector candidate union — it must
+		// never pull a non-matching entity into the results (spec §5.4).
+		expect(rel.entities.map(e => e.name)).not.toContain('HotUnrelated');
+	});
+
 	it('reports rankingDegraded when the FTS list is lost, and omits it on healthy runs', async () => {
 		await seedRelevanceFixture();
 		// Healthy run first (vectors are configured OFF in Pool 1 = 'unavailable'

@@ -46,7 +46,7 @@ import {
   type FindPrecedentsOptions,
   type SearchOrderBy,
 } from './types.js';
-import { fuseRanks, toFtsQuery } from './rank-fusion.js';
+import { fuseRanks, toFtsQuery, activationScore } from './rank-fusion.js';
 import { JsonlStore } from './jsonl-store.js';
 import {
   type CursorPayload,
@@ -2799,7 +2799,9 @@ export class SqliteStore implements GraphStore {
    *   1.0 vector— KNN semantic matches, best-cosine-first (skipped unless the
    *               embedding model is ready — same graceful degradation as the
    *               recency path's augmentation)
-   * Phase B adds a 0.5-weight activation list computed over this union.
+   *   0.5 activation — ACT-R retrieval strength (access_count + recency of
+   *               last access), computed ONLY over the union of the three
+   *               lists above; reranks candidates, never nominates them.
    */
   private async searchNodesRanked(
     cteSql: string,
@@ -2943,11 +2945,42 @@ export class SqliteStore implements GraphStore {
       degraded.push('vector');
     }
 
+    // List 4 — ACT-R activation rerank over the candidate UNION (Phase B).
+    // LOAD-BEARING CONSTRAINT: activation NEVER nominates — it is computed only
+    // over entities already nominated by LIKE/FTS/vector. A global activation
+    // list would let frequently-accessed-but-irrelevant entities flood every
+    // query (spec §5.4). Weight 0.5 (half the relevance lists): retrieval
+    // strength nudges among relevant candidates, it never overrides relevance.
+    // Never-accessed entities (activationScore -Infinity) are EXCLUDED rather
+    // than ranked last: appearing at the list's tail would still hand them RRF
+    // points, and "no retrieval history" should contribute exactly nothing.
+    const unionIds = [...new Set([...likeIds, ...ftsIds, ...vecIds])];
+    let activationIds: number[] = [];
+    if (unionIds.length > 0) {
+      const nowMs = Date.now();
+      const scored: { id: number; a: number }[] = [];
+      for (let i = 0; i < unionIds.length; i += CHUNK_SIZE) {
+        const chunk = unionIds.slice(i, i + CHUNK_SIZE);
+        const placeholders = chunk.map(() => '?').join(',');
+        const rows = this.db.prepare(
+          `SELECT id, access_count, last_accessed_at FROM entities WHERE id IN (${placeholders})`
+        ).all(...chunk) as { id: number; access_count: number; last_accessed_at: string }[];
+        for (const r of rows) {
+          const a = activationScore(r.access_count, r.last_accessed_at, nowMs);
+          if (a > -Infinity) scored.push({ id: r.id, a });
+        }
+      }
+      activationIds = scored
+        .sort((x, y) => (y.a - x.a) || (y.id - x.id)) // deterministic tie-break, matches the fused sort
+        .map(x => x.id);
+    }
+
     // Fuse, rank (score DESC, id DESC for determinism on ties), take top-k.
     const fused = fuseRanks<number>([
       { weight: 1.0, ids: likeIds },
       { weight: 1.0, ids: ftsIds },
       { weight: 1.0, ids: vecIds },
+      { weight: 0.5, ids: activationIds },
     ]);
     const ranked = [...fused.entries()]
       .sort((a, b) => (b[1] - a[1]) || (b[0] - a[0]))
