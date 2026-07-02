@@ -617,6 +617,32 @@ describe('FTS triggers under raw-SQL observation writes', () => {
 			db.close();
 		}
 	});
+
+	it('tombstone marker never surfaces in search (Issue #83 invariant pin)', async () => {
+		// The post-#83 strip marker '[evicted:<id>]' tokenizes to REAL FTS
+		// tokens ("evicted", the id) — unlike the old '', which was unmatchable
+		// by construction. Its invisibility therefore rests entirely on the
+		// superseded_at='' join every search path carries (tombstoned rows are
+		// always superseded — deleteEntities cascades in one transaction). A
+		// comment can't fail CI when a refactor drops that join; this pin can
+		// (QA cross-exam 2026-07-02). Guards recency AND relevance in one shot.
+		await store.createEntities([
+			{ name: 'MarkerLeakProbe', entityType: 'test', observations: ['quokka sanctuary logistics'] },
+		]);
+		await store.deleteEntities(['MarkerLeakProbe']);
+		const db = new Database(dbPath);
+		try {
+			// Real Tier-2 shape: strip to the marker + stamp tombstoned_at.
+			db.prepare(`UPDATE observations SET content = '[evicted:' || id || ']', tombstoned_at = ? WHERE content = ?`)
+				.run(new Date().toISOString(), 'quokka sanctuary logistics');
+		} finally {
+			db.close();
+		}
+		const recency = await store.searchNodes('evicted');
+		expect(recency.entities).toHaveLength(0);
+		const relevance = await store.searchNodes('evicted', undefined, { limit: 10 }, undefined, undefined, 'relevance');
+		expect(relevance.entities).toHaveLength(0);
+	});
 });
 
 // ── JSONL backend: relevance gracefully degrades to recency + flag ────────────
