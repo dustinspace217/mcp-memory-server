@@ -40,6 +40,11 @@ export interface RankedList<K> {
  * fusion would need per-list normalization (fragile, distribution-dependent);
  * rank-based fusion needs none and is robust to outliers. The formula is
  * score(id) = Σ over lists of weight / (RRF_K + rank + 1), rank 0-based.
+ *
+ * PRECONDITION: ids must be unique WITHIN each list. A duplicated id receives
+ * a contribution per occurrence (double-counted). All current callers satisfy
+ * this structurally (SELECT DISTINCT / GROUP BY / a first-seen Set) — if a
+ * future list can't, dedup it before fusing. Pinned by an exact-value test.
  */
 export function fuseRanks<K>(lists: RankedList<K>[]): Map<K, number> {
 	const scores = new Map<K, number>();
@@ -66,10 +71,30 @@ export function fuseRanks<K>(lists: RankedList<K>[]): Map<K, number> {
  * precision bias, because the LIKE candidate list (substring, always runs
  * alongside) provides the recall for partial/looser matches.
  *
- * Empty input returns '""' — a valid FTS5 phrase that matches nothing.
+ * Tokens containing NO letter or digit (`-`, `&`, `->`, emoji) are DROPPED
+ * before quoting: unicode61 tokenizes them to zero tokens, producing an empty
+ * phrase. Empirically probed 2026-07-02 (review Discussion #82): the bundled
+ * SQLite treats an empty phrase inside an AND chain as a no-op, but a LONE
+ * empty phrase matches nothing, and the in-conjunction no-op is undocumented
+ * behavior a SQLite upgrade could change (older parsers reportedly throw).
+ * Dropping the tokens removes the reliance entirely. The `/[\p{L}\p{N}]/u`
+ * test approximates unicode61's default token characters (note `_` is
+ * punctuation to unicode61, unlike JS `\w`); mismatches fail safe — a wrongly
+ * kept token just matches nothing in a chain the probe showed tolerates it.
+ * Order matters: whole tokens are dropped BEFORE quote-doubling — stripping
+ * characters after doubling could delete half of a doubled quote pair and
+ * reopen the phrase-breakout hole the doubling closes. NUL bytes are stripped
+ * first for the same reason (they truncate the MATCH string at a C boundary,
+ * leaving an unbalanced quote).
+ *
+ * Empty/whitespace-only/all-punctuation input returns '""' — a valid FTS5
+ * phrase that matches nothing (there is no text signal to search for).
  */
 export function toFtsQuery(raw: string): string {
-	const tokens = raw.split(/\s+/).filter(t => t.length > 0);
+	const tokens = raw
+		.replace(/\u0000/g, '')
+		.split(/\s+/)
+		.filter(t => /[\p{L}\p{N}]/u.test(t));
 	if (tokens.length === 0) return '""';
 	return tokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' ');
 }

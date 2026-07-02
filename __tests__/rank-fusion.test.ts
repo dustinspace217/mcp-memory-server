@@ -33,6 +33,25 @@ describe('fuseRanks', () => {
 		expect(scores.get('A')!).toBeCloseTo(0.5 / 61, 10);
 	});
 
+	it('computes the exact RRF contribution OFF the rank-0 axis', () => {
+		// Review finding (Discussion #82, test-analyzer): a rank-0 probe sits on
+		// the symmetry axis where the rank term vanishes — a mutant denominator
+		// like (60 + 2*rank + 1) passes it. Rank 1 kills that mutant class:
+		// hand derivation: A at rank 1, weight 1 → 1/(60+1+1) = 1/62
+		// (mutant would give 1/63 — distinguishable at 10 decimal places).
+		const scores = fuseRanks([{ weight: 1, ids: ['x', 'A'] }]);
+		expect(scores.get('A')!).toBeCloseTo(1 / 62, 10);
+	});
+
+	it('double-counts an id duplicated WITHIN one list (documented precondition pin)', () => {
+		// fuseRanks requires unique ids per list (see JSDoc); this pins the
+		// actual behavior when the precondition is violated, so a future caller
+		// that forgets to dedup fails a test instead of silently reranking:
+		// A at ranks 0 and 1 → 1/61 + 1/62.
+		const scores = fuseRanks([{ weight: 1, ids: ['A', 'A'] }]);
+		expect(scores.get('A')!).toBeCloseTo(1 / 61 + 1 / 62, 10);
+	});
+
 	it('a high rank on a heavy list can beat a low rank on a light list', () => {
 		// Hand derivation: A rank 4 on weight-1.0 list → 1/65 ≈ 0.01538.
 		// B rank 0 on weight-0.5 list → 0.5/61 ≈ 0.00820. A must beat B —
@@ -73,6 +92,26 @@ describe('toFtsQuery', () => {
 		expect(toFtsQuery('')).toBe('""');
 		expect(toFtsQuery('   ')).toBe('""');
 	});
+
+	it('drops tokens with no letter or digit (they tokenize to empty phrases)', () => {
+		// Review finding (Discussion #82, adversarial-tester + 3 concurring
+		// lenses): `-`, `&`, `->`, emoji produce empty FTS5 phrases. Probed
+		// 2026-07-02: current SQLite tolerates them inside an AND chain (no-op)
+		// but a LONE one matches nothing, and the no-op is undocumented — so
+		// the sanitizer drops them rather than relying on parser mercy.
+		expect(toFtsQuery('vector - search')).toBe('"vector" "search"');
+		expect(toFtsQuery('foo & bar')).toBe('"foo" "bar"');
+		expect(toFtsQuery('🔭 mount')).toBe('"mount"');
+		expect(toFtsQuery('->')).toBe('""');       // all-punctuation → no-match phrase
+		expect(toFtsQuery('a->b')).toBe('"a->b"'); // has letters → kept whole (quoting handles the rest)
+	});
+
+	it('strips NUL bytes before quoting (C-boundary truncation guard)', () => {
+		// A NUL inside a quoted phrase can truncate the MATCH string at a C
+		// boundary, leaving an unbalanced quote (parse error → silent FTS-list
+		// loss). Stripped before tokenization.
+		expect(toFtsQuery('foo\u0000bar baz')).toBe('"foobar" "baz"');
+	});
 });
 
 describe('activationScore', () => {
@@ -103,6 +142,14 @@ describe('activationScore', () => {
 		// Entities migrated from pre-v9 data can carry the '0000-00-00…' sentinel;
 		// Date.parse yields NaN and the entity must sort with the never-accessed.
 		expect(activationScore(5, '0000-00-00T00:00:00.000Z', NOW)).toBe(-Infinity);
+	});
+
+	it('computes the exact ACT-R value (pins d=0.5 and the ln form)', () => {
+		// Review finding (Discussion #82): without an exact probe, a mutant with
+		// d=0.9 or log2 passes every monotonicity test. Hand derivation for
+		// count=3, exactly 24h ago: ln(1+3) − 0.5·ln(1+24)
+		// = 1.3862943611 − 0.5·3.2188758249 = −0.2231435513.
+		expect(activationScore(3, '2026-07-01T00:00:00.000Z', NOW)).toBeCloseTo(-0.2231435513, 8);
 	});
 
 	it('a future last_accessed_at clamps to zero elapsed (clock skew guard)', () => {

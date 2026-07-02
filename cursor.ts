@@ -92,8 +92,12 @@ export function decodeCursor(cursor: string, expectedFingerprint: string): Curso
 export function clampLimit(limit?: number): number {
   // Handle undefined, NaN, Infinity, and other non-finite values
   if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_PAGE_SIZE;
-  // Math.max/min ensures the value stays within [1, MAX_PAGE_SIZE]
-  return Math.max(1, Math.min(limit, MAX_PAGE_SIZE));
+  // Math.floor: MCP callers are integer-gated by Zod (.int()), but direct
+  // GraphStore consumers can pass 2.7 — which would flow into computed KNN
+  // parameters (k = limit*2 → 5.4) and error sqlite-vec into its degraded
+  // path. Force an integer here so every downstream arithmetic is safe.
+  // Math.max/min ensures the value stays within [1, MAX_PAGE_SIZE].
+  return Math.max(1, Math.min(Math.floor(limit), MAX_PAGE_SIZE));
 }
 
 /**

@@ -253,13 +253,151 @@ describe('searchNodes relevance mode', () => {
 
 	it('rejects cursor and asOf combined with relevance mode (store-level guard)', async () => {
 		await seedRelevanceFixture();
-		// Grab a real cursor from a recency query so the guard (not cursor decoding) is what trips.
+		// The cursor value never gets decoded: the relevance guard fires before
+		// decodeCursor, so an arbitrary string isolates the guard (not cursor
+		// validation) as the thrower — pinned by matching the guard's message.
 		await expect(
 			store.searchNodes('vector search', undefined, { limit: 1, cursor: 'anything' }, undefined, undefined, 'relevance')
 		).rejects.toThrow(/relevance/);
 		await expect(
 			store.searchNodes('vector search', undefined, { limit: 1 }, '2026-01-01T00:00:00.000Z', undefined, 'relevance')
 		).rejects.toThrow(/relevance/);
+	});
+
+	it('explicit orderBy recency matches omitted orderBy exactly', async () => {
+		// Pins that 'recency' is a true default, not a third behavior.
+		await seedRelevanceFixture();
+		const omitted = await store.searchNodes('vector search', undefined, { limit: 10 });
+		const explicit = await store.searchNodes('vector search', undefined, { limit: 10 }, undefined, undefined, 'recency');
+		expect(explicit.entities.map(e => e.name)).toEqual(omitted.entities.map(e => e.name));
+		expect(explicit.totalCount).toBe(omitted.totalCount);
+	});
+
+	it('floors a fractional limit from direct store callers (clampLimit hardening)', async () => {
+		// MCP callers are integer-gated by Zod; direct GraphStore consumers are
+		// not — 2.7 must floor to 2 rather than flowing into KNN k-arithmetic.
+		await seedRelevanceFixture();
+		await store.createEntities([
+			{ name: 'EntC', entityType: 'test', observations: ['a third note about vector search tuning'] },
+		]);
+		const rel = await store.searchNodes('vector search', undefined, { limit: 2.7 }, undefined, undefined, 'relevance');
+		expect(rel.entities.length).toBe(2);
+	});
+
+	it('FTS-only membership: diacritic-folded matches appear in relevance mode, and survive punctuation tokens', async () => {
+		// 'Voilà' is invisible to LIKE's ASCII-only case fold (à ≠ a) but the
+		// FTS unicode61 remove_diacritics tokenizer folds it — so this entity's
+		// presence in relevance results proves the FTS list contributes real
+		// MEMBERSHIP (not just reordering), end-to-end through the store.
+		await store.createEntities([
+			{ name: 'DiacriticEnt', entityType: 'test', observations: ['Voilà: provençal observations'] },
+		]);
+		const clean = await store.searchNodes('voila', undefined, { limit: 10 }, undefined, undefined, 'relevance');
+		expect(clean.entities.map(e => e.name)).toContain('DiacriticEnt');
+		// Punctuation token in the query must not cost the FTS list (review
+		// Discussion #82 finding: pre-fix, '"voila" "-"' relied on undocumented
+		// empty-phrase tolerance; the sanitizer now drops the '-' token).
+		const punct = await store.searchNodes('voila -', undefined, { limit: 10 }, undefined, undefined, 'relevance');
+		expect(punct.entities.map(e => e.name)).toContain('DiacriticEnt');
+	});
+
+	it('reports rankingDegraded when the FTS list is lost, and omits it on healthy runs', async () => {
+		await seedRelevanceFixture();
+		// Healthy run first (vectors are configured OFF in Pool 1 = 'unavailable'
+		// = deliberate configuration, NOT degradation — flag must be absent).
+		const healthy = await store.searchNodes('vector search', undefined, { limit: 10 }, undefined, undefined, 'relevance');
+		expect(healthy.rankingDegraded).toBeUndefined();
+		// Break the FTS index out from under the store (simulates index corruption
+		// or an FTS5-less rebuild). Dropping the table makes the MATCH throw into
+		// the degradation path. NOTE: this also breaks the insert triggers, so no
+		// writes after this point in the test.
+		const db = new Database(dbPath);
+		try {
+			db.exec('DROP TABLE obs_fts');
+		} finally {
+			db.close();
+		}
+		const degraded = await store.searchNodes('vector search', undefined, { limit: 10 }, undefined, undefined, 'relevance');
+		expect(degraded.rankingDegraded).toEqual(['fts']);
+		// Results still come back via the LIKE list — degraded, not dead.
+		expect(degraded.entities.length).toBeGreaterThan(0);
+	});
+});
+
+// ── Sanitizer vs the real FTS5 parser (round-trip; the contract is the parser,
+//    not a string shape — review Discussion #82, test-analyzer + security) ─────
+
+describe('toFtsQuery round-trip through real FTS5', () => {
+	it('hostile inputs neither throw nor match unintended rows', async () => {
+		const { toFtsQuery } = await import('../rank-fusion.js');
+		const db = new Database(':memory:');
+		try {
+			db.exec(`CREATE VIRTUAL TABLE t USING fts5(content, tokenize='unicode61 remove_diacritics 2')`);
+			db.prepare(`INSERT INTO t(content) VALUES (?)`).run('vector search calibration notes');
+			const hostile = [
+				'"unbalanced', 'trailing \\', 'NEAR(a b)', 'content:x', '-', '*', '^caret',
+				'a"b', '""', 'foo -', '(paren', 'NOT vector', ' vector',
+			];
+			for (const raw of hostile) {
+				// Contract: sanitized MATCH must never throw, whatever the input.
+				const q = toFtsQuery(raw);
+				const rows = db.prepare(`SELECT count(*) AS n FROM t WHERE t MATCH ?`).get(q) as { n: number };
+				expect(rows.n).toBeGreaterThanOrEqual(0); // reached = no throw
+			}
+			// Literal-semantics spot checks: operators are matched as text, not executed.
+			// 'NOT vector' must AND-match both tokens (0 rows here: 'not' absent) —
+			// if NOT executed as an operator, it would instead match the row.
+			const notQ = toFtsQuery('NOT vector');
+			expect((db.prepare(`SELECT count(*) AS n FROM t WHERE t MATCH ?`).get(notQ) as { n: number }).n).toBe(0);
+			// Punctuation token dropped → both real tokens still required and found.
+			const punctQ = toFtsQuery('vector - search');
+			expect((db.prepare(`SELECT count(*) AS n FROM t WHERE t MATCH ?`).get(punctQ) as { n: number }).n).toBe(1);
+		} finally {
+			db.close();
+		}
+	});
+});
+
+// ── Trigger behavior under raw-SQL writes (the eviction paths) ─────────────────
+
+describe('FTS triggers under raw-SQL observation writes', () => {
+	beforeEach(async () => {
+		dbPath = tempDbPath();
+		store = new SqliteStore(dbPath);
+		await store.init();
+	});
+
+	it('obs_fts_au: content-strip UPDATE (eviction Tier-2 shape) re-syncs the index', async () => {
+		// One observation per entity — deliberately: two active observations
+		// sharing a superseded_at would trip the PRE-EXISTING Tier-2 UNIQUE
+		// collision (Issue #83), which is not what this test pins.
+		await store.createEntities([
+			{ name: 'StripTarget', entityType: 'test', observations: ['the wolverine kept its secret'] },
+		]);
+		const db = new Database(dbPath);
+		try {
+			// Raw SQL exactly like evict.ts Tier-2 — bypasses GraphStore entirely;
+			// only the DB-level trigger can keep the index consistent.
+			db.prepare(`UPDATE observations SET content = '' WHERE content = ?`).run('the wolverine kept its secret');
+			const stale = db.prepare(`SELECT rowid FROM obs_fts WHERE obs_fts MATCH '"wolverine"'`).all();
+			expect(stale.length).toBe(0); // old content is out of the index
+		} finally {
+			db.close();
+		}
+	});
+
+	it('obs_fts_ad: raw DELETE (eviction Tier-1 shape) removes the index row', async () => {
+		await store.createEntities([
+			{ name: 'DeleteTarget', entityType: 'test', observations: ['the pangolin rolled away'] },
+		]);
+		const db = new Database(dbPath);
+		try {
+			db.prepare(`DELETE FROM observations WHERE content = ?`).run('the pangolin rolled away');
+			const stale = db.prepare(`SELECT rowid FROM obs_fts WHERE obs_fts MATCH '"pangolin"'`).all();
+			expect(stale.length).toBe(0);
+		} finally {
+			db.close();
+		}
 	});
 });
 
@@ -277,6 +415,22 @@ describe('JSONL relevance fallback', () => {
 			const res = await jstore.searchNodes('vector search', undefined, { limit: 10 }, undefined, undefined, 'relevance');
 			expect(res.entities.map(e => e.name)).toContain('JsonlEnt');
 			expect(res.rankingUnavailable).toBe(true);
+		} finally {
+			try { await fs.unlink(jsonlPath); } catch { /* ok */ }
+		}
+	});
+
+	it('rejects cursor + relevance (contract mirrors the SQLite guard)', async () => {
+		// Even though JSONL's fallback is recency (which paginates fine), the
+		// cursor+relevance combination must behave identically across backends —
+		// otherwise caller behavior silently depends on store configuration.
+		const jsonlPath = path.join(testDir, `test-fts-jsonl-guard-${Date.now()}.jsonl`);
+		const jstore = new JsonlStore(jsonlPath);
+		try {
+			await jstore.init();
+			await expect(
+				jstore.searchNodes('anything', undefined, { limit: 1, cursor: 'x' }, undefined, undefined, 'relevance')
+			).rejects.toThrow(/relevance/);
 		} finally {
 			try { await fs.unlink(jsonlPath); } catch { /* ok */ }
 		}

@@ -249,6 +249,11 @@ const PaginatedOutputSchema = {
   nextCursor: z.string().nullable().describe("Cursor for the next page, or null if this is the last page"),
   totalCount: z.number().describe("Total number of matching entities across all pages"),
   rankingUnavailable: z.boolean().optional().describe("Present (true) only when orderBy:'relevance' was requested but the backend cannot rank (JSONL has no FTS index) and results fell back to recency order."),
+  // Declaring this here is load-bearing, not just documentation: the MCP SDK
+  // validates structuredContent against this schema with key-stripping
+  // semantics, so a flag the store sets but this schema omits would vanish
+  // silently — the degradation signal itself failing silently.
+  rankingDegraded: z.array(z.enum(['fts', 'vector'])).optional().describe("Present (non-empty) only when orderBy:'relevance' ran but a candidate signal was LOST this call: 'fts' = the BM25 full-text list failed; 'vector' = the semantic KNN list failed or the embedding model was still loading. Degraded runs can MISS results a healthy run would return (treat as partial). Not set when vector search is configured off."),
 };
 
 const server = new McpServer({

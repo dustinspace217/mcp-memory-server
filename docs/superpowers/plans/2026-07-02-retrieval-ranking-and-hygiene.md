@@ -8,12 +8,14 @@
 > `docs/superpowers/specs/2026-07-02-retrieval-ranking-and-hygiene-design.md` — §12 is the quality
 > contract, §3 the verified facts, §4-§10 the DECIDED designs. Do not re-litigate decisions here.
 
-## Status (updated 2026-07-02, ~02:50 PDT)
-Phase: A of 7 — code COMPLETE (Tasks A1-A4 committed on branch feat/relevance-ranking), QA review pending
-Done: v11 FTS5 index + triggers (3c4ab71); rank-fusion.ts (a622cf4); searchNodes relevance mode +
-  JSONL fallback (1e1b899); tool surface + CLAUDE.md docs (A4, this commit). Both pools green
-  (614 + 10); real-artifact probe on a live-DB copy verified rank inversion + migration at scale.
-Next: Phase A QA review (code-reviewer + test-analyzer + performance-analyst), then Phase B Task B1
+## Status (updated 2026-07-02, ~03:50 PDT)
+Phase: A of 7 — COMPLETE including full three-phase QA (Discussion #82) + stabilization fixes
+Done: Tasks A1-A4 (commits 3c4ab71/a622cf4/1e1b899/c2f1cb5) + QA stabilization commit: 6-agent
+  Phase A review, 30-reply Phase B cross-exam, Phase C synthesis all on Discussion #82; fixes
+  applied (toFtsQuery zero-token/NUL hardening, rankingDegraded flag, JSONL cursor guard,
+  migration IMMEDIATE + in-txn recheck, clampLimit floor, wrong-comment fix, 17 new tests).
+  Both pools green (627 + 12 = 639). Pre-existing eviction bug found by review → Issue #83.
+Next: Phase B Task B1 (migration v12 access_count + touch increments)
 Blocked: nothing
 
 **Goal:** Relevance-ranked hybrid search, retrieval strengthening, graph hygiene, valid-time
@@ -45,6 +47,7 @@ strict order; harness Phase D touches only `~/.claude/hooks/` prompt files.
 | DEF-RR-01 | MED | `as_of_valid` query filtering on valid-time fields | when a real query need appears | open (by design, spec §8.3) |
 | DEF-RR-02 | MED | Flip `rerank` default after blind gate | Phase E gate | open |
 | DEF-RR-03 | LOW | `access_count` as eviction-tier signal | indefinite | open (comment-only note) |
+| DEF-RR-04 | LOW | Two-connection migration race test (child-process harness) | indefinite | open (Phase A QA #9) |
 
 ---
 
@@ -654,5 +657,33 @@ restart store, assert vec table cleared and re-swept).
    schema version and broke on v11. Established convention: per-migration tests assert
    "at least N"; ONE exact pin (knowledge-graph.test.ts fresh-database test) is bumped
    deliberately per migration. Documented in the CLAUDE.md tests section.
-4. **[deferment — process]** Phase A QA review not yet run at code-complete (usage budget);
-   queued as the next action before Phase B. Plan-mandated, not skipped.
+4. **[deferment — process, RESOLVED same session]** Phase A QA review not yet run at code-complete
+   (usage budget); ran in full after ultracode was enabled — six-agent Phase A + 30-reply Phase B
+   cross-exam + Phase C synthesis, all on GitHub Discussion #82.
+
+### Phase A QA stabilization (2026-07-02 ~03:50, post-review fixes)
+5. **[behavioral-change — hardening]** `toFtsQuery` now strips NUL bytes and drops tokens with no
+   letter/digit. My empirical probe PARTIALLY REFUTED the adversarial finding's headline (current
+   SQLite treats an empty phrase in an AND chain as a no-op — it does NOT zero the list), so this
+   shipped as version-robustness hardening, not a bug fix; lone-punctuation queries and the NUL
+   truncation case were real. Probe result recorded in the function comment + round-trip tests.
+6. **[behavioral-change — new response field]** `rankingDegraded?: ('fts'|'vector')[]` per
+   silent-failure F1 (goal A: degradation changes result membership and must surface). Configured-
+   off vector search deliberately NOT flagged (cross-exam consensus: chronic noise trains callers
+   to ignore the flag).
+7. **[behavioral-change]** JSONL now mirrors the cursor+relevance throw (F2, contract symmetry);
+   `clampLimit` floors fractional input; migration v11 runs IMMEDIATE with an in-transaction
+   version re-check (the naive deferred re-check would trade a redundant rebuild for a
+   SQLITE_BUSY_SNAPSHOT startup crash — caught by three cross-exam lenses independently).
+8. **[other — accepted-as-is, with rationale]** relevance-mode totalCount stays candidate-union
+   size (documented; subtraction is racy and off-page-blind — adversarial refuted the proposed
+   fix); fingerprint-before-branch dead work left (sub-microsecond); 2893/2902 normalize
+   inconsistency left (unreachable post-v8, pre-existing pattern); the recency path's silent
+   vector-skip left (pre-existing in kind, out of Phase A scope).
+9. **[deferment]** DEF-RR-04: two-connection migration race test (single-threaded better-sqlite3
+   makes an in-process race a deadlock; needs a child-process harness). Severity LOW — the
+   IMMEDIATE+recheck fix is verified by trace from three independent lenses; forward-migration
+   tests cover the non-race path. Fix direction: spawn a second connection in a child process,
+   assert the loser skips the rebuild. Obsolete if migrations ever move to a single-writer lock file.
+10. **[other — pre-existing bug found by review]** Eviction Tier-2 UNIQUE collision → filed as
+   Issue #83 (not Phase A scope; multi-agent-verified).

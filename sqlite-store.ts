@@ -795,9 +795,17 @@ export class SqliteStore implements GraphStore {
       // an improvement over LIKE's ASCII-only case folding (Known Limitations).
       //
       // Race safety (Issue #78 — concurrent server instances migrate in parallel):
-      // IF NOT EXISTS on table + triggers makes losers no-op; 'rebuild' is
-      // idempotent (it derives the index from the content table).
+      // IF NOT EXISTS on table + triggers makes losers no-op, and losers SKIP the
+      // corpus-sized 'rebuild' via the in-transaction version re-check below.
+      // The transaction is IMMEDIATE (write lock taken at BEGIN), which is what
+      // makes the re-check sound: a DEFERRED transaction would read version=10
+      // under a pre-commit snapshot and then die with SQLITE_BUSY_SNAPSHOT on its
+      // first write (busy_timeout does not retry snapshot conflicts) — the
+      // re-check must happen under the write lock to observe the winner's commit.
+      // (Caught in review cross-exam, Discussion #82.)
       this.db.transaction(() => {
+        const v = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+        if (v >= 11) return; // another instance already migrated — skip the rebuild
         this.db.exec(`
           CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts USING fts5(
             content,
@@ -820,7 +828,7 @@ export class SqliteStore implements GraphStore {
         // statement — this is what indexes the pre-v11 corpus.
         this.db.exec(`INSERT INTO obs_fts(obs_fts) VALUES ('rebuild')`);
         this.db.prepare('UPDATE schema_version SET version = 11').run();
-      })();
+      }).immediate();
       currentVersion = 11;
     }
 
@@ -2404,8 +2412,11 @@ export class SqliteStore implements GraphStore {
     // mutation, so a keyset cursor over it would silently skip or duplicate
     // results; and the FTS index holds only current content, so historical
     // (asOf) ranking would be quietly wrong. Reject both loudly rather than
-    // degrade silently — the Zod layer in index.ts rejects these first for MCP
-    // callers; this guard covers direct GraphStore consumers.
+    // degrade silently. NOTE: this guard is the ONLY enforcement point — the
+    // MCP layer cannot cross-field-validate (registerTool takes a per-field
+    // ZodRawShape with no cross-field refinement hook; see index.ts), so MCP
+    // callers reach this guard directly. Do not remove it in favor of "the
+    // Zod layer handles it" — it doesn't and can't.
     if (orderBy === 'relevance') {
       if (pagination?.cursor) {
         throw new Error("orderBy:'relevance' does not support cursor pagination — ranked results are top-k; omit the cursor");
@@ -2722,7 +2733,13 @@ export class SqliteStore implements GraphStore {
    * and vector lists, and the clamped page limit.
    * Returns: PaginatedKnowledgeGraph with nextCursor always null (ranked
    * results are top-k by design — see the guard in searchNodes) and totalCount
-   * = size of the fused candidate union.
+   * = size of the fused candidate union AT COLLECTION TIME. Under concurrent
+   * mutation an entity can be superseded between candidate collection and
+   * hydration and silently drop from the page, so totalCount can exceed
+   * entities.length; that is the documented semantic (candidate-union size),
+   * not a bug — no subtraction is attempted because off-page casualties are
+   * undetectable anyway (review Discussion #82, F3). rankingDegraded lists
+   * candidate signals lost to errors/unavailability this call (see types.ts).
    *
    * The three lists and their weights (design: 2026-07-02 spec §4.5):
    *   1.0 LIKE  — substring recall over name/normalized/type/obs content,
@@ -2750,6 +2767,12 @@ export class SqliteStore implements GraphStore {
       SELECT e.id FROM entities e JOIN matched_ids m ON m.id = e.id
       ORDER BY e.updated_at DESC, e.id DESC
     `).all(...cteParams) as { id: number }[]).map(r => r.id);
+
+    // Degradation ledger (goal A: a lost candidate list changes result
+    // MEMBERSHIP, so the caller must be able to tell a degraded run from a
+    // healthy one — stderr alone is invisible over MCP). Populated by the
+    // catch/skip sites below; attached to the result only when non-empty.
+    const degraded: ('fts' | 'vector')[] = [];
 
     // List 2 — FTS/BM25 candidates, best score per entity. bm25() is
     // lower-is-better in SQLite FTS5, hence MIN + ASC. The superseded_at=''
@@ -2792,7 +2815,10 @@ export class SqliteStore implements GraphStore {
       ftsIds = (this.db.prepare(ftsSql).all(...ftsParams) as { id: number }[]).map(r => r.id);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
+      // Full error detail stays on stderr only — SQLite messages can echo SQL
+      // fragments/paths; the caller gets the closed-enum flag, never err.message.
       console.error(`FTS candidate list failed (degrading to LIKE+vector): ${msg}`);
+      degraded.push('fts');
     }
 
     // List 3 — vector KNN candidates mapped to entities, best-cosine-first.
@@ -2802,7 +2828,8 @@ export class SqliteStore implements GraphStore {
     // walking knnRows best-first and keeping first-seen entity ids ranks each
     // entity by its single best-matching observation.
     let vecIds: number[] = [];
-    if (this.vecTableExists && this.embeddingPipeline.state.status === 'ready') {
+    const vecStatus = this.embeddingPipeline.state.status;
+    if (this.vecTableExists && vecStatus === 'ready') {
       try {
         const queryEmbedding = await this.embeddingPipeline.embed(query);
         if (queryEmbedding) {
@@ -2854,7 +2881,16 @@ export class SqliteStore implements GraphStore {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`Vector candidate list failed (degrading to LIKE+FTS): ${msg}`);
+        degraded.push('vector');
       }
+    } else if (vecStatus !== 'unavailable') {
+      // 'loading' (model still downloading/initializing), 'failed' (circuit
+      // breaker tripped), or a missing vec table with vectors nominally on:
+      // the semantic list SHOULD exist and doesn't — transient degradation the
+      // caller deserves to see. 'unavailable' (MEMORY_VECTOR_SEARCH=off) is
+      // deliberately NOT flagged: chosen configuration is not degradation, and
+      // chronic flag noise would train callers to ignore the flag.
+      degraded.push('vector');
     }
 
     // Fuse, rank (score DESC, id DESC for determinism on ties), take top-k.
@@ -2870,7 +2906,10 @@ export class SqliteStore implements GraphStore {
     const pageIds = ranked.slice(0, limit);
 
     if (pageIds.length === 0) {
-      return { entities: [], relations: [], nextCursor: null, totalCount };
+      return {
+        entities: [], relations: [], nextCursor: null, totalCount,
+        ...(degraded.length > 0 ? { rankingDegraded: degraded } : {}),
+      };
     }
 
     // Hydrate in fused order (SQL IN gives no ordering guarantee — reorder by map).
@@ -2907,7 +2946,10 @@ export class SqliteStore implements GraphStore {
     const allRelations = this.getConnectedRelations([...entityNames], undefined);
     const relations = allRelations.filter(r => entityNames.has(r.from) && entityNames.has(r.to));
 
-    return { entities, relations, nextCursor: null, totalCount };
+    return {
+      entities, relations, nextCursor: null, totalCount,
+      ...(degraded.length > 0 ? { rankingDegraded: degraded } : {}),
+    };
   }
 
   /**

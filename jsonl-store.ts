@@ -821,6 +821,13 @@ export class JsonlStore implements GraphStore {
     if (asOf !== undefined) {
       throw new Error('as_of queries not supported in JSONL backend: migrate to SQLite');
     }
+    // Mirror the SQLite guard so the cursor+relevance contract is backend-
+    // independent: even though this backend's fallback IS recency (which would
+    // paginate fine), letting the combination succeed here while SQLite throws
+    // would make caller behavior depend on which store happens to be configured.
+    if (orderBy === 'relevance' && pagination?.cursor) {
+      throw new Error("orderBy:'relevance' does not support cursor pagination — ranked results are top-k; omit the cursor");
+    }
     const graph = await this.loadGraph();
     const lowerQuery = query.toLowerCase();
     // projectId arrives pre-normalized from normalizeProjectId() in index.ts

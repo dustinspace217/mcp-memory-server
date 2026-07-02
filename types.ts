@@ -186,6 +186,17 @@ export interface PaginatedKnowledgeGraph extends KnowledgeGraph {
    *  (not false) on the SQLite path — same optional-flag convention as
    *  similarityCheckFailed on AddObservationResult. */
   rankingUnavailable?: boolean;
+  /** Present (non-empty) only when orderBy:'relevance' ran but one of its candidate
+   *  lists was LOST to an error or transient unavailability — 'fts' when the BM25
+   *  query failed, 'vector' when the KNN list failed or the embedding model was
+   *  still loading / had failed. Degradation changes result MEMBERSHIP (FTS-only
+   *  diacritic matches and vector-only semantic matches exist in no other list),
+   *  so per goal A it must surface to the caller, not just stderr. Deliberately
+   *  NOT set when vector search is configured off (MEMORY_VECTOR_SEARCH=off):
+   *  that is chosen configuration, not degradation, and flagging it would train
+   *  callers to ignore the flag. Same convention family as rankingUnavailable /
+   *  vectorSearchEnabled / modelReady. */
+  rankingDegraded?: ('fts' | 'vector')[];
 }
 
 /** Result ordering for searchNodes. 'recency' (default) = updated_at DESC with

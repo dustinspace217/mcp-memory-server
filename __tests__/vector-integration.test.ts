@@ -302,4 +302,42 @@ describe('Vector search integration', () => {
     // Unrelated content should not match the canine observation
     expect(result.results[0].matches).toHaveLength(0);
   });
+
+  it('relevance mode includes vector-only semantic matches (membership, not just order)', async () => {
+    // Review Discussion #82 gap #1: the ranked path's vector candidate list had
+    // zero coverage in either pool. This pins MEMBERSHIP (the load-bearing
+    // property: without the vec list, this entity appears in NO other list) —
+    // relative-rank assertions are deliberately avoided as they're fragile
+    // across embedding-model versions.
+    await store.createEntities([
+      // Semantically related to the query, zero token overlap with it:
+      { name: 'telescope-entity', entityType: 'gear', observations: ['An optical instrument for observing distant celestial objects'] },
+      // Token-overlap control (LIKE/FTS can find this one):
+      { name: 'stargazing-note', entityType: 'note', observations: ['stargazing equipment maintenance log'] },
+    ], undefined);
+    await new Promise(resolve => setTimeout(resolve, 2500)); // embedding sweep
+
+    const rel = await store.searchNodes('stargazing equipment', undefined, { limit: 10 }, undefined, undefined, 'relevance');
+    const names = rel.entities.map(e => e.name);
+    expect(names).toContain('stargazing-note');      // lexical path sanity
+    expect(names).toContain('telescope-entity');      // vector-only membership — the pin
+    // Healthy full-stack run: all three lists live → no degradation flag.
+    expect(rel.rankingDegraded).toBeUndefined();
+  });
+
+  it('relevance mode vector list respects projectId scoping', async () => {
+    await store.createEntities([
+      { name: 'scoped-telescope', entityType: 'gear', observations: ['A refractor instrument for viewing far-off nebulae at night'] },
+    ], 'astro-proj');
+    await store.createEntities([
+      { name: 'other-proj-telescope', entityType: 'gear', observations: ['A reflector instrument for viewing far-off galaxies at night'] },
+    ], 'other-proj');
+    await new Promise(resolve => setTimeout(resolve, 2500)); // embedding sweep
+
+    // Query with no token overlap — only the vector list can nominate these.
+    const rel = await store.searchNodes('astronomy optics for deep sky observation', 'astro-proj', { limit: 10 }, undefined, undefined, 'relevance');
+    const names = rel.entities.map(e => e.name);
+    expect(names).toContain('scoped-telescope');       // in-project semantic match
+    expect(names).not.toContain('other-proj-telescope'); // out-of-project excluded
+  });
 });
