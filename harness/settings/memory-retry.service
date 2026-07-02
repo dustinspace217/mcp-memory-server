@@ -1,0 +1,12 @@
+[Unit]
+Description=Drain the Claude memory retry queue (failed PreCompact/SessionEnd/consolidation saves)
+# The worker itself is plain bash; only queued job.sh scripts invoke claude.
+ConditionPathExists=%h/.claude/hooks/memory-retry-worker.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash %h/.claude/hooks/memory-retry-worker.sh
+# Generous cap: a queued consolidation retry legitimately runs ~2h. The worker
+# bounds each JOB with its own per-job timeout; this is the outer backstop.
+TimeoutStartSec=8000
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin

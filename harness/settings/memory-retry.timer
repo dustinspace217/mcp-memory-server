@@ -1,0 +1,13 @@
+[Unit]
+Description=Retry killed memory saves every 20 minutes (survives usage outages and reboots)
+
+[Timer]
+# 5 min after boot: the queue lives in ~/.local/state so jobs survive a reboot;
+# pick them up promptly once the session is up.
+OnBootSec=5min
+OnUnitActiveSec=20min
+# If the machine was asleep/off when a tick was due, fire on wake.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

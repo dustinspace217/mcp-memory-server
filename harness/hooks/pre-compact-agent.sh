@@ -18,8 +18,26 @@ LOGFILE="$HOME/.claude/hooks/hook-execution.log"
 mkdir -p /tmp/claude
 
 log() {
-    echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') | PreCompact | $1" >> "$LOGFILE"
+    # session= is appended centrally so every line is correlatable to a session —
+    # the June 2026 failure forensics required matching /tmp filenames because
+    # these log lines carried no session id. SESSION_ID is parsed before the
+    # first log call; the :-unset fallback covers any future early call.
+    echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') | PreCompact | $1 (session=${SESSION_ID:-unset})" >> "$LOGFILE"
 }
+
+# Recursion guard: this script spawns claude -p; if that child ever compacts
+# or otherwise fires lifecycle hooks, we must not spawn grandchildren. The
+# spawn site below sets CLAUDE_LIFECYCLE_AGENT=1 in the child's environment.
+if [ -n "${CLAUDE_LIFECYCLE_AGENT:-}" ]; then
+    log "SKIP: recursion guard (lifecycle agent child)"
+    exit 0
+fi
+
+# Leave a trace if the harness kills us (shouldn't happen now that claude -p
+# has an internal timeout inside the 300s settings.json budget). NOTE: the
+# trap only logs — it must NOT write to stdout, which is reserved for
+# newCustomInstructions.
+trap 'log "FAIL: killed by SIGTERM"; exit 143' TERM
 
 INPUT=$(cat)
 TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
@@ -86,21 +104,103 @@ PROMPT=$(sed \
 # Spawn claude -p.
 # IMPORTANT: stdout goes to a LOG FILE, not to this script's stdout.
 # This prevents claude -p's reasoning text from contaminating newCustomInstructions.
+# Internal timeout (420s + 10s kill grace) fires BEFORE the settings.json hook
+# budget (480s): a harness kill would skip the instructions delivery below and
+# hand the compaction model EMPTY newCustomInstructions (worse than the designed
+# fallback); an internal timeout (exit 124) flows through normally so the
+# fallback text still ships. The CLI reports errors — including usage-limit
+# exhaustion, the June 2026 failure cluster — on stdout/exit code, NOT stderr,
+# so FAIL lines log the stdout head and the capture files are kept on failure.
+# 240→420 (2026-07-02): 240s was CHRONICALLY short — five internal timeouts in
+# three days, including one where the agent was killed while PRINTING ITS
+# COMPLETION SUMMARY (the work was done; only the exit was late). The ceiling
+# only costs wall-clock in runs that would otherwise die: fast runs are
+# unaffected, and compaction blocks on this hook either way (docs confirm
+# PreCompact blocks; per-hook command default is 600s, so 480 is conservative).
 cd "${CWD:-$HOME/Claude}" 2>/dev/null || cd "$HOME/Claude"
 
 CLAUDE_LOG="/tmp/claude/precompact-claude-output-${SESSION_ID}.txt"
-echo "$PROMPT" | claude -p \
+echo "$PROMPT" | CLAUDE_LIFECYCLE_AGENT=1 timeout -k 10 420 claude -p \
     --permission-mode bypassPermissions \
     --model sonnet \
     --no-session-persistence \
     --output-format text \
-    > "$CLAUDE_LOG" 2>/tmp/claude/precompact-stderr-${SESSION_ID}.txt && \
-    log "OK: claude -p completed (trigger=$TRIGGER, skip_saves=$SKIP_SAVES, excerpt=$EXCERPT_LINES lines)" || \
-    log "FAIL: claude -p error (stderr=$(head -1 /tmp/claude/precompact-stderr-${SESSION_ID}.txt 2>/dev/null))"
+    > "$CLAUDE_LOG" 2>/tmp/claude/precompact-stderr-${SESSION_ID}.txt
+PRECOMPACT_RC=$?
+if [ "$PRECOMPACT_RC" -eq 0 ]; then
+    log "OK: claude -p completed (trigger=$TRIGGER, skip_saves=$SKIP_SAVES, excerpt=$EXCERPT_LINES lines)"
+elif [ "$PRECOMPACT_RC" -eq 124 ]; then
+    log "FAIL: internal timeout after 240s (stdout=$(head -c 300 "$CLAUDE_LOG" 2>/dev/null | tr '\n' ' '))"
+elif [ "$PRECOMPACT_RC" -eq 137 ]; then
+    # timeout's -k grace expired and it escalated to SIGKILL — label it as a
+    # timeout escalation, not a generic exit (QA: 137 was mislabeled before)
+    log "FAIL: hard-killed (SIGKILL after timeout grace; stdout=$(head -c 300 "$CLAUDE_LOG" 2>/dev/null | tr '\n' ' '))"
+else
+    log "FAIL: claude -p exit=$PRECOMPACT_RC (stdout=$(head -c 300 "$CLAUDE_LOG" 2>/dev/null | tr '\n' ' ') stderr=$(head -c 120 /tmp/claude/precompact-stderr-${SESSION_ID}.txt 2>/dev/null | tr '\n' ' '))"
+fi
 
-# Update debounce timestamp (only if we did saves)
-if [ "$SKIP_SAVES" = "false" ]; then
+# Update debounce timestamp — only when we attempted saves AND the agent
+# exited 0. Stamping on failure converts ONE failed save into TWO missed
+# saves: the next PreCompact within 10 minutes would read the stamp and set
+# SKIP_SAVES=true, suppressing its own save with no trace (QA 2026-06-09,
+# found independently by two reviewers). Exit code is the contract — the
+# CLI's prose can lie, its exit code doesn't (reference_claude_cli_behavior.md).
+if [ "$SKIP_SAVES" = "false" ] && [ "$PRECOMPACT_RC" -eq 0 ]; then
     date +%s > "$DEBOUNCE_FILE"
+fi
+
+# Durable retry (2026-07-02): a killed/failed save used to be simply LOST —
+# timeout, usage-limit exhaustion, whatever; the data was gone unless the
+# in-context session had checkpointed. Now the failure enqueues a
+# self-contained replay job (prompt + a persisted copy of the excerpt) into
+# ~/.local/state/claude-memory-queue, and memory-retry.timer (plain bash +
+# systemd, no Claude dependency) retries it with backoff until usage returns.
+# Only when saves were actually attempted-and-failed: a SKIP_SAVES run has
+# nothing to replay. The replay prompt is rebuilt with SESSION_ID suffixed
+# "-retry" so its /tmp outputs (briefing/instructions, meaningless after the
+# compaction has already happened) can never collide with a LIVE PreCompact
+# run of the same session.
+if [ "$SKIP_SAVES" = "false" ] && [ "$PRECOMPACT_RC" -ne 0 ]; then
+    QUEUE_LIB="$HOME/.claude/hooks/memory-queue-lib.sh"
+    if [ -f "$QUEUE_LIB" ]; then
+        # shellcheck disable=SC1090
+        source "$QUEUE_LIB"
+        STAGE=$(mq_new_staging "precompact-save")
+        if cp "$EXCERPT" "$STAGE/excerpt.jsonl" 2>/dev/null; then
+            sed \
+                -e "s|{{TRANSCRIPT_PATH}}|$STAGE/excerpt.jsonl|g" \
+                -e "s|{{CWD}}|${CWD:-$HOME/Claude}|g" \
+                -e "s|{{SESSION_ID}}|${SESSION_ID}-retry|g" \
+                -e "s|{{TRIGGER}}|${TRIGGER}|g" \
+                -e "s|{{SKIP_SAVES}}|false|g" \
+                "$PROMPT_TEMPLATE" > "$STAGE/prompt.txt"
+            # cwd is a payload file (not baked into job.sh) so the heredoc can
+            # stay fully quoted — no expansion surprises inside the job script.
+            echo "${CWD:-$HOME/Claude}" > "$STAGE/cwd"
+            cat > "$STAGE/job.sh" <<'JOBEOF'
+#!/bin/bash
+# Replays a PreCompact memory save that died in the live hook (see run.log
+# for attempts). Payload lives beside this script; the worker moves the whole
+# directory, so locate it relative to $0.
+set -uo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$(cat "$DIR/cwd" 2>/dev/null)" 2>/dev/null || cd "$HOME/Claude" || exit 1
+CLAUDE_LIFECYCLE_AGENT=1 claude -p \
+    --permission-mode bypassPermissions \
+    --model sonnet \
+    --no-session-persistence \
+    --output-format text \
+    < "$DIR/prompt.txt"
+JOBEOF
+            if mq_enqueue "$STAGE" 420; then
+                log "QUEUED: failed save enqueued for retry (queue=$(basename "$STAGE"))"
+            else
+                log "WARN: enqueue failed — save not queued for retry"
+            fi
+        else
+            log "WARN: could not persist excerpt — save not queued for retry"
+        fi
+    fi
 fi
 
 # Output ONLY the preservation instructions to stdout → becomes newCustomInstructions.
@@ -116,5 +216,10 @@ else
     log "WARN: instructions file not found — using fallback"
 fi
 
-# Clean up
-rm -f "$EXCERPT" "$CLAUDE_LOG" "/tmp/claude/precompact-stderr-${SESSION_ID}.txt"
+# Clean up. The excerpt always goes; claude -p's stdout/stderr captures are
+# KEPT on failure as evidence for session-health-check.py's surfacing at the
+# next session start (the CLI reports errors on stdout, not stderr).
+rm -f "$EXCERPT"
+if [ "${PRECOMPACT_RC:-1}" -eq 0 ]; then
+    rm -f "$CLAUDE_LOG" "/tmp/claude/precompact-stderr-${SESSION_ID}.txt"
+fi

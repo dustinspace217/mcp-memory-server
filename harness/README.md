@@ -38,24 +38,31 @@ Most users will accept the defaults. Override only if your Claude Code install l
 harness/
 ├── README.md                  # this file
 ├── install.sh                 # idempotent installer
-├── hooks/                     # 11 files — wire the server into Claude Code's lifecycle
+├── hooks/                     # 15 files — wire the server into Claude Code's lifecycle
 │   ├── load-l0-context.py            # SessionStart × 3 chunks
 │   ├── check-memory-freshness.py     # SessionStart freshness scan
 │   ├── check-memory-noise.py         # PostToolUse after writes
 │   ├── memory-save-gate.sh           # Stop checkpoint
 │   ├── periodic-memory-check.sh      # cron-style maintenance
-│   ├── session-end-agent.sh          # SessionEnd orchestrator
+│   ├── session-end-agent.sh          # SessionEnd orchestrator (launches detached save)
+│   ├── sessionend-save.sh            # detached SessionEnd save worker
 │   ├── sessionend-prompt.md          # prompt body for the SessionEnd agent
 │   ├── pre-compact-agent.sh          # PreCompact orchestrator
 │   ├── precompact-prompt.md          # prompt body for the PreCompact agent
 │   ├── post-compact-agent.sh         # PostCompact orchestrator
+│   ├── memory-queue-lib.sh           # durable retry queue: enqueue helpers
+│   ├── memory-retry-worker.sh        # durable retry queue: systemd-timer worker
 │   └── test_check_memory_freshness.py
 ├── skills/
 │   ├── audit-memory/SKILL.md
 │   └── checkpoint/SKILL.md
+├── scripts/
+│   └── run-consolidation.sh           # weekly consolidation runner (systemd timer)
 ├── settings/
 │   ├── settings.hooks.example.json    # hooks block to merge into ~/.claude/settings.json
-│   └── mcp-registration.example.json  # entry to merge into ~/.claude.json mcpServers
+│   ├── mcp-registration.example.json  # entry to merge into ~/.claude.json mcpServers
+│   ├── memory-retry.service           # systemd --user unit for the retry worker
+│   └── memory-retry.timer             # every-20-min timer (Persistent=true)
 └── claude-md/
     └── session-protocol.md            # paste into ~/Claude/CLAUDE.md
 ```
