@@ -20,8 +20,19 @@ Done: Phases A (Disc #82, Issue #83) + B (Disc #84) closed. Phase C: v13 vocab m
   sessionend/precompact prompts + checkpoint gate message; null-typed backlog quota (50/run,
   oldest-first) in the consolidation prompt; repo mirror synced (was badly stale). Both pools
   green (651 + 12 = 663).
-Next: Phase E QA (launched), then Phase F Task F1 (valid-time migration v14)
+Next: Phase F Task F1 (valid-time migration v14), then Phase G; open agent-budget gates:
+  DEF-RR-02 (rerank blind panel) + G2 (embedding panel)
 Blocked: nothing
+
+### Phase E CLOSED (2026-07-02 ~09:50, Discussion #86 full three-phase thread)
+Cross-exam refinements in the final commit: strict exact-zero pin (dyadic weights, toBe not
+toBeCloseTo — the tolerance would mask the drift that breaks the restart-subtraction premise);
+decoy fixture fixed to carry the FULL query token set (as shipped it never matched the AND-ed
+FTS query, so the intersect-removal mutant survived silently — cross-exam catch); empty-floored
+rerankApplied pin (unrelated-query construction — an "unreachable" floor can't empty a
+verbatim-text match, which embeds at cosine ≈ 1.0; found empirically when 0.9999 still returned
+the target). Performance's eviction-cap rationale corrected in-thread (byte cap doesn't bound
+relation count). 675 tests (661 + 14).
 
 ### Phase E code complete (2026-07-02 ~09:40)
 E1 pagerank.ts (cfe0ca2, exact hand-walked power-iteration tests) + E2 rerank wired into

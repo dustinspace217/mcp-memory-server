@@ -80,6 +80,18 @@ describe('personalizedPageRank', () => {
 		expect(rank.get('C')!).toBeCloseTo(0.0703125, 12);
 	});
 
+	it('an isolated seed in a mixed graph carries EXACTLY its restart mass (strict equality)', () => {
+		// The findPrecedents restart-subtraction fix (review #86) rests on this
+		// exactness: an isolated seed receives zero diffusion, so its final rank
+		// is precisely alpha · (w/Σ) — the caller subtracts that term to isolate
+		// the graph signal, and the subtraction must yield exact zero. Strict
+		// toBe (not toBeCloseTo, whose 1e-13 slack would mask the drift that
+		// breaks exact-zero). Dyadic weights (3, 1 → Σ=4) keep every operation
+		// exact in IEEE-754: p_C = 1/4, alpha·p_C = 0.5 · 0.25 = 0.125.
+		const rank = personalizedPageRank([['A', 'B']], new Map([['A', 3], ['C', 1]]));
+		expect(rank.get('C')).toBe(0.125);
+	});
+
 	it('is deterministic across runs (no randomness, stable iteration)', () => {
 		const edges: Array<[string, string]> = [['A', 'B'], ['B', 'C'], ['C', 'A'], ['C', 'D']];
 		const seeds = new Map([['A', 0.9], ['D', 0.4]]);

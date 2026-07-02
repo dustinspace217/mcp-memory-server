@@ -368,7 +368,10 @@ describe('Vector search integration', () => {
     // 0.9-floor-vs-~0.99-target margin is robust across embedding versions.
     await store.createEntities([
       { name: 'floor-target', entityType: 'note', observations: ['periodic error correction for the mount worm gear'] },
-      { name: 'floor-decoy', entityType: 'note', observations: ['my grocery list: periodic error correction mount worm gear apples bananas cheese'] },
+      // Decoy carries EVERY query token (toFtsQuery emits AND-ed tokens — a
+      // partial-token decoy never enters bm25Ids and the intersect-removal
+      // mutant survives silently; cross-exam #86 catch):
+      { name: 'floor-decoy', entityType: 'note', observations: ['my grocery list for the periodic error correction mount worm gear day: apples bananas cheese'] },
     ], undefined);
     await new Promise(resolve => setTimeout(resolve, 2500)); // embedding sweep
 
@@ -379,6 +382,15 @@ describe('Vector search integration', () => {
     for (const p of res.precedents) {
       expect(p.similarity).toBeGreaterThanOrEqual(0.9);
     }
+
+    // Empty-floored contract (cross-exam #86): an UNRELATED query under a high
+    // floor → empty result with rerankApplied ABSENT (nothing fused) — uniform
+    // with the other empty paths. (An unreachable floor on the verbatim-match
+    // query can't work here: identical text embeds to cosine ≈ 1.0, above any
+    // legal floor — caught when a 0.9999 floor still returned the target.)
+    const emptied = await store.findPrecedents('watercolor techniques for painting sunsets', undefined, { limit: 5, minSimilarity: 0.99, rerank: true });
+    expect(emptied.precedents).toEqual([]);
+    expect(emptied.rerankApplied).toBeUndefined();
   });
 
   it('relevance mode vector list respects projectId scoping', async () => {
