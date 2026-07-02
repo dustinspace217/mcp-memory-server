@@ -155,6 +155,14 @@ export interface FindPrecedentsOptions {
   memoryType?: string;     // restrict to observations of this memory_type (e.g. 'decision')
   limit?: number;          // max precedents to return (default 5)
   minSimilarity?: number;  // cosine floor (default 0.25 — lower than dedup; precedents are related, not duplicate)
+  /** Graph-aware rerank (Phase E, default false): fuse the cosine ranking with
+   *  personalized-PageRank-over-relations (seeded by the matches' parent
+   *  entities) and an observation-level BM25 list. Reorders WITHIN the
+   *  floor-gated candidate set only — fusion never resurrects a below-floor
+   *  match, and `similarity` values remain raw cosines (fusion reorders, it
+   *  does not fabricate similarity numbers). Default stays false until the
+   *  offline blind gate passes (plan DEF-RR-02). */
+  rerank?: boolean;
 }
 
 /** Result of findPrecedents. The flags tell the caller WHY precedents is empty when it is. */
@@ -162,6 +170,11 @@ export interface FindPrecedentsResult {
   precedents: PrecedentMatch[];
   modelReady: boolean;          // embedding model loaded?
   vectorSearchEnabled: boolean; // vec table present (MEMORY_VECTOR_SEARCH !== 'off')?
+  /** Present (true) only when opts.rerank was requested AND the graph-aware
+   *  fusion actually ran. Absent when rerank was off, or when the degraded
+   *  path returned empty before reranking could apply — so the caller can
+   *  distinguish "reranked order" from "pure cosine order". */
+  rerankApplied?: boolean;
 }
 
 /** Pagination parameters for readGraph and searchNodes.

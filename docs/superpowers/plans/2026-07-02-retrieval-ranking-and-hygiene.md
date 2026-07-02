@@ -20,8 +20,16 @@ Done: Phases A (Disc #82, Issue #83) + B (Disc #84) closed. Phase C: v13 vocab m
   sessionend/precompact prompts + checkpoint gate message; null-typed backlog quota (50/run,
   oldest-first) in the consolidation prompt; repo mirror synced (was badly stale). Both pools
   green (651 + 12 = 663).
-Next: post Phase C cross-exam replies + synthesis to #85, then Phase E Task E1 (pagerank.ts)
+Next: Phase E QA (launched), then Phase F Task F1 (valid-time migration v14)
 Blocked: nothing
+
+### Phase E code complete (2026-07-02 ~09:40)
+E1 pagerank.ts (cfe0ca2, exact hand-walked power-iteration tests) + E2 rerank wired into
+findPrecedents behind `rerank: false` (cosine 1.0 / parent-entity PPR 0.5 / BM25 0.75; floor
+gates BEFORE fusion; BM25 intersected with the floored set — reorders, never nominates;
+`rerankApplied` flag distinguishes reranked from pure-cosine order, absent on the degraded
+path). 672 tests green (659 + 13). DEF-RR-02 (blind gate before default flip) remains open —
+shipping dark as planned.
 
 **Goal:** Relevance-ranked hybrid search, retrieval strengthening, graph hygiene, valid-time
 fields, graph-aware precedent rerank, and a gated embedding-model eval — the full approved output

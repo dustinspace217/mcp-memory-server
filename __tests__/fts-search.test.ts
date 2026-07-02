@@ -488,6 +488,29 @@ describe('toFtsQuery round-trip through real FTS5', () => {
 	});
 });
 
+// ── find_precedents rerank: degraded-path contract (Pool 1 = vectors OFF) ─────
+
+describe('findPrecedents rerank degraded path', () => {
+	beforeEach(async () => {
+		dbPath = tempDbPath();
+		store = new SqliteStore(dbPath);
+		await store.init();
+	});
+
+	it('vectors off + rerank requested → empty precedents, flags set, rerankApplied ABSENT', async () => {
+		// rerank cannot apply without a cosine candidate set to rerank — the
+		// degraded path must not claim it ran (absent, not false: same optional-
+		// flag convention as rankingDegraded/rankingUnavailable).
+		await store.createEntities([
+			{ name: 'PrecEnt', entityType: 'test', observations: ['a decision precedent about caching'] },
+		]);
+		const res = await store.findPrecedents('caching decision', undefined, { limit: 5, rerank: true });
+		expect(res.precedents).toEqual([]);
+		expect(res.vectorSearchEnabled).toBe(false); // MEMORY_VECTOR_SEARCH=off in Pool 1
+		expect(res.rerankApplied).toBeUndefined();
+	});
+});
+
 // ── Relation-type canonicalization: the ambiguity guard (SQLite-only fixture) ──
 
 describe('relation-type canonicalization ambiguity guard', () => {

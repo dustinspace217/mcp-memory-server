@@ -587,6 +587,14 @@ describe('MCP Tool Handler Integration', () => {
 			expect(SearchNodesInputSchema.safeParse({ query: 'foo', orderBy: '' }).success).toBe(false);
 		});
 
+		// ----- rerank parameter validation (find_precedents, Phase E) -----
+		it('accepts boolean rerank and rejects non-boolean on find_precedents', () => {
+			const RerankSchema = z.object({ query: z.string().min(1), rerank: z.boolean().optional() });
+			expect(RerankSchema.safeParse({ query: 'foo', rerank: true }).success).toBe(true);
+			expect(RerankSchema.safeParse({ query: 'foo' }).success).toBe(true);
+			expect(RerankSchema.safeParse({ query: 'foo', rerank: 'yes' }).success).toBe(false);
+		});
+
 		it('accepts omitting asOf (treats as undefined / current state)', () => {
 			const result = ReadGraphInputSchema.safeParse({});
 			expect(result.success).toBe(true);

@@ -573,15 +573,17 @@ server.registerTool(
       memoryType: z.string().min(1).max(50).optional().describe("Optional filter; recommend 'decision' for precedent recall. Omit for all types."),
       limit: z.number().int().min(1).max(50).optional().default(5).describe("Max precedents to return (default 5)"),
       minSimilarity: z.number().min(0).max(1).optional().default(0.25).describe("Cosine floor; lower than dedup thresholds because precedents are related, not duplicates"),
+      rerank: z.boolean().optional().describe("EXPERIMENTAL (default false): graph-aware rerank — fuses the cosine ranking with personalized PageRank over the relation graph (seeded by the matches' entities) and a BM25 full-text list. Reorders within the floor-gated candidates only; similarity values stay raw cosines. rerankApplied in the response confirms it ran."),
     },
     outputSchema: {
       precedents: z.array(PrecedentMatchOutputSchema),
       modelReady: z.boolean(),
       vectorSearchEnabled: z.boolean(),
+      rerankApplied: z.boolean().optional().describe("Present (true) only when rerank was requested and the graph-aware fusion actually ran — absent on the degraded path, so callers can distinguish reranked from pure-cosine order."),
     },
   },
-  async ({ query, projectId, memoryType, limit, minSimilarity }) => {
-    const result = await store.findPrecedents(query, normalizeProjectId(projectId), { memoryType, limit, minSimilarity });
+  async ({ query, projectId, memoryType, limit, minSimilarity, rerank }) => {
+    const result = await store.findPrecedents(query, normalizeProjectId(projectId), { memoryType, limit, minSimilarity, rerank });
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       structuredContent: { ...result }

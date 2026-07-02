@@ -325,6 +325,40 @@ describe('Vector search integration', () => {
     expect(rel.rankingDegraded).toBeUndefined();
   });
 
+  it('find_precedents rerank: fusion runs, floor still gates, graph-favored order holds', async () => {
+    // Scope note: PPR's rank CONTRIBUTION is pinned at unit level (exact power-
+    // iteration values in pagerank.test.ts; fusion weights in rank-fusion tests).
+    // This integration test pins the WIRING: rerankApplied flag semantics, the
+    // floor-before-fusion discipline, and a stable overdetermined ordering
+    // (lexical + semantic + graph all favor the connected entity) — per the
+    // Phase A review lesson, membership and flags are primary; fine-grained
+    // rank-quality evidence belongs to the offline blind gate (DEF-RR-02).
+    await store.createEntities([
+      { name: 'guide-conn', entityType: 'note', observations: ['guidescope calibration workflow for the autoguider rig'] },
+      { name: 'guide-iso', entityType: 'note', observations: ['aligning the small helper telescope before unattended imaging'] },
+      { name: 'guide-hub', entityType: 'note', observations: ['calibration workflow standards document'] },
+    ], undefined);
+    await store.createRelations([
+      { from: 'guide-conn', to: 'guide-hub', relationType: 'part_of' },
+    ]);
+    await new Promise(resolve => setTimeout(resolve, 2500)); // embedding sweep
+
+    const reranked = await store.findPrecedents('guidescope calibration workflow', undefined, { limit: 5, minSimilarity: 0.15, rerank: true });
+    expect(reranked.rerankApplied).toBe(true);
+    expect(reranked.modelReady).toBe(true);
+    const names = reranked.precedents.map(p => p.entityName);
+    expect(names[0]).toBe('guide-conn'); // lexical+semantic+graph agree
+    // Floor discipline: every returned similarity respects the raw-cosine gate.
+    for (const p of reranked.precedents) {
+      expect(p.similarity).toBeGreaterThanOrEqual(0.15);
+    }
+
+    // Control: without rerank the flag is ABSENT (pure cosine order).
+    const plain = await store.findPrecedents('guidescope calibration workflow', undefined, { limit: 5, minSimilarity: 0.15 });
+    expect(plain.rerankApplied).toBeUndefined();
+    expect(plain.precedents.length).toBeGreaterThan(0);
+  });
+
   it('relevance mode vector list respects projectId scoping', async () => {
     await store.createEntities([
       { name: 'scoped-telescope', entityType: 'gear', observations: ['A refractor instrument for viewing far-off nebulae at night'] },

@@ -59,6 +59,7 @@ import {
 import { normalizeEntityName } from './normalize-name.js';
 import { checkAndEvict, type EvictionResult } from './evict.js';
 import { CORE_RELATION_TYPES, relationTypeKey, RELATION_VOCAB_FIXES } from './relation-types.js';
+import { personalizedPageRank } from './pagerank.js';
 
 /**
  * Checks if a file exists at the given path.
@@ -3483,11 +3484,13 @@ export class SqliteStore implements GraphStore {
   async findPrecedents(query: string, projectId?: string, opts: FindPrecedentsOptions = {}): Promise<FindPrecedentsResult> {
     const limit = opts.limit ?? 5;
     const minSimilarity = opts.minSimilarity ?? 0.25;
+    const rerank = opts.rerank ?? false;
     const modelReady = this.embeddingPipeline.state.status === 'ready';
     const vectorSearchEnabled = this.vecTableExists;
 
     // Similarity ranking is impossible without the model + vec table. Return empty + flags
-    // rather than throwing or recency-falling-back.
+    // rather than throwing or recency-falling-back. Rerank cannot apply on the degraded
+    // path either (there is no cosine candidate set to rerank), so rerankApplied stays absent.
     if (!vectorSearchEnabled || !modelReady) {
       return { precedents: [], modelReady, vectorSearchEnabled };
     }
@@ -3498,8 +3501,11 @@ export class SqliteStore implements GraphStore {
     // Over-fetch: KNN ranks over ALL observations, but we then filter by active/project/memoryType,
     // so fetch more candidates than `limit` to still have enough after filtering. k is a validated
     // integer interpolated into the query (sqlite-vec's MATCH ... k = N syntax here, mirroring the
-    // dedup paths, does not bind k as a parameter).
-    const k = Math.min(Math.max(limit * 5, 50), 200);
+    // dedup paths, does not bind k as a parameter). Rerank mode fetches 3× the usual candidates
+    // (spec §9.2) — fusion needs a deeper pool to reorder within, capped at searchNodes' 500.
+    const k = rerank
+      ? Math.min(Math.max(limit * 15, 150), 500)
+      : Math.min(Math.max(limit * 5, 50), 200);
     const knnRows = this.db.prepare(`
       SELECT v.observation_id, v.distance FROM vec_observations v
       WHERE v.embedding MATCH ? AND k = ${k}
@@ -3518,6 +3524,9 @@ export class SqliteStore implements GraphStore {
     // Hydrate only ACTIVE observations on ACTIVE entities, applying project/memoryType filters.
     const ids = [...simById.keys()];
     const precedents: PrecedentMatch[] = [];
+    // Parent-entity normalized names, captured during hydration for the rerank
+    // path's PageRank seeds/lookups (relations store normalized endpoints).
+    const entityNormByObsId = new Map<number, string>();
     for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
       const chunk = ids.slice(i, i + CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
@@ -3526,7 +3535,8 @@ export class SqliteStore implements GraphStore {
       if (projectId) { filters.push('(e.project = ? OR e.project IS NULL)'); params.push(projectId); }
       if (opts.memoryType) { filters.push('o.memory_type = ?'); params.push(opts.memoryType); }
       const rows = this.db.prepare(`
-        SELECT o.id, o.content, o.importance, o.memory_type, o.context_layer, o.created_at, e.name AS entityName
+        SELECT o.id, o.content, o.importance, o.memory_type, o.context_layer, o.created_at,
+               e.name AS entityName, e.normalized_name AS entityNorm
         FROM observations o JOIN entities e ON o.entity_id = e.id
         WHERE o.id IN (${placeholders})
           AND o.superseded_at = '' AND o.tombstoned_at = ''
@@ -3534,9 +3544,10 @@ export class SqliteStore implements GraphStore {
           ${filters.length ? 'AND ' + filters.join(' AND ') : ''}
       `).all(...params) as Array<{
         id: number; content: string; importance: number; memory_type: string | null;
-        context_layer: string | null; created_at: string; entityName: string;
+        context_layer: string | null; created_at: string; entityName: string; entityNorm: string;
       }>;
       for (const row of rows) {
+        entityNormByObsId.set(row.id, row.entityNorm);
         precedents.push({
           entityName: row.entityName,
           observationId: String(row.id),
@@ -3554,13 +3565,94 @@ export class SqliteStore implements GraphStore {
       }
     }
 
-    return {
-      // Gate on the floor + rank by raw cosine + cap + round-for-display, in that order — see the
-      // rankAndFloorPrecedents JSDoc for why rounding must be last (Finding E boundary leak).
-      precedents: rankAndFloorPrecedents(precedents, minSimilarity, limit),
-      modelReady,
-      vectorSearchEnabled,
-    };
+    if (!rerank) {
+      return {
+        // Gate on the floor + rank by raw cosine + cap + round-for-display, in that order — see the
+        // rankAndFloorPrecedents JSDoc for why rounding must be last (Finding E boundary leak).
+        precedents: rankAndFloorPrecedents(precedents, minSimilarity, limit),
+        modelReady,
+        vectorSearchEnabled,
+      };
+    }
+
+    // ── Graph-aware rerank (Phase E, spec §9) ────────────────────────────────
+    // ORDER OF OPERATIONS IS LOAD-BEARING: the minSimilarity floor gates on RAW
+    // cosine BEFORE fusion — a fused score must never resurrect a below-floor
+    // match, and the BM25 list is intersected with the floored set for the same
+    // reason (BM25 reorders candidates; it never nominates).
+    const floored = precedents.filter(p => p.similarity >= minSimilarity);
+    if (floored.length === 0) {
+      return { precedents: [], modelReady, vectorSearchEnabled, rerankApplied: true };
+    }
+    const flooredIds = new Set(floored.map(p => Number(p.observationId)));
+
+    // List 1 — cosine, raw-DESC (deterministic tie-break: obs id DESC).
+    const byId = new Map(floored.map(p => [Number(p.observationId), p]));
+    const vectorIds = [...floored]
+      .sort((a, b) => (b.similarity - a.similarity) || (Number(b.observationId) - Number(a.observationId)))
+      .map(p => Number(p.observationId));
+
+    // List 2 — parent-entity PageRank. Seeds = each candidate's entity at its
+    // best cosine; edges = the ACTIVE relation graph (both endpoints normalized,
+    // ~500 rows — milliseconds of pure JS). Observations whose entity received
+    // no rank mass are EXCLUDED (absent = zero contribution), mirroring the
+    // activation list's never-boost-the-unconnected rule in searchNodesRanked.
+    const seeds = new Map<string, number>();
+    for (const p of floored) {
+      const norm = entityNormByObsId.get(Number(p.observationId));
+      if (norm !== undefined) {
+        seeds.set(norm, Math.max(seeds.get(norm) ?? 0, p.similarity));
+      }
+    }
+    const edges = this.db.prepare(
+      `SELECT from_entity, to_entity FROM relations WHERE superseded_at = '' AND tombstoned_at = ''`
+    ).all() as { from_entity: string; to_entity: string }[];
+    const ppr = personalizedPageRank(edges.map(e => [e.from_entity, e.to_entity] as const), seeds);
+    const pprIds = floored
+      .map(p => {
+        const norm = entityNormByObsId.get(Number(p.observationId));
+        return { id: Number(p.observationId), score: norm !== undefined ? (ppr.get(norm) ?? 0) : 0, sim: p.similarity };
+      })
+      .filter(x => x.score > 0)
+      .sort((a, b) => (b.score - a.score) || (b.sim - a.sim) || (b.id - a.id))
+      .map(x => x.id);
+
+    // List 3 — observation-level BM25 (reuses Phase A's index + sanitizer),
+    // intersected with the floored candidate set. try/catch mirrors the
+    // searchNodesRanked FTS contract: a MATCH failure degrades to no-BM25-list.
+    let bm25Ids: number[] = [];
+    try {
+      bm25Ids = (this.db.prepare(`
+        WITH scored AS MATERIALIZED (
+          SELECT rowid AS obs_rowid, bm25(obs_fts) AS score
+          FROM obs_fts WHERE obs_fts MATCH ?
+        )
+        SELECT s.obs_rowid AS id FROM scored s
+        JOIN observations o ON o.id = s.obs_rowid AND o.superseded_at = ''
+        ORDER BY s.score ASC LIMIT 200
+      `).all(toFtsQuery(query)) as { id: number }[])
+        .map(r => r.id)
+        .filter(id => flooredIds.has(id));
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`Precedent BM25 list failed (rerank degrades to cosine+PPR): ${msg}`);
+    }
+
+    // Fuse (weights: spec §9.2), order, cap, round-for-display at the boundary.
+    const fused = fuseRanks<number>([
+      { weight: 1.0, ids: vectorIds },
+      { weight: 0.5, ids: pprIds },
+      { weight: 0.75, ids: bm25Ids },
+    ]);
+    const reranked = [...fused.entries()]
+      .sort((a, b) => (b[1] - a[1]) || (b[0] - a[0]))
+      .slice(0, limit)
+      .map(([id]) => {
+        const p = byId.get(id)!;
+        return { ...p, similarity: Math.round(p.similarity * 1000) / 1000 };
+      });
+
+    return { precedents: reranked, modelReady, vectorSearchEnabled, rerankApplied: true };
   }
 
   /**
