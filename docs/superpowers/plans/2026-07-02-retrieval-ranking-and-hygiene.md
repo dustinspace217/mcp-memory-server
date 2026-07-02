@@ -8,17 +8,14 @@
 > `docs/superpowers/specs/2026-07-02-retrieval-ranking-and-hygiene-design.md` — §12 is the quality
 > contract, §3 the verified facts, §4-§10 the DECIDED designs. Do not re-litigate decisions here.
 
-## Status (updated 2026-07-02, ~04:35 PDT)
-Phase: B of 7 — code COMPLETE (Tasks B1-B2 committed: 9ce97f8 v12 access_count parity rule,
-  e5b01dc activation as fourth RRF list), QA review launching
-Done: Phase A fully closed (QA on Discussion #82, stabilization 00959b1, branch pushed, Issue #83
-  filed). Phase B: v12 access_count under the PARITY RULE (increments exactly where
-  last_accessed_at writes — including the four inline UPDATE sites + creation seeding 1, a
-  deviation from the plan's helpers-only sketch, rationale in the deviation log); activation
-  (weight 0.5, union-only, never nominates, -Infinity excluded) fused into relevance ranking.
-  Both pools green (630 + 12 = 642).
-Next: Phase B QA (code-reviewer + test-analyzer + performance-analyst), then Phase C Task C1
-  (relation-vocab migration v13)
+## Status (updated 2026-07-02, ~04:55 PDT)
+Phase: B of 7 — COMPLETE including three-phase QA (Discussion #84) + stabilization
+Done: Phase A closed (Discussion #82, Issue #83). Phase B: v12 access_count under the PARITY RULE
+  (9ce97f8); activation as fourth RRF list, weight 0.5, union-only (e5b01dc); QA stabilization
+  (this commit): v12+v10 → .immediate(), activation superseded filter, migrateFromJsonl parity
+  seed, weight-bound + exclusion deterministic pins, parity test extended to the inline sites.
+  Both pools green (632 + 12 = 644).
+Next: Phase C Task C1 (relation-vocab migration v13, explicit map)
 Blocked: nothing
 
 **Goal:** Relevance-ranked hybrid search, retrieval strengthening, graph hygiene, valid-time
@@ -710,3 +707,23 @@ restart store, assert vec table cleared and re-swept).
    connection (observer-effect-safe), and the B2 ordering test constructs its cold entity via raw
    SQL because every store write path now counts (there is no store-level way to create a
    never-accessed entity — which is itself evidence the parity rule is airtight).
+
+### Phase B QA stabilization (2026-07-02 ~04:50, Discussion #84 findings applied)
+4. **[behavioral-change — hardening]** v12 migration → `.immediate()` (code-reviewer Major: a
+   deferred transaction's prepare() may pin a read snapshot even write-first → loser dies on
+   SQLITE_BUSY_SNAPSHOT instead of the duplicate-column catch; cross-exam honestly downgraded the
+   mechanism to hypothesis — untestable without a two-process harness, folded into DEF-RR-04 —
+   but IMMEDIATE is free and structurally closes it). v10 retrofitted with the same one-word fix
+   (identical latent shape; adjacent-broken-code allowance).
+5. **[behavioral-change — hardening]** Activation lookup gains `superseded_at = ''` (soft-deleted
+   entities can't occupy activation rank slots during the collection-time race window; plan-neutral
+   predicate per performance cross-exam). `migrateFromJsonl` seeds `access_count = 1` (it writes
+   last_accessed_at → parity rule; same encoding rationale as createEntities), pinned in the
+   JSONL→SQLite migration test.
+6. **[other — test rigor]** Hand-math itemization typo fixed; parity test extended to the four
+   inline sites (+4 assertions); weight-bound pin added (cold entity RAW-inserted per cross-exam —
+   a createEntities twin balloons the detection threshold from w≈1.02 to w≈63); deterministic
+   -Infinity-exclusion pin added (performance cross-exam showed the FTS tie order is
+   plan-determined, so a tail-ranking regression would consistently HIDE rather than flake — the
+   pin detects it under both tie orders); never-nominates got its positive control. 644 tests
+   (632 + 12).

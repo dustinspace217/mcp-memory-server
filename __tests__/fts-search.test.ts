@@ -310,8 +310,10 @@ describe('searchNodes relevance mode', () => {
 		// Hand math (weights: LIKE 1.0, FTS 1.0, activation 0.5):
 		//   B (LIKE rank 0, newer): 1/61 + fts_B
 		//   A (LIKE rank 1):        1/62 + fts_A + 0.5/61 (activation rank 0)
-		// Even in the worst FTS tie order (B first): A ≈ .0164+.0161+.0082=.0405
+		// Even in the worst FTS tie order (B first): A ≈ .0161+.0161+.0082=.0405
 		// vs B ≈ .0164+.0164=.0328 → A wins on activation alone.
+		// (Cross-exam-verified, Discussion #84: without activation, B wins under
+		// BOTH FTS tie orders, so this test cannot pass without List 4's points.)
 		await store.createEntities([
 			{ name: 'AccessedEnt', entityType: 'test', observations: ['activation probe target alpha'] },
 		]);
@@ -353,6 +355,80 @@ describe('searchNodes relevance mode', () => {
 		// Activation only RERANKS the LIKE/FTS/vector candidate union — it must
 		// never pull a non-matching entity into the results (spec §5.4).
 		expect(rel.entities.map(e => e.name)).not.toContain('HotUnrelated');
+		// Positive control (review #84): the query must actually return results,
+		// otherwise the absence assertion above would pass vacuously.
+		expect(rel.entities.map(e => e.name)).toContain('EntA');
+	});
+
+	it('activation weight stays bounded: retrieval heat never overrides relevance', async () => {
+		// Pins the load-bearing "nudges, never overrides" claim (spec §5.4 /
+		// weight 0.5). Construction (cross-exam-corrected, Discussion #84 —
+		// the cold entity MUST be raw-inserted; a createEntities twin is seeded
+		// access_count 1, joins the activation list, and the detection
+		// threshold balloons from w≈1.02 to w≈63):
+		//   Hot: matches via entity NAME only (LIKE list, no FTS), heated 5×.
+		//   Cold: raw-inserted (count 0, excluded from activation), matches
+		//   via observation content → LIKE + FTS lists.
+		// Hand math at w=0.5: cold = 1/61 + 1/61 ≈ .0328 (LIKE rank varies ≤1
+		// slot; worst .0161+.0164) vs hot = 1/61 + 0.5/61 ≈ .0246. Cold wins
+		// for any activation weight below ≈1.0; a weight regression above that
+		// flips this test.
+		await store.createEntities([
+			{ name: 'weighted probe station', entityType: 'test', observations: ['nothing relevant here'] },
+		]);
+		for (let i = 0; i < 5; i++) {
+			await store.openNodes(['weighted probe station']);
+		}
+		const db = new Database(dbPath);
+		try {
+			const future = new Date(Date.now() + 60_000).toISOString();
+			db.prepare(
+				`INSERT INTO entities (name, normalized_name, entity_type, updated_at, created_at) VALUES (?, ?, ?, ?, ?)`
+			).run('ColdRelevant', 'coldrelevant', 'test', future, future);
+			const entId = (db.prepare(`SELECT id FROM entities WHERE name = 'ColdRelevant'`).get() as { id: number }).id;
+			db.prepare(
+				`INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)`
+			).run(entId, 'weighted probe analysis', future);
+		} finally {
+			db.close();
+		}
+		const rel = await store.searchNodes('weighted probe', undefined, { limit: 10 }, undefined, undefined, 'relevance');
+		expect(rel.entities[0].name).toBe('ColdRelevant');
+	});
+
+	it('never-accessed entities are EXCLUDED from the activation list, not tail-ranked', async () => {
+		// Deterministic pin for the -Infinity exclusion (review #84 (d): the
+		// FTS tie order is plan-determined, so a regression to tail-ranking
+		// would consistently HIDE in a given environment rather than flake —
+		// this construction detects it in both tie orders).
+		//   A: created normally (access_count ≥ 1, recent → activation rank 0).
+		//   C: raw-inserted cold, STRICTLY better lexical profile — newer
+		//      updated_at (LIKE rank 0) and a shorter observation with the same
+		//      term hits (better bm25 → FTS rank 0, no tie to break).
+		// Hand math (weights 1.0/1.0/0.5): C leads lexically by
+		// (1/61−1/62)·2 ≈ .00053. Correct exclusion: A's activation bonus is
+		// 0.5/61 ≈ .0082 → A wins by ≈ .0077. Regression to tail-ranking: C
+		// takes activation rank 1 → A's net bonus shrinks to
+		// 0.5/61 − 0.5/62 ≈ .00013 < .00053 → C wins. Assert A first.
+		await store.createEntities([
+			{ name: 'ExclusionAccessed', entityType: 'test', observations: ['exclusion checkpoint among several other trailing words'] },
+		]);
+		const db = new Database(dbPath);
+		try {
+			const future = new Date(Date.now() + 60_000).toISOString();
+			db.prepare(
+				`INSERT INTO entities (name, normalized_name, entity_type, updated_at, created_at) VALUES (?, ?, ?, ?, ?)`
+			).run('ExclusionCold', 'exclusioncold', 'test', future, future);
+			const entId = (db.prepare(`SELECT id FROM entities WHERE name = 'ExclusionCold'`).get() as { id: number }).id;
+			db.prepare(
+				`INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)`
+			).run(entId, 'exclusion checkpoint', future); // shorter doc, same terms → strictly better bm25
+		} finally {
+			db.close();
+		}
+		const rel = await store.searchNodes('exclusion checkpoint', undefined, { limit: 10 }, undefined, undefined, 'relevance');
+		expect(rel.entities.map(e => e.name)).toContain('ExclusionCold'); // still a member
+		expect(rel.entities[0].name).toBe('ExclusionAccessed');           // exclusion decides
 	});
 
 	it('reports rankingDegraded when the FTS list is lost, and omits it on healthy runs', async () => {

@@ -769,7 +769,11 @@ export class SqliteStore implements GraphStore {
         ).run();
 
         this.db.prepare('UPDATE schema_version SET version = 10').run();
-      })();
+        // IMMEDIATE retrofitted alongside v12's fix (Discussion #84): this
+        // migration shares the deferred-transaction shape whose loser could
+        // die on SQLITE_BUSY_SNAPSHOT instead of reaching the duplicate-column
+        // catch above. Same one-word fix, same rationale as v11/v12.
+      }).immediate();
       currentVersion = 10;
     }
 
@@ -855,7 +859,13 @@ export class SqliteStore implements GraphStore {
       // eviction tiers as a retention signal; left as a comment-only note.
       //
       // Race safety: same try-catch-duplicate-column pattern as v10 (Issue #78 —
-      // concurrent instances race the ALTER; losers continue to the version bump).
+      // concurrent instances race the ALTER; losers continue to the version bump),
+      // PLUS IMMEDIATE like v11: even a write-first migration can pin a read
+      // snapshot at prepare() time inside a deferred transaction and die with
+      // SQLITE_BUSY_SNAPSHOT instead of reaching the duplicate-column catch.
+      // (The snapshot mechanism is a review hypothesis — Discussion #84 — and
+      // isn't testable without a two-process harness [DEF-RR-04]; IMMEDIATE is
+      // free and structurally closes the question either way.)
       this.db.transaction(() => {
         try {
           this.db.prepare(
@@ -867,7 +877,7 @@ export class SqliteStore implements GraphStore {
           // Another process already added the column — safe to continue.
         }
         this.db.prepare('UPDATE schema_version SET version = 12').run();
-      })();
+      }).immediate();
       currentVersion = 12;
     }
 
@@ -1187,8 +1197,10 @@ export class SqliteStore implements GraphStore {
     // Prepared statements are compiled once and reused for every row in the transaction.
     // Schema v8 added normalized_name as the identity key — every entity insert must populate it.
     // last_accessed_at initialized to updated_at — migration data gets a reasonable starting point.
+    // access_count seeded to 1 (PARITY RULE — this INSERT writes last_accessed_at, so it counts;
+    // same "encoding is the first presentation" rationale as createEntities).
     const insertEntity = this.db.prepare(
-      'INSERT OR IGNORE INTO entities (name, normalized_name, entity_type, project, updated_at, created_at, last_accessed_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO entities (name, normalized_name, entity_type, project, updated_at, created_at, last_accessed_at, access_count) VALUES (?, ?, ?, ?, ?, ?, ?, 1)'
     );
     // Look up the auto-assigned id after inserting. Goes through normalized_name +
     // active filter so a hypothetical re-run (after partial crash) finds the right row
@@ -2963,7 +2975,12 @@ export class SqliteStore implements GraphStore {
         const chunk = unionIds.slice(i, i + CHUNK_SIZE);
         const placeholders = chunk.map(() => '?').join(',');
         const rows = this.db.prepare(
-          `SELECT id, access_count, last_accessed_at FROM entities WHERE id IN (${placeholders})`
+          // superseded_at filter: an entity soft-deleted between candidate
+          // collection and this lookup shouldn't occupy activation rank slots
+          // (hydration would drop it anyway, but its slot would deflate the
+          // RRF contribution of every entity ranked below it). Free predicate
+          // on rows already fetched by rowid seek — no plan change.
+          `SELECT id, access_count, last_accessed_at FROM entities WHERE id IN (${placeholders}) AND superseded_at = ''`
         ).all(...chunk) as { id: number; access_count: number; last_accessed_at: string }[];
         for (const r of rows) {
           const a = activationScore(r.access_count, r.last_accessed_at, nowMs);

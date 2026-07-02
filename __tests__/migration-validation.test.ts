@@ -108,6 +108,21 @@ describe('Migration safety validation', () => {
     const bakExists = await fs.access(jsonlPath + '.bak').then(() => true).catch(() => false);
     expect(bakExists).toBe(true);
 
+    // Parity rule (v12, review #84): migrateFromJsonl's INSERT writes
+    // last_accessed_at, so it must seed access_count = 1 — the migration is
+    // this store's "encoding" of the entity, same rationale as createEntities.
+    // Raw connection: readGraph deliberately doesn't touch/count, so this read
+    // can't perturb what it measures.
+    const Database = (await import('better-sqlite3')).default;
+    const rawDb = new Database(dbPath, { readonly: true });
+    try {
+      const counts = rawDb.prepare('SELECT access_count FROM entities').all() as { access_count: number }[];
+      expect(counts.length).toBeGreaterThan(0);
+      for (const c of counts) expect(c.access_count).toBe(1);
+    } finally {
+      rawDb.close();
+    }
+
     await sqliteStore.close();
   });
 

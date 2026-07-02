@@ -140,6 +140,21 @@ describe('last_accessed_at access discipline', () => {
 
     await store.readGraph(); // bulk read — must NOT count
     expect(readCount('CountTarget')).toBe(afterCreate + 2);
+
+    // The four INLINE parity sites (review #84 (b) — these write
+    // last_accessed_at directly, not via the touch helpers, and each must
+    // count exactly once under the parity rule):
+    await store.addObservations([{ entityName: 'CountTarget', contents: ['second obs'] }]);
+    expect(readCount('CountTarget')).toBe(afterCreate + 3);
+
+    await store.deleteObservations([{ entityName: 'CountTarget', contents: ['second obs'] }]);
+    expect(readCount('CountTarget')).toBe(afterCreate + 4);
+
+    await store.supersedeObservations([{ entityName: 'CountTarget', oldContent: 'countable', newContent: 'countable v2' }]);
+    expect(readCount('CountTarget')).toBe(afterCreate + 5);
+
+    await store.setObservationMetadata([{ entityName: 'CountTarget', content: 'countable v2', importance: 4 }]);
+    expect(readCount('CountTarget')).toBe(afterCreate + 6);
   });
 
   it('entityTimeline updates last_accessed_at (viewing history = intent)', async () => {
