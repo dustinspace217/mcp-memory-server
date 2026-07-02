@@ -105,6 +105,10 @@ export interface TimelineRelation {
   relationType: string;
   createdAt: string;
   supersededAt: string;
+  /** Valid time (v14) — present only when set. An invalidated relation's valid
+   *  window is only naturally visible HERE (active reads exclude it). */
+  validFrom?: string;
+  validUntil?: string;
   /** 'active' = current, 'superseded' = retired, 'tombstoned' = stripped by eviction. */
   status: 'active' | 'superseded' | 'tombstoned';
 }

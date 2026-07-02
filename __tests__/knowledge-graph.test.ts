@@ -155,6 +155,15 @@ describe.each<[string, string, StoreFactory]>([
 			expect(withTime.validUntil).toBe('2023-06-30T00:00:00.000Z');
 			expect(without.validFrom).toBeUndefined();
 			expect(without.validUntil).toBeUndefined();
+
+			// readGraph's bare (unscoped+unpaginated) relation query is the ONE
+			// hydration that doesn't route through getConnectedRelations — review
+			// #87 caught it shipping without the fields while openNodes (above)
+			// accidentally routed around it. Pin both paths.
+			const bare = await store.readGraph();
+			const bareRel = bare.relations.find(r => r.to === 'Employer')!;
+			expect(bareRel.validFrom).toBe('2019-03-01T00:00:00.000Z');
+			expect(bareRel.validUntil).toBe('2023-06-30T00:00:00.000Z');
 		});
 
 		// Write-time vocabulary canonicalization (v1.3.0 Phase C2, spec §6.3).
@@ -3669,7 +3678,8 @@ describe('SqliteStore-specific', () => {
 			// v12 added access_count on entities for retrieval strengthening.
 			// v13 normalized drifted relation-type spellings (explicit reviewed map).
 			// v14 added valid_from/valid_until (bi-temporal valid time) to observations + relations.
-			expect(row!.version).toBe(14);
+			// v15 added vec_config (single-row embedding-model identity guard).
+			expect(row!.version).toBe(15);
 		});
 	});
 
@@ -4290,6 +4300,50 @@ describe('SqliteStore-specific', () => {
 			const timeline = await store.entityTimeline('ValidTimeTest');
 			expect(timeline!.observations[0].validFrom).toBe('2019-03-01T00:00:00.000Z');
 			expect(timeline!.observations[0].validUntil).toBeUndefined();
+		});
+
+		it('supersede: old observation keeps its valid time in history; replacement starts unset (v14)', async () => {
+			// New content is a NEW claim — inheriting the old claim's world-time
+			// window would be a silent lie. The superseded row's window stays on
+			// the historical record (review #87 pin).
+			await store.createEntities([
+				{ name: 'SupersedeVT', entityType: 'fact', observations: ['employed at Acme'] },
+			]);
+			await store.setObservationMetadata([
+				{ entityName: 'SupersedeVT', content: 'employed at Acme', validFrom: '2019-03-01T00:00:00.000Z', validUntil: '2023-06-30T00:00:00.000Z' },
+			]);
+			await store.supersedeObservations([
+				{ entityName: 'SupersedeVT', oldContent: 'employed at Acme', newContent: 'employed at Acme, then consulted for them' },
+			]);
+			const timeline = await store.entityTimeline('SupersedeVT');
+			const oldObs = timeline!.observations.find(o => o.content === 'employed at Acme')!;
+			const newObs = timeline!.observations.find(o => o.content.includes('consulted'))!;
+			expect(oldObs.status).toBe('superseded');
+			expect(oldObs.validFrom).toBe('2019-03-01T00:00:00.000Z'); // history keeps its window
+			expect(oldObs.validUntil).toBe('2023-06-30T00:00:00.000Z');
+			expect(newObs.status).toBe('active');
+			expect(newObs.validFrom).toBeUndefined(); // new claim starts unset
+			expect(newObs.validUntil).toBeUndefined();
+		});
+
+		it('invalidated relations keep their valid window, visible on the timeline (v14)', async () => {
+			// Once invalidated, a relation is excluded from every active read —
+			// the timeline is the only natural surface for its valid window.
+			await store.createEntities([
+				{ name: 'TimelineRelEnt', entityType: 'person', observations: [] },
+				{ name: 'OldClub', entityType: 'org', observations: [] },
+			]);
+			await store.createRelations([
+				{ from: 'TimelineRelEnt', to: 'OldClub', relationType: 'member_of', validFrom: '2020-01-01T00:00:00.000Z', validUntil: '2022-01-01T00:00:00.000Z' },
+			]);
+			await store.invalidateRelations([
+				{ from: 'TimelineRelEnt', to: 'OldClub', relationType: 'member_of' },
+			]);
+			const timeline = await store.entityTimeline('TimelineRelEnt');
+			const rel = timeline!.relations.find(r => r.to === 'OldClub')!;
+			expect(rel.status).toBe('superseded');
+			expect(rel.validFrom).toBe('2020-01-01T00:00:00.000Z');
+			expect(rel.validUntil).toBe('2022-01-01T00:00:00.000Z');
 		});
 
 		it('updates importance without changing content or timestamps', async () => {

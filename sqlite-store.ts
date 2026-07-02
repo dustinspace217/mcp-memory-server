@@ -5,7 +5,7 @@
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { promises as fs } from 'fs';
-import { EmbeddingPipeline, EMBEDDING_DIM, type VectorState } from './embedding.js';
+import { EmbeddingPipeline, EMBEDDING_DIM, EMBED_MODEL, DEFAULT_EMBED_MODEL, type VectorState } from './embedding.js';
 import {
   createObservation,
   ENTITY_TIMESTAMP_SENTINEL,
@@ -955,6 +955,26 @@ export class SqliteStore implements GraphStore {
       currentVersion = 14;
     }
 
+    if (currentVersion < 15) {
+      // Migration 14 → 15: embedding-model identity (Phase G1).
+      //
+      // vec_config records WHICH model wrote the vectors in vec_observations.
+      // An ordinary single-row table (not a vec0 aux column: the whole table is
+      // always one model — full clear + re-embed on switch — so per-row
+      // provenance is pointless). Seeded with the HISTORICAL default (MiniLM),
+      // NOT the configured EMBED_MODEL: every pre-v15 vector was written by
+      // MiniLM, so seeding the configured name would let a first-run-with-new-
+      // model slip past the startup mismatch guard with stale MiniLM vectors
+      // intact. The guard (vector-setup block below) then handles any
+      // configured-vs-recorded difference by clearing + re-embedding.
+      this.db.transaction(() => {
+        this.db.exec(`CREATE TABLE IF NOT EXISTS vec_config (id INTEGER PRIMARY KEY CHECK (id = 1), model_name TEXT NOT NULL)`);
+        this.db.prepare(`INSERT OR IGNORE INTO vec_config (id, model_name) VALUES (1, ?)`).run(DEFAULT_EMBED_MODEL);
+        this.db.prepare('UPDATE schema_version SET version = 15').run();
+      }).immediate();
+      currentVersion = 15;
+    }
+
     // === Indexes (idempotent, run on every startup) ===
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
@@ -1081,6 +1101,23 @@ export class SqliteStore implements GraphStore {
         `);
 
         this.vecTableExists = true;
+
+        // Embedding-model identity guard (v15/Phase G1): if the configured
+        // model differs from the one that wrote the stored vectors, CLEAR them
+        // — cosines across different models are meaningless garbage, and this
+        // makes a mixed-model index impossible rather than silently wrong. The
+        // background sweep re-embeds everything with the new model, so a model
+        // switch is one env flip + one restart, self-healing. Rollback is the
+        // same flip back. Racing instances: the loser reads the already-updated
+        // config and no-ops (IMMEDIATE keeps the read under the write lock).
+        const vecCfg = this.db.prepare('SELECT model_name FROM vec_config WHERE id = 1').get() as { model_name: string } | undefined;
+        if (vecCfg && vecCfg.model_name !== EMBED_MODEL) {
+          console.error(`Embedding model changed (${vecCfg.model_name} -> ${EMBED_MODEL}): clearing vec_observations for a full re-embed by the background sweep`);
+          this.db.transaction(() => {
+            this.db.prepare('DELETE FROM vec_observations').run();
+            this.db.prepare('UPDATE vec_config SET model_name = ? WHERE id = 1').run(EMBED_MODEL);
+          }).immediate();
+        }
 
         // Startup consistency check: find stale embeddings and delete them.
         // Catches both truly orphaned vec rows (observation was CASCADE-deleted)
@@ -1290,8 +1327,10 @@ export class SqliteStore implements GraphStore {
     );
     // Relations store the NORMALIZED form for from_entity / to_entity (post-v8). The
     // JSONL file holds display names, so we normalize before insert.
+    // valid_from/valid_until (v14): JSONL relations can carry valid time —
+    // migrate it rather than dropping it (review #87 minor).
     const insertRel = this.db.prepare(
-      'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type) VALUES (?, ?, ?)'
+      'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type, valid_from, valid_until) VALUES (?, ?, ?, ?, ?)'
     );
 
     // Track valid normalized names so we can skip dangling relations (no FK to enforce
@@ -1345,7 +1384,7 @@ export class SqliteStore implements GraphStore {
           continue;
         }
         // INSERT OR IGNORE handles duplicate relations
-        insertRel.run(fromNorm, toNorm, rel.relationType);
+        insertRel.run(fromNorm, toNorm, rel.relationType, rel.validFrom ?? '', rel.validUntil ?? '');
       }
     });
     txn();
@@ -2109,6 +2148,10 @@ export class SqliteStore implements GraphStore {
     // so metadata isn't lost during content updates (use set_observation_metadata to change these).
     // source_instance is set from the CURRENT instance (the one performing the supersede),
     // not carried forward — the new observation was authored by this instance.
+    // VALID TIME (v14) is DELIBERATELY NOT carried forward: new content is a new
+    // claim, and inheriting the old claim's world-time window would be a silent
+    // lie (the superseded row keeps its own window in the timeline; set the
+    // replacement's via set_observation_metadata when it genuinely applies).
     const insertObs = this.db.prepare(
       `INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance) VALUES (?, ?, ?, ?, ?, ?, ?)`
     );
@@ -2572,18 +2615,29 @@ export class SqliteStore implements GraphStore {
     // no active entity row matches. Pass alias 'r' so the temporal filter qualifies
     // its column references and doesn't collide with the JOINed entities.superseded_at.
     const relFilter = this.temporalRelFilter(asOf, 'r');
-    const relations = this.db.prepare(
+    const relRows = this.db.prepare(
       `SELECT
           COALESCE(ef.name, r.from_entity) AS "from",
           COALESCE(et.name, r.to_entity)   AS "to",
           r.relation_type AS relationType,
           r.created_at    AS createdAt,
-          r.superseded_at AS supersededAt
+          r.superseded_at AS supersededAt,
+          r.valid_from    AS vf,
+          r.valid_until   AS vu
        FROM relations r
        LEFT JOIN entities ef ON ef.normalized_name = r.from_entity AND ef.superseded_at = ''
        LEFT JOIN entities et ON et.normalized_name = r.to_entity   AND et.superseded_at = ''
        WHERE ${relFilter.clause}`
-    ).all(...relFilter.params) as Relation[];
+    ).all(...relFilter.params) as (Relation & { vf: string; vu: string })[];
+    // Valid time (v14): '' sentinel → field absent. This bare query is the ONE
+    // relation hydration that doesn't route through getConnectedRelations —
+    // review #87 caught it shipping without the fields (the round-trip test had
+    // used openNodes, accidentally routing around this path).
+    const relations: Relation[] = relRows.map(({ vf, vu, ...rel }) => ({
+      ...rel,
+      ...(vf ? { validFrom: vf } : {}),
+      ...(vu ? { validUntil: vu } : {}),
+    }));
 
     return { entities, relations, nextCursor, totalCount };
   }
@@ -2780,7 +2834,7 @@ export class SqliteStore implements GraphStore {
     // Vector results appear as supplementary matches appended to the page.
     if (this.vecTableExists && this.embeddingPipeline.state.status === 'ready') {
       try {
-        const queryEmbedding = await this.embeddingPipeline.embed(query);
+        const queryEmbedding = await this.embeddingPipeline.embed(query, 'query');
         if (queryEmbedding) {
           // Request more KNN results than the page limit to account for
           // duplicates and multiple observations per entity. When memoryType is
@@ -3031,7 +3085,7 @@ export class SqliteStore implements GraphStore {
     const vecStatus = this.embeddingPipeline.state.status;
     if (this.vecTableExists && vecStatus === 'ready') {
       try {
-        const queryEmbedding = await this.embeddingPipeline.embed(query);
+        const queryEmbedding = await this.embeddingPipeline.embed(query, 'query');
         if (queryEmbedding) {
           const baseK = limit * 2;
           const knnK = Math.min(memoryType ? Math.max(baseK, 200) : baseK, 500);
@@ -3549,7 +3603,7 @@ export class SqliteStore implements GraphStore {
       return { precedents: [], modelReady, vectorSearchEnabled };
     }
 
-    const embedding = await this.embeddingPipeline.embed(query);
+    const embedding = await this.embeddingPipeline.embed(query, 'query');
     if (!embedding) return { precedents: [], modelReady, vectorSearchEnabled };
 
     // Over-fetch: KNN ranks over ALL observations, but we then filter by active/project/memoryType,
@@ -3889,7 +3943,9 @@ export class SqliteStore implements GraphStore {
         r.relation_type,
         r.created_at,
         r.superseded_at,
-        r.tombstoned_at
+        r.tombstoned_at,
+        r.valid_from,
+        r.valid_until
       FROM relations r
       LEFT JOIN entities ef ON ef.normalized_name = r.from_entity AND ef.superseded_at = ''
       LEFT JOIN entities et ON et.normalized_name = r.to_entity   AND et.superseded_at = ''
@@ -3898,6 +3954,7 @@ export class SqliteStore implements GraphStore {
     `).all(normalizedName, normalizedName) as {
       from_entity: string; to_entity: string; relation_type: string;
       created_at: string; superseded_at: string; tombstoned_at: string;
+      valid_from: string; valid_until: string;
     }[];
 
     // Map DB rows to TimelineRelation with computed status field.
@@ -3911,6 +3968,11 @@ export class SqliteStore implements GraphStore {
       status: r.tombstoned_at !== '' ? 'tombstoned' as const
             : r.superseded_at === '' ? 'active' as const
             : 'superseded' as const,
+      // Valid time (v14): an INVALIDATED relation's valid window is only
+      // naturally visible here — active reads exclude the relation entirely
+      // (review #87: observations got this treatment first; relations must too).
+      ...(r.valid_from ? { validFrom: r.valid_from } : {}),
+      ...(r.valid_until ? { validUntil: r.valid_until } : {}),
     }));
 
     return {

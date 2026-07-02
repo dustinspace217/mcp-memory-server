@@ -89,3 +89,29 @@ describe('SqliteStore vector infrastructure', () => {
 		expect(results2.entities).toHaveLength(1);
 	});
 });
+
+// ── Embedder configuration (Phase G1: env-driven model/pooling/prefix) ────────
+
+describe('embedder configuration', () => {
+	it('defaults preserve the historical MiniLM setup when env vars are unset', async () => {
+		// The test env doesn't set MEMORY_EMBED_MODEL/_POOLING — the resolved
+		// values must be the pre-G1 constants, so existing deployments see zero
+		// change from the configurability alone.
+		const { EMBED_MODEL, EMBED_POOLING, DEFAULT_EMBED_MODEL } = await import('../embedding.js');
+		expect(DEFAULT_EMBED_MODEL).toBe('Xenova/all-MiniLM-L6-v2');
+		expect(EMBED_MODEL).toBe('Xenova/all-MiniLM-L6-v2');
+		expect(EMBED_POOLING).toBe('mean');
+	});
+
+	it('prefixedInput applies the prefix to QUERY embeds only', async () => {
+		// Retrieval-specialized models (arctic, granite, bge) are asymmetric:
+		// the query side needs an instruction prefix, stored passages don't.
+		// (The 2026-06-20 Phase 2b control run showed omitting the prefix turns
+		// a dead-heat model into an apparent loser — this helper is that lesson.)
+		const { prefixedInput } = await import('../embedding.js');
+		expect(prefixedInput('find the cat', 'query', 'QUERYPFX: ')).toBe('QUERYPFX: find the cat');
+		expect(prefixedInput('the cat sat', 'passage', 'QUERYPFX: ')).toBe('the cat sat');
+		// Empty prefix (the MiniLM default): identity for both kinds.
+		expect(prefixedInput('find the cat', 'query', '')).toBe('find the cat');
+	});
+});

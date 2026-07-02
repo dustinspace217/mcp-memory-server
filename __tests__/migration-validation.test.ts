@@ -1208,6 +1208,14 @@ describe('Migration safety validation', () => {
     expect(preexistingObs.valid_from).toBe('');
     expect(preexistingObs.valid_until).toBe('');
 
+    // Verify: v15 also ran — vec_config exists and is seeded with the HISTORICAL
+    // default model (MiniLM), not the configured one: pre-v15 vectors can only
+    // have been written by MiniLM, so seeding the configured model would let a
+    // simultaneous model switch slip past the mismatch guard un-re-embedded.
+    expect(version).toBeGreaterThanOrEqual(15);
+    const vecCfg = db2.prepare('SELECT model_name FROM vec_config WHERE id = 1').get() as { model_name: string };
+    expect(vecCfg.model_name).toBe('Xenova/all-MiniLM-L6-v2');
+
     db2.close();
     await sqliteStore.close();
   });

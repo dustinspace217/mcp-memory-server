@@ -393,6 +393,60 @@ describe('Vector search integration', () => {
     expect(emptied.rerankApplied).toBeUndefined();
   });
 
+  it('vec_config model guard: a model switch clears stale vectors on startup (v15)', async () => {
+    // Dedicated store on its own db file — this test mutates vec_config and
+    // clears vec_observations, which must never touch the shared fixture.
+    // Deliberately does NOT wait for the model: the guard runs at init() from
+    // a string comparison, so no second model instance is ever needed (the
+    // compute-expensive-testing rule), and sqlite-vec loads with vectors on
+    // regardless of model readiness.
+    const guardPath = path.join(testDir, `test-vec-guard-${Date.now()}.db`);
+    const Database = (await import('better-sqlite3')).default;
+    try {
+      const store1 = new SqliteStore(guardPath);
+      await store1.init();
+      store1.shutdown();
+      await store1.close();
+
+      // Simulate a pre-switch world: one fake vector row + a stale model name.
+      const sqliteVec = await import('sqlite-vec');
+      const db = new Database(guardPath);
+      try {
+        sqliteVec.load(db); // vec0 module needed to touch the virtual table
+        const fake = new Float32Array(384).fill(0.5);
+        db.prepare(`INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)`)
+          .run(Buffer.from(fake.buffer), '999999');
+        db.prepare(`UPDATE vec_config SET model_name = 'fake/old-model' WHERE id = 1`).run();
+        expect((db.prepare('SELECT count(*) AS n FROM vec_observations').get() as { n: number }).n).toBe(1);
+      } finally {
+        db.close();
+      }
+
+      // Re-open: init must detect the mismatch, clear the stale vectors, and
+      // record the currently-configured model — making a mismatched index
+      // IMPOSSIBLE rather than silently garbage (cosines across models are
+      // meaningless).
+      const store2 = new SqliteStore(guardPath);
+      await store2.init();
+      store2.shutdown();
+      await store2.close();
+
+      const check = new Database(guardPath);
+      try {
+        sqliteVec.load(check);
+        expect((check.prepare('SELECT count(*) AS n FROM vec_observations').get() as { n: number }).n).toBe(0);
+        const cfg = check.prepare('SELECT model_name FROM vec_config WHERE id = 1').get() as { model_name: string };
+        expect(cfg.model_name).toBe('Xenova/all-MiniLM-L6-v2'); // resolved current model (env unset)
+      } finally {
+        check.close();
+      }
+    } finally {
+      for (const suffix of ['', '-wal', '-shm']) {
+        try { await fs.unlink(guardPath + suffix); } catch { /* ok */ }
+      }
+    }
+  });
+
   it('relevance mode vector list respects projectId scoping', async () => {
     await store.createEntities([
       { name: 'scoped-telescope', entityType: 'gear', observations: ['A refractor instrument for viewing far-off nebulae at night'] },

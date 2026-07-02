@@ -162,7 +162,13 @@ const RelationInputSchema = z.object({
   // Same Z-suffix-only validation as asOf so stored values compare lexicographically.
   validFrom: z.string().datetime({ offset: false }).optional().describe("Optional VALID-TIME start: when the relationship became true in the world (ISO 8601 UTC, Z suffix). Distinct from createdAt (when the database learned it)."),
   validUntil: z.string().datetime({ offset: false }).optional().describe("Optional VALID-TIME end: when the relationship stopped being true in the world (ISO 8601 UTC, Z suffix). Omit for still-true/unknown."),
-});
+}).refine(
+  // A reversed window (until before from) is always caller error — reject at
+  // the boundary rather than storing silent nonsense. Only checkable when both
+  // bounds arrive together (Z-suffixed ISO strings compare lexicographically).
+  (r) => !r.validFrom || !r.validUntil || r.validFrom <= r.validUntil,
+  { message: "validFrom must be <= validUntil" }
+);
 
 // Output schema for relations returned by queries — includes system-managed temporal fields.
 // createdAt: ISO 8601 UTC when the relation was established (sentinel for legacy data).
@@ -313,7 +319,7 @@ server.registerTool(
   "create_relations",
   {
     title: "Create Relations",
-    description: "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice. NOTE: relationType spellings are canonicalized on write — case/separator variants of the core vocabulary or of an existing active type are stored under the existing spelling (the returned relationType shows what was stored); genuinely novel types store verbatim. " + RELATION_TYPE_GUIDANCE,
+    description: "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice. NOTE: relationType spellings are canonicalized on write — case/separator variants of the core vocabulary or of an existing active type are stored under the existing spelling (the returned relationType shows what was stored); genuinely novel types store verbatim. Deduplication is by (from, to, relationType) only: a relation differing solely in validFrom/validUntil from an existing active one is silently skipped (absent from the result array) — to attach or change valid time on an existing relation, invalidate_relations it first, then re-create it with the valid-time fields. " + RELATION_TYPE_GUIDANCE,
     inputSchema: { relations: z.array(RelationInputSchema).max(100) },
     outputSchema: { relations: z.array(RelationOutputSchema) }
   },
@@ -689,6 +695,10 @@ server.registerTool(
         createdAt: z.string(),
         supersededAt: z.string(),
         status: z.enum(['active', 'superseded', 'tombstoned']),
+        // Valid time (v14) — an invalidated relation's valid window is only
+        // naturally visible on the timeline; declared so SDK validation keeps it.
+        validFrom: z.string().optional(),
+        validUntil: z.string().optional(),
       })),
     }
   },

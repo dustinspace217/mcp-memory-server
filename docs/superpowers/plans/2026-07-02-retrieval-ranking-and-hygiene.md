@@ -20,9 +20,31 @@ Done: Phases A (Disc #82, Issue #83) + B (Disc #84) closed. Phase C: v13 vocab m
   sessionend/precompact prompts + checkpoint gate message; null-typed backlog quota (50/run,
   oldest-first) in the consolidation prompt; repo mirror synced (was badly stale). Both pools
   green (651 + 12 = 663).
-Next: Phase F QA (slim), then Phase G Task G1 (env-configurable prefix-aware embedder + vec_config
-  v15); open agent-budget gates: DEF-RR-02 (rerank blind panel) + G2 (embedding panel)
+Next: post #87 QA thread (cross-exam + synthesis), then Task G2 eval-harness prep
+  (phase3_candidates.py — the judge PANEL itself is an agent-budget gate, like DEF-RR-02);
+  then final close-out (package.json 1.3.0 + Version History)
 Blocked: nothing
+
+### Phase F QA stabilization + Phase G1 (2026-07-02 ~14:30, Discussion #87 findings applied)
+1. **[behavioral-change — F review Major]** Timeline RELATIONS now carry valid-time (observations
+   had it; relations didn't — yet an invalidated relation's valid window is only naturally visible
+   on the timeline). Pinned (create → invalidate → timeline shows window).
+2. **[behavioral-change — F review HIGH-by-inspection]** readGraph's bare unscoped+unpaginated
+   relation query — the ONE hydration not routed through getConnectedRelations — was missing the
+   fields; the round-trip test had used openNodes and accidentally routed around it. Fixed +
+   pinned on both paths.
+3. **[other — F review]** create_relations description documents the dedup-ignores-valid-time
+   sharp edge + the invalidate→re-create recipe; RelationInputSchema rejects reversed windows
+   (refine, both-bounds-present only); supersede's deliberate valid-time RESET documented in code
+   + pinned (old row keeps its window in history; replacement starts unset — new content = new
+   claim); migrateFromJsonl carries relation valid-time; JSDoc staleness fixed.
+4. **[Phase G1 complete]** Env-configurable prefix-aware embedder (MEMORY_EMBED_MODEL/_POOLING/
+   _QUERY_PREFIX; embed() gains query/passage kind — searchNodes' two query embeds marked 'query'
+   alongside findPrecedents', a spec-§10.2 extension for consistent semantics, no-op under the
+   MiniLM default) + v15 vec_config guard (seeded with the HISTORICAL default so a simultaneous
+   model switch can't slip past; mismatch → clear + self-healing re-embed). Pool 2 guard test
+   runs WITHOUT a second model instance (string-comparison at init — compute-expensive rule).
+   686 tests green (671 + 15).
 
 ### Phase F code complete (2026-07-02 ~14:15)
 v14 valid-time on observations + relations (migration + full write/read surface:

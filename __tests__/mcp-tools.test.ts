@@ -619,6 +619,21 @@ describe('MCP Tool Handler Integration', () => {
 			expect(VT.safeParse({ validUntil: 'yesterday' }).success).toBe(false);
 		});
 
+		it('rejects a reversed valid-time window when both bounds arrive together', () => {
+			// Mirrors the production refine on RelationInputSchema: until-before-from
+			// is always caller error; single-bound and no-bound inputs pass.
+			const VT = z.object({
+				validFrom: z.string().datetime({ offset: false }).optional(),
+				validUntil: z.string().datetime({ offset: false }).optional(),
+			}).refine(
+				(r) => !r.validFrom || !r.validUntil || r.validFrom <= r.validUntil,
+				{ message: 'validFrom must be <= validUntil' }
+			);
+			expect(VT.safeParse({ validFrom: '2023-01-01T00:00:00.000Z', validUntil: '2019-01-01T00:00:00.000Z' }).success).toBe(false);
+			expect(VT.safeParse({ validFrom: '2019-01-01T00:00:00.000Z', validUntil: '2023-01-01T00:00:00.000Z' }).success).toBe(true);
+			expect(VT.safeParse({ validFrom: '2019-01-01T00:00:00.000Z' }).success).toBe(true);
+		});
+
 		it('accepts omitting asOf (treats as undefined / current state)', () => {
 			const result = ReadGraphInputSchema.safeParse({});
 			expect(result.success).toBe(true);

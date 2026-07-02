@@ -8,10 +8,49 @@
 // It takes text in, returns float vectors out.
 import type { FeatureExtractionPipeline } from '@huggingface/transformers';
 
-/** The embedding model: all-MiniLM-L6-v2 converted to ONNX format.
- * 384 dimensions, ~23MB download. Cached locally after first use.
- * 'Xenova/' prefix means the ONNX-converted version on Hugging Face. */
-const MODEL_NAME = 'Xenova/all-MiniLM-L6-v2';
+/** The HISTORICAL default embedding model: all-MiniLM-L6-v2 converted to ONNX.
+ * 384 dimensions, ~23MB download, cached locally after first use. 'Xenova/'
+ * prefix means the ONNX-converted version on Hugging Face. Exported separately
+ * from EMBED_MODEL because the v15 vec_config migration seeds with THIS name —
+ * every pre-v15 vector was written by MiniLM, so seeding the configured model
+ * would let a simultaneous model switch slip past the mismatch guard. */
+export const DEFAULT_EMBED_MODEL = 'Xenova/all-MiniLM-L6-v2';
+
+/** The ACTIVE embedding model, env-overridable (Phase G1). Switching models is
+ * a config flip: on startup the store compares this against vec_config's
+ * recorded model and clears vec_observations on mismatch (self-healing
+ * re-embed via the background sweep) — a mixed-model index is never possible.
+ * Any candidate must be a transformers.js-loadable ONNX model with
+ * EMBEDDING_DIM-dimensional output (the vec0 schema is fixed at 384). */
+export const EMBED_MODEL = process.env.MEMORY_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+
+/** Pooling strategy, env-overridable. MiniLM wants 'mean'; bge-family models
+ * want 'cls' — the 2026-06-20 fidelity check proved a mean/cls mismatch is a
+ * SILENT ~4% cosine drift, not an error, so this must switch WITH the model. */
+export const EMBED_POOLING: 'mean' | 'cls' =
+  process.env.MEMORY_EMBED_POOLING === 'cls' ? 'cls' : 'mean';
+
+/** Query-side instruction prefix, env-overridable (default: none, correct for
+ * MiniLM's symmetric embedding). Retrieval-specialized models are ASYMMETRIC:
+ * arctic-embed wants "Represent this sentence for searching relevant
+ * passages: " on QUERIES only — the 2026-06-20 Phase 2b control showed that
+ * omitting it turns a dead-heat model into an apparent loser. */
+const QUERY_PREFIX = process.env.MEMORY_EMBED_QUERY_PREFIX ?? '';
+
+/** Which side of retrieval a text is on. Stored observations are 'passage';
+ * search/precedent queries are 'query'. Dedup comparisons are passage-to-
+ * passage (both sides are stored-observation-shaped text). */
+export type EmbedKind = 'query' | 'passage';
+
+/**
+ * Applies the query-side instruction prefix when (and only when) embedding a
+ * query with a non-empty configured prefix. Pure — the prefix parameter
+ * defaults to the env-resolved value but is injectable for tests (env is baked
+ * at module load, so tests can't vary it after import).
+ */
+export function prefixedInput(text: string, kind: EmbedKind, prefix: string = QUERY_PREFIX): string {
+  return kind === 'query' && prefix ? prefix + text : text;
+}
 
 /** Dimensionality of the embedding vectors. Must match the vec0 table definition. */
 export const EMBEDDING_DIM = 384;
@@ -69,7 +108,7 @@ export class EmbeddingPipeline {
     import('@huggingface/transformers').then(async ({ pipeline }) => {
       // pipeline() downloads the model on first run (~23MB), then caches it.
       // 'feature-extraction' is the task for generating dense vector embeddings.
-      const pipe = await pipeline('feature-extraction', MODEL_NAME, {
+      const pipe = await pipeline('feature-extraction', EMBED_MODEL, {
         dtype: 'fp32',
       });
 
@@ -94,18 +133,23 @@ export class EmbeddingPipeline {
    * Returns null if the model isn't ready (loading, failed, unavailable).
    * Wraps pipeline() in try-catch so a runtime failure doesn't crash the caller.
    *
-   * @param text - The observation content to embed
+   * @param text - The text to embed
+   * @param kind - 'passage' (default — stored observations, dedup comparisons)
+   *   or 'query' (search/precedent lookups). Only queries receive the
+   *   configured instruction prefix; with the MiniLM default (no prefix) the
+   *   two kinds are identical.
    * @returns Float32Array of EMBEDDING_DIM length, or null if unavailable
    */
-  async embed(text: string): Promise<Float32Array | null> {
+  async embed(text: string, kind: EmbedKind = 'passage'): Promise<Float32Array | null> {
     if (this._state.status !== 'ready') return null;
 
     try {
       // pipeline(text, options) runs the ONNX model on the input text.
-      // pooling: 'mean' averages all token embeddings into one vector.
+      // pooling: env-resolved ('mean' for MiniLM; 'cls' for bge-family — a
+      // mismatch is a silent ~4% cosine drift, so it switches WITH the model).
       // normalize: true L2-normalizes so cosine similarity = dot product.
-      const output = await this._state.pipeline(text, {
-        pooling: 'mean',
+      const output = await this._state.pipeline(prefixedInput(text, kind), {
+        pooling: EMBED_POOLING,
         normalize: true,
       });
 
