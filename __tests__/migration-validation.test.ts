@@ -1289,6 +1289,11 @@ describe('Migration safety validation', () => {
     const dynRetired = db2.prepare(
       `SELECT relation_type FROM relations WHERE from_entity = 'alpha' AND to_entity = 'beta' AND superseded_at != ''`
     ).all() as { relation_type: string }[];
+    // NOTE (cross-exam #85): asserting WHICH spelling was retired pins the
+    // RELATION_VOCAB_FIXES array order — swapping the two belongs_to entries
+    // converges to the same end state but retires 'belongs to' instead. That
+    // order-pin is deliberate for a frozen audit map; a reorder should be a
+    // conscious edit that updates this assertion.
     expect(dynRetired).toEqual([{ relation_type: 'belongs-to' }]); // retired with its original spelling
 
     // Idempotency: a second init over the migrated DB is a no-op (guard + naturally

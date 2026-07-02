@@ -520,6 +520,38 @@ describe('relation-type canonicalization ambiguity guard', () => {
 		]);
 		expect(created[0].relationType).toBe('TIED TO');
 	});
+
+	it('the ambiguity ratchet self-heals when one spelling is retired (documented repair path)', async () => {
+		// Pins the repair claim in the ratchet comment (review #85): the map is
+		// rebuilt per call from the live DISTINCT scan, so the ambiguity is a
+		// persistent DATA condition, not locked code state — invalidate one
+		// spelling's rows and canonicalization resumes on the survivor.
+		await store.createEntities([
+			{ name: 'S1', entityType: 'test', observations: [] },
+			{ name: 'S2', entityType: 'test', observations: [] },
+			{ name: 'S3', entityType: 'test', observations: [] },
+			{ name: 'S4', entityType: 'test', observations: [] },
+		]);
+		const db = new Database(dbPath);
+		try {
+			const ins = db.prepare(`INSERT INTO relations (from_entity, to_entity, relation_type, created_at, superseded_at) VALUES (?, ?, ?, ?, '')`);
+			ins.run('s1', 's2', 'routes_to', '2026-06-01T00:00:00.000Z');
+			ins.run('s2', 's3', 'Routes-To', '2026-06-01T00:00:00.000Z');
+		} finally {
+			db.close();
+		}
+		// Ambiguous: verbatim.
+		const before = await store.createRelations([{ from: 'S3', to: 'S4', relationType: 'ROUTES TO' }]);
+		expect(before[0].relationType).toBe('ROUTES TO');
+		// Repair: retire the variant spelling's row (the consolidation agent's move).
+		await store.invalidateRelations([{ from: 'S2', to: 'S3', relationType: 'Routes-To' }]);
+		// ...canonicalization resumes? Not quite yet — the verbatim 'ROUTES TO'
+		// row written above ALSO shares the key, keeping it ambiguous. Retire it
+		// too (a real repair retires every non-survivor spelling), then verify.
+		await store.invalidateRelations([{ from: 'S3', to: 'S4', relationType: 'ROUTES TO' }]);
+		const after = await store.createRelations([{ from: 'S4', to: 'S1', relationType: 'Routes To' }]);
+		expect(after[0].relationType).toBe('routes_to'); // survivor spelling reused
+	});
 });
 
 // ── Trigger behavior under raw-SQL writes (the eviction paths) ─────────────────
@@ -602,6 +634,10 @@ describe('JSONL relevance fallback', () => {
 			const lines = [
 				JSON.stringify({ type: 'relation', from: 'J1', to: 'J2', relationType: 'wired_to', createdAt: '2026-06-01T00:00:00.000Z', supersededAt: '' }),
 				JSON.stringify({ type: 'relation', from: 'J2', to: 'J3', relationType: 'Wired-To', createdAt: '2026-06-01T00:00:00.000Z', supersededAt: '' }),
+				// Superseded same-key spelling: must NOT seed or poison the map —
+				// jsonl-store's map build skips superseded rows, mirroring SQLite's
+				// WHERE superseded_at = '' (cross-exam #85 refinement pin).
+				JSON.stringify({ type: 'relation', from: 'J1', to: 'J3', relationType: 'WIRED_TO', createdAt: '2026-06-01T00:00:00.000Z', supersededAt: '2026-06-02T00:00:00.000Z' }),
 			];
 			await fs.appendFile(jsonlPath, lines.join('\n') + '\n');
 			const created = await jstore.createRelations([
