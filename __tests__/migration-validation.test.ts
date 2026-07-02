@@ -1262,6 +1262,11 @@ describe('Migration safety validation', () => {
     }
     const ins = db.prepare(`INSERT INTO relations (from_entity, to_entity, relation_type, created_at, superseded_at) VALUES (?, ?, ?, ?, ?)`);
     ins.run('alpha', 'beta', 'belongs to', ts, '');                        // case 1: plain rewrite
+    ins.run('alpha', 'beta', 'belongs-to', ts, '');                        // case 4: DYNAMIC collision —
+    // its target row doesn't exist yet; it is CREATED by case 1's rewrite one map entry
+    // earlier. Pins the per-entry retire-before-rewrite structure: a refactor to
+    // "all retires, then all rewrites" would UNIQUE-crash here and brick startup at v12
+    // (review Discussion #85 gap #1).
     ins.run('alpha', 'gamma', 'has_file', ts, '');                        // case 2: drifted...
     ins.run('alpha', 'gamma', 'contains_file', ts, '');                   // ...colliding with existing target
     ins.run('beta', 'gamma', 'belongs to', ts, '2026-06-02T00:00:00.000Z'); // case 3: already superseded
@@ -1274,11 +1279,29 @@ describe('Migration safety validation', () => {
     const version = (db2.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
     expect(version).toBeGreaterThanOrEqual(13);
 
-    // Case 1: rewritten in place, still active.
+    // Case 1: rewritten in place, still active — and case 4's dynamic collision
+    // left exactly ONE active row (the drifted sibling was soft-retired against
+    // the row case 1's rewrite created).
     const rewritten = db2.prepare(
       `SELECT relation_type FROM relations WHERE from_entity = 'alpha' AND to_entity = 'beta' AND superseded_at = ''`
     ).all() as { relation_type: string }[];
     expect(rewritten).toEqual([{ relation_type: 'belongs_to' }]);
+    const dynRetired = db2.prepare(
+      `SELECT relation_type FROM relations WHERE from_entity = 'alpha' AND to_entity = 'beta' AND superseded_at != ''`
+    ).all() as { relation_type: string }[];
+    expect(dynRetired).toEqual([{ relation_type: 'belongs-to' }]); // retired with its original spelling
+
+    // Idempotency: a second init over the migrated DB is a no-op (guard + naturally
+    // idempotent body) — re-open and re-check the same assertions hold.
+    const storeAgain = new SqliteStore(dbPath);
+    await storeAgain.init();
+    await storeAgain.close();
+    const recheck = new Database(dbPath, { readonly: true });
+    const rewrittenAgain = recheck.prepare(
+      `SELECT relation_type FROM relations WHERE from_entity = 'alpha' AND to_entity = 'beta' AND superseded_at = ''`
+    ).all() as { relation_type: string }[];
+    expect(rewrittenAgain).toEqual([{ relation_type: 'belongs_to' }]);
+    recheck.close();
 
     // Case 2: the drifted duplicate is soft-retired; the target row is intact.
     const alphaGamma = db2.prepare(

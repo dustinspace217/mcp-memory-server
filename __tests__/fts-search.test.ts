@@ -584,6 +584,35 @@ describe('JSONL relevance fallback', () => {
 		}
 	});
 
+	it('ambiguity guard: JSONL stores verbatim when two file-resident spellings share a key', async () => {
+		// Parity pin for the SQLite raw-SQL ambiguity test: JSONL's ambiguity
+		// branch is reachable via pre-C2 file contents — write the two spellings
+		// directly into the .jsonl (the file IS the store), then create a third
+		// variant through the API.
+		const jsonlPath = path.join(testDir, `test-fts-jsonl-ambig-${Date.now()}.jsonl`);
+		const jstore = new JsonlStore(jsonlPath);
+		try {
+			await jstore.init();
+			await jstore.createEntities([
+				{ name: 'J1', entityType: 'test', observations: [] },
+				{ name: 'J2', entityType: 'test', observations: [] },
+				{ name: 'J3', entityType: 'test', observations: [] },
+				{ name: 'J4', entityType: 'test', observations: [] },
+			]);
+			const lines = [
+				JSON.stringify({ type: 'relation', from: 'J1', to: 'J2', relationType: 'wired_to', createdAt: '2026-06-01T00:00:00.000Z', supersededAt: '' }),
+				JSON.stringify({ type: 'relation', from: 'J2', to: 'J3', relationType: 'Wired-To', createdAt: '2026-06-01T00:00:00.000Z', supersededAt: '' }),
+			];
+			await fs.appendFile(jsonlPath, lines.join('\n') + '\n');
+			const created = await jstore.createRelations([
+				{ from: 'J3', to: 'J4', relationType: 'WIRED TO' },
+			]);
+			expect(created[0].relationType).toBe('WIRED TO'); // ambiguous → verbatim, same as SQLite
+		} finally {
+			try { await fs.unlink(jsonlPath); } catch { /* ok */ }
+		}
+	});
+
 	it('rejects cursor + relevance (contract mirrors the SQLite guard)', async () => {
 		// Even though JSONL's fallback is recency (which paginates fine), the
 		// cursor+relevance combination must behave identically across backends —

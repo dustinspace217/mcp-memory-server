@@ -34,6 +34,13 @@ describe('relationTypeKey', () => {
 	it('leaves already-canonical lowercase keys unchanged', () => {
 		expect(relationTypeKey('contains_file')).toBe('contains_file');
 	});
+
+	it('trims surrounding whitespace before keying (invisible-edge guard)', () => {
+		// ' CAUSED_BY' must key identically to 'CAUSED_BY' — an untrimmed key
+		// ('_caused_by') would escape canonicalization AND the traversal filter.
+		expect(relationTypeKey(' CAUSED_BY')).toBe('caused_by');
+		expect(relationTypeKey('CAUSED_BY  ')).toBe('caused_by');
+	});
 });
 
 describe('RELATION_VOCAB_FIXES (v13 migration map)', () => {
@@ -53,6 +60,15 @@ describe('RELATION_VOCAB_FIXES (v13 migration map)', () => {
 		const drifted = new Set(RELATION_VOCAB_FIXES.map(([d]) => d));
 		for (const [, target] of RELATION_VOCAB_FIXES) {
 			expect(drifted.has(target), `target ${target} must not itself be a drifted key`).toBe(false);
+		}
+	});
+
+	it('never maps a spelling to itself (mass-retire trap guard)', () => {
+		// If an entry had drifted === target, the migration's collision EXISTS
+		// would match every row against ITSELF and soft-retire the entire type
+		// (review #85 finding 5). The map must never carry such an entry.
+		for (const [drifted, target] of RELATION_VOCAB_FIXES) {
+			expect(drifted, 'identity mapping would mass-retire the type').not.toBe(target);
 		}
 	});
 });

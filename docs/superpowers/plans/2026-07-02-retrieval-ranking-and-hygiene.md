@@ -8,14 +8,19 @@
 > `docs/superpowers/specs/2026-07-02-retrieval-ranking-and-hygiene-design.md` — §12 is the quality
 > contract, §3 the verified facts, §4-§10 the DECIDED designs. Do not re-litigate decisions here.
 
-## Status (updated 2026-07-02, ~04:55 PDT)
-Phase: B of 7 — COMPLETE including three-phase QA (Discussion #84) + stabilization
-Done: Phase A closed (Discussion #82, Issue #83). Phase B: v12 access_count under the PARITY RULE
-  (9ce97f8); activation as fourth RRF list, weight 0.5, union-only (e5b01dc); QA stabilization
-  (this commit): v12+v10 → .immediate(), activation superseded filter, migrateFromJsonl parity
-  seed, weight-bound + exclusion deterministic pins, parity test extended to the inline sites.
-  Both pools green (632 + 12 = 644).
-Next: Phase C Task C1 (relation-vocab migration v13, explicit map)
+## Status (updated 2026-07-02, ~09:30 PDT)
+Phase: C + D of 7 — code COMPLETE with QA stabilization applied (Discussion #85); C cross-exam
+  in flight, synthesis pending
+Done: Phases A (Disc #82, Issue #83) + B (Disc #84) closed. Phase C: v13 vocab migration
+  (0dc6e94; live-copy probe: 128→119 distinct spellings) + write-time canonicalization both
+  backends; stabilization: relationTypeKey trim guard, mass-retire map-trap test, dynamic-
+  collision + idempotency fixture, within-batch fixture, JSONL ambiguity fixture, ratchet
+  documentation, create_relations description note; pre-deploy live-DB rescan confirmed the map
+  current (no variants leaked since the audit). Phase D: memoryType-MANDATORY directive in
+  sessionend/precompact prompts + checkpoint gate message; null-typed backlog quota (50/run,
+  oldest-first) in the consolidation prompt; repo mirror synced (was badly stale). Both pools
+  green (651 + 12 = 663).
+Next: post Phase C cross-exam replies + synthesis to #85, then Phase E Task E1 (pagerank.ts)
 Blocked: nothing
 
 **Goal:** Relevance-ranked hybrid search, retrieval strengthening, graph hygiene, valid-time
@@ -727,3 +732,35 @@ restart store, assert vec table cleared and re-swept).
    plan-determined, so a tail-ranking regression would consistently HIDE rather than flake — the
    pin detects it under both tie orders); never-nominates got its positive control. 644 tests
    (632 + 12).
+
+## Phase C (2026-07-02, ~09:30 — Discussion #85)
+1. **[behavioral-change — hardening]** `relationTypeKey` trims before keying (adversarial #4:
+   ' CAUSED_BY' would escape canonicalization AND the traversal filter — an invisible causal edge).
+2. **[other — accepted + documented: the ambiguity ratchet]** Adversarial #1-#3 (a key holding two
+   active spellings permanently stores verbatim; reachable via pre-deploy leak or concurrent-novel
+   TOCTOU): accepted as designed behavior with the repair path documented in code (the map rebuilds
+   per call from the live scan, so retiring one spelling's rows — e.g. via the consolidation
+   agent — self-heals it). Consequence is verbatim storage (pre-C2 behavior), never corruption.
+   Pre-deploy leak risk CLOSED for this deploy by a live-DB rescan (map matches; no new variants
+   since the audit); "rescan before extending the map" recorded as a MERGE-GATE convention in
+   CLAUDE.md's v13 entry.
+3. **[other — test rigor]** Dynamic-collision fixture (test-analyzer HIGH: a retires-then-rewrites
+   refactor would UNIQUE-crash and brick startup at v12 with the old suite green) + v13 re-run
+   idempotency; within-batch convergence fixture (the in-batch branch was deletable); JSONL
+   ambiguity fixture (raw-file two-spellings — the parity claim was untested); mass-retire map-trap
+   unit test (chosen over adversarial's proposed startup assert: zero runtime cost, same guarantee);
+   `'is part of'` added to the map-contract exceptions (the contract test caught my own
+   misclassification of a filler-word drop as a mechanical merge).
+4. **[other]** create_relations tool description now discloses canonicalization; CLAUDE.md
+   staleness batch (code-reviewer minor 1) fixed; JSONL existingKeys supersededAt divergence
+   (code-reviewer minor 2) left as-is — pre-existing, latent (JSONL cannot supersede via its own
+   API), deprecated backend.
+
+## Phase D (2026-07-02, ~09:15 — prompt edits, no server code)
+1. As planned: memoryType-MANDATORY directive added to sessionend-prompt.md + precompact-prompt.md
+   + the memory-save-gate.sh checkpoint message (all live ~/.claude files; verified one directive
+   per file + bash syntax). Consolidation prompt gained the null-typed backlog quota (50/run,
+   oldest-first, classification-only, drain rate reported) in Pass D.
+2. **[scope-add, justified]** The repo mirror harness/prompts/memory-consolidation.md was badly
+   stale (missing the Pass F ownership block + June QA rules) — synced from the live file rather
+   than editing both separately. The mirror now matches the deployed prompt exactly.

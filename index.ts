@@ -302,7 +302,7 @@ server.registerTool(
   "create_relations",
   {
     title: "Create Relations",
-    description: "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice. " + RELATION_TYPE_GUIDANCE,
+    description: "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice. NOTE: relationType spellings are canonicalized on write — case/separator variants of the core vocabulary or of an existing active type are stored under the existing spelling (the returned relationType shows what was stored); genuinely novel types store verbatim. " + RELATION_TYPE_GUIDANCE,
     inputSchema: { relations: z.array(RelationInputSchema).max(100) },
     outputSchema: { relations: z.array(RelationOutputSchema) }
   },

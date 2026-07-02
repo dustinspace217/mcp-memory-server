@@ -51,7 +51,10 @@ export const RELATION_TYPE_GUIDANCE =
  * decision stands).
  */
 export function relationTypeKey(relationType: string): string {
-  return relationType.toLowerCase().replace(/[\s\-]+/g, '_');
+  // trim first (review #85): ' CAUSED_BY' would otherwise key to '_caused_by',
+  // silently escaping BOTH canonicalization and get_connected_context's
+  // case-insensitive relationTypes filter — an invisible causal edge.
+  return relationType.trim().toLowerCase().replace(/[\s\-]+/g, '_');
 }
 
 /**

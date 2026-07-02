@@ -158,6 +158,22 @@ describe.each<[string, string, StoreFactory]>([
 				expect(created[0].relationType).toBe('belongs_to');
 			});
 
+			it('converges WITHIN a single batch (the in-batch map update)', async () => {
+				// Review #85 gap 2: the separate-calls convergence test below leaves
+				// the in-batch branch deletable. One call, two variants — the second
+				// must canonicalize onto the first's just-written spelling.
+				await store.createEntities([
+					{ name: 'B1', entityType: 'test', observations: [] },
+					{ name: 'B2', entityType: 'test', observations: [] },
+					{ name: 'B3', entityType: 'test', observations: [] },
+				]);
+				const created = await store.createRelations([
+					{ from: 'B1', to: 'B2', relationType: 'feeds_into' },
+					{ from: 'B2', to: 'B3', relationType: 'Feeds-Into' },
+				]);
+				expect(created.map(r => r.relationType)).toEqual(['feeds_into', 'feeds_into']);
+			});
+
 			it('stores genuinely novel types verbatim (open vocabulary preserved)', async () => {
 				await store.createEntities([
 					{ name: 'MoonEnt', entityType: 'test', observations: [] },

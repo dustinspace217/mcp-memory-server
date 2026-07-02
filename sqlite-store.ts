@@ -1642,6 +1642,12 @@ export class SqliteStore implements GraphStore {
       } else if (held !== null && held !== relation_type && !coreSpellings.includes(held)) {
         // Two different stored spellings share this key (pre-v13 data) and
         // neither is core vocab — ambiguous; store future inputs verbatim.
+        // KNOWN LIMITATION (the "ambiguity ratchet", review #85): this state
+        // persists until one spelling's rows are retired — the map is rebuilt
+        // per call from the live DISTINCT scan, so the repair path is data
+        // (invalidate/supersede one spelling, e.g. via the consolidation
+        // agent), not code. Consequence is verbatim storage (pre-C2 behavior),
+        // never corruption.
         typeKeyMap.set(key, null);
       }
     }
