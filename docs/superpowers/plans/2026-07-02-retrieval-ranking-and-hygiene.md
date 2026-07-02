@@ -20,10 +20,19 @@ Done: Phases A (Disc #82, Issue #83) + B (Disc #84) closed. Phase C: v13 vocab m
   sessionend/precompact prompts + checkpoint gate message; null-typed backlog quota (50/run,
   oldest-first) in the consolidation prompt; repo mirror synced (was badly stale). Both pools
   green (651 + 12 = 663).
-Next: post #87 QA thread (cross-exam + synthesis), then Task G2 eval-harness prep
-  (phase3_candidates.py — the judge PANEL itself is an agent-budget gate, like DEF-RR-02);
-  then final close-out (package.json 1.3.0 + Version History)
-Blocked: nothing
+Next: close #87 (cross-exam replies + synthesis, in flight), then the arc is DONE except the two
+  agent-budget gates. Version bumped to 1.3.0; Version History written; G2 harness committed
+  (memory-graph-viz 23460dd — phase3_candidates.py, granite-s-r2 + arctic-s vs MiniLM).
+Blocked: nothing. OPEN GATES (agent-budget, deliberate): DEF-RR-02 rerank blind panel;
+  G2 judge panel (then G3 cutover, CONDITIONAL on ≥12/18 + Dustin's go).
+
+## Deferments register — FINAL RECONCILIATION (2026-07-02)
+| ID | Sev | Title | Status at arc close |
+|---|---|---|---|
+| DEF-RR-01 | MED | as_of_valid query filtering | OPEN by design (record-only valid time; build on demonstrated query need) |
+| DEF-RR-02 | MED | Flip find_precedents rerank default | OPEN — blind panel ≥12/18 required; param shipped dark |
+| DEF-RR-03 | LOW | access_count as eviction signal | OPEN indefinite (comment-only note at the v12 migration) |
+| DEF-RR-04 | LOW | Two-connection migration race test | OPEN indefinite (child-process harness; IMMEDIATE fix verified by trace ×3 lenses) |
 
 ### Phase F QA stabilization + Phase G1 (2026-07-02 ~14:30, Discussion #87 findings applied)
 1. **[behavioral-change — F review Major]** Timeline RELATIONS now carry valid-time (observations
