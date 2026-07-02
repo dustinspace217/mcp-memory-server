@@ -31,7 +31,10 @@
 # Enqueue is ATOMIC: producers build in staging/ and mq_enqueue mv's the dir
 # into jobs/ — same filesystem, so the worker can never see a half-written job.
 
-MQ_ROOT="$HOME/.local/state/claude-memory-queue"
+# env-overridable so tests can point at a sandbox queue instead of the real
+# one (QA 2026-07-02: the hardcoded path made the mechanics test execute any
+# REAL pending jobs). Production callers never set MQ_ROOT.
+MQ_ROOT="${MQ_ROOT:-$HOME/.local/state/claude-memory-queue}"
 
 # mq_new_staging LABEL — create a staging dir, echo its path.
 # LABEL becomes part of the jobid: <utc-timestamp>-<label>-<pid> is unique

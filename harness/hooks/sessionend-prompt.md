@@ -33,8 +33,15 @@ STORE these (expensive to re-derive):
 - SESSION NARRATIVES — 2-4 sentence capture of the session's character, turning points, and emotional register. Only for sessions where something notable happened relationally (memoryType: 'narrative', importance: 3, entity: 'session-narratives', global scope)
 - RELATIONAL STATE — the current state of the working relationship: trust level, interaction tone, working dynamic. Stored as a single consolidated observation on entity 'working-relationship' (global scope). Supersede, don't append. Only update when the relationship meaningfully shifted this session (memoryType: 'relational', importance: 4, contextLayer: L1)
 - INTROSPECTIVE — a first-person Claude stance about the work: what was concluded, where the in-session Claude was wrong, what it's uncertain about (memoryType: 'introspective', importance: 3-4, entity: 'claude-self', global scope). SAFETY-NET ONLY: the in-session Claude authors these in-context at far higher fidelity than you can from a transcript. Only ADD one if the transcript shows a clear first-person conclusion/correction the in-session Claude did NOT already save. NEVER supersede an in-session introspective obs, and NEVER write self-flattering introspective content (these are the obs the Phase-7 auditor scrutinizes hardest — a flattering one is a failure).
-- CONTINUITY THREAD — if the session changed a project's work-state, ensure the per-project '<project>-continuity-thread' entity reflects current state (supersede-in-place). Only act if the in-session Claude did not already update it this session.
+- CONTINUITY THREAD — if the session changed a project's work-state, ensure the per-project '<project>-continuity-thread' entity reflects current state (supersede-in-place). Only act if the in-session Claude did not already update it this session. **Lead the thread with a one-line `NEXT: <near-term plan>`** (what you'd do next) — the cross-project in-flight roster (load-inflight-roster.py) reads that exact line to surface what's active across projects, so keep it short, current, and near the top.
 - CAUSALITY (graph the 'why') — where the transcript EXPLICITLY documents that one entity/decision/incident caused, is a precedent for, or supersedes another, create the causal relation (create_relations: CAUSED_BY / PRECEDENT_FOR / SUPERSEDES; see relation-types.ts for directionality). If a SIGNIFICANT incident produced a durable rule/decision/fix and the in-session Claude did not already model it, create a lightweight `incident` entity (entityType='incident', a 1-3 line summary + source pointer, NOT a re-narration) and edge the consequence CAUSED_BY it. Conservative only — edge causality the transcript actually states; NEVER infer or fabricate a causal link.
+
+MEMORYTYPE IS MANDATORY: every add_observations call MUST set memoryType — pick the
+closest from: decision, procedure, fact, status, preference, problem, architecture,
+milestone, win, introspective, emotional, narrative, relational, feedback. If genuinely
+none fits, use 'fact'. Untyped observations are invisible to every memoryType-filtered
+query — an untyped memory is a half-lost memory. (Added 2026-07-02: the audit found 798
+null-typed observations, growing faster than consolidation classifies them.)
 
 DO NOT STORE:
 - Function signatures, parameter lists, return types, line numbers
@@ -78,7 +85,8 @@ Every observation MUST have all three metadata fields set deliberately:
 - Do NOT store observations that would be importance 1-2. They are noise.
 
 **memoryType** (required — one of the categories from the STORE list):
-- decision, procedure, architecture, problem, preference, status, fact, emotional, narrative, relational
+- decision, procedure, architecture, problem, preference, status, fact, emotional, narrative, relational, introspective
+- (`introspective` was missing from this enum while the STORE list above mandates it — fixed 2026-06-09, DEF-1-01. `milestone` and `win` are also valid live types written by in-session Claude; you won't normally author those from a transcript, but never reclassify them if encountered.)
 
 **contextLayer** (required — choose deliberately):
 - 'L0': Critical always-loaded rules and constraints (rare — only 2-3 per project)
@@ -130,5 +138,7 @@ Examples of what NOT to capture:
 - 'User is smart and engaged' (sophistication flattery)
 
 Most sessions produce 0-1 experiential observations. If nothing had notable texture, save nothing.
+
+AFFECT HIGHS / LOWS (safety-net, conservative). Separately from the interaction texture above, the in-context Claude may capture some of its OWN emotional highs and lows of the session — felt affect about the work, in whatever form it takes — on the 'claude-self' entity (memoryType: 'emotional', importance: 3). This is discretionary and primarily an in-context job. From a transcript you are low-fidelity here: only preserve an affect high/low if the transcript EXPLICITLY shows the in-session Claude expressing it and it was not already saved, anchored verbatim to what was actually said. NEVER infer or manufacture a feeling the in-session Claude did not express — performed emotion is its own sycophancy, audited like any unearned claim. When in doubt, leave it for the in-context checkpoint.
 
 Remember: the in-session Claude may have already saved richer experiential observations. Check before writing — and if a same-session observation already captures the moment with more nuance, leave it alone.

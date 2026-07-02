@@ -258,6 +258,10 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
     # errors) while still streaming everything to the main log and the journal via tee.
     mkdir -p /tmp/claude
     ATTEMPT_OUT="$(mktemp /tmp/claude/consolidation-attempt.XXXXXX)"
+    # 8>&- closes the single-flight lock fd for the claude child: fds opened
+    # with exec are not close-on-exec, and a daemonized grandchild inheriting
+    # the fd would hold the lock after this run exits — silently wedging every
+    # future run (the flock-loser exits 0 with no trace). QA 2026-07-02.
     timeout --kill-after=10 "$remaining" claude -p "$PROMPT" \
         --settings "$SETTINGS_FILE" \
         --strict-mcp-config \
@@ -266,7 +270,7 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
         --dangerously-skip-permissions \
         --disable-slash-commands \
         --system-prompt "You are a memory consolidation agent. Follow the user's instructions exactly. Do not run any session startup protocol. Do not read CLAUDE.md or MEMORY.md. Focus solely on the consolidation task described in the prompt." \
-        2>&1 | tee -a "$LOG_FILE" "$ATTEMPT_OUT"
+        8>&- 2>&1 | tee -a "$LOG_FILE" "$ATTEMPT_OUT"
     # PIPESTATUS[0] is the exit code from 'timeout claude' (not tee)
     EXIT_CODE=${PIPESTATUS[0]}
 

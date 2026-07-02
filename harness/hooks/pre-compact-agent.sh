@@ -9,7 +9,8 @@
 # Only the contents of the instructions file go to stdout → becomes newCustomInstructions,
 # which influences what the compaction model preserves in the summary.
 #
-# Timeout governed by settings.json (300s).
+# Timeout governed by settings.json (480s); internal claude -p timeout is
+# INTERNAL_TIMEOUT below (single source — log lines derive from it).
 # Logs success/failure to ~/.claude/hooks/hook-execution.log.
 
 set -uo pipefail
@@ -34,7 +35,7 @@ if [ -n "${CLAUDE_LIFECYCLE_AGENT:-}" ]; then
 fi
 
 # Leave a trace if the harness kills us (shouldn't happen now that claude -p
-# has an internal timeout inside the 300s settings.json budget). NOTE: the
+# has an internal timeout inside the 480s settings.json budget). NOTE: the
 # trap only logs — it must NOT write to stdout, which is reserved for
 # newCustomInstructions.
 trap 'log "FAIL: killed by SIGTERM"; exit 143' TERM
@@ -120,7 +121,11 @@ PROMPT=$(sed \
 cd "${CWD:-$HOME/Claude}" 2>/dev/null || cd "$HOME/Claude"
 
 CLAUDE_LOG="/tmp/claude/precompact-claude-output-${SESSION_ID}.txt"
-echo "$PROMPT" | CLAUDE_LIFECYCLE_AGENT=1 timeout -k 10 420 claude -p \
+# Single source of truth for the internal ceiling — the rc=124 log line derives
+# from this variable so the logged duration can never drift from the real one
+# again (QA 2026-07-02: the 240→420 bump left "after 240s" in the FAIL line).
+INTERNAL_TIMEOUT=420
+echo "$PROMPT" | CLAUDE_LIFECYCLE_AGENT=1 timeout -k 10 "$INTERNAL_TIMEOUT" claude -p \
     --permission-mode bypassPermissions \
     --model sonnet \
     --no-session-persistence \
@@ -130,7 +135,7 @@ PRECOMPACT_RC=$?
 if [ "$PRECOMPACT_RC" -eq 0 ]; then
     log "OK: claude -p completed (trigger=$TRIGGER, skip_saves=$SKIP_SAVES, excerpt=$EXCERPT_LINES lines)"
 elif [ "$PRECOMPACT_RC" -eq 124 ]; then
-    log "FAIL: internal timeout after 240s (stdout=$(head -c 300 "$CLAUDE_LOG" 2>/dev/null | tr '\n' ' '))"
+    log "FAIL: internal timeout after ${INTERNAL_TIMEOUT}s (stdout=$(head -c 300 "$CLAUDE_LOG" 2>/dev/null | tr '\n' ' '))"
 elif [ "$PRECOMPACT_RC" -eq 137 ]; then
     # timeout's -k grace expired and it escalated to SIGKILL — label it as a
     # timeout escalation, not a generic exit (QA: 137 was mislabeled before)
@@ -167,8 +172,13 @@ if [ "$SKIP_SAVES" = "false" ] && [ "$PRECOMPACT_RC" -ne 0 ]; then
         source "$QUEUE_LIB"
         STAGE=$(mq_new_staging "precompact-save")
         if cp "$EXCERPT" "$STAGE/excerpt.jsonl" 2>/dev/null; then
+            # The excerpt path is left as the @@EXCERPT@@ token, resolved by
+            # job.sh AT RUN TIME against its own directory: the staged prompt
+            # can't embed a real path because mq_enqueue MOVES the job from
+            # staging/ to jobs/ (and a baked staging path would dangle — a
+            # real bug the harness test caught on its first run, 2026-07-02).
             sed \
-                -e "s|{{TRANSCRIPT_PATH}}|$STAGE/excerpt.jsonl|g" \
+                -e "s|{{TRANSCRIPT_PATH}}|@@EXCERPT@@|g" \
                 -e "s|{{CWD}}|${CWD:-$HOME/Claude}|g" \
                 -e "s|{{SESSION_ID}}|${SESSION_ID}-retry|g" \
                 -e "s|{{TRIGGER}}|${TRIGGER}|g" \
@@ -181,16 +191,17 @@ if [ "$SKIP_SAVES" = "false" ] && [ "$PRECOMPACT_RC" -ne 0 ]; then
 #!/bin/bash
 # Replays a PreCompact memory save that died in the live hook (see run.log
 # for attempts). Payload lives beside this script; the worker moves the whole
-# directory, so locate it relative to $0.
+# directory, so locate everything relative to $0 — including the excerpt path,
+# substituted into the prompt here rather than at staging time.
 set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$(cat "$DIR/cwd" 2>/dev/null)" 2>/dev/null || cd "$HOME/Claude" || exit 1
+sed "s|@@EXCERPT@@|$DIR/excerpt.jsonl|g" "$DIR/prompt.txt" | \
 CLAUDE_LIFECYCLE_AGENT=1 claude -p \
     --permission-mode bypassPermissions \
     --model sonnet \
     --no-session-persistence \
-    --output-format text \
-    < "$DIR/prompt.txt"
+    --output-format text
 JOBEOF
             if mq_enqueue "$STAGE" 420; then
                 log "QUEUED: failed save enqueued for retry (queue=$(basename "$STAGE"))"

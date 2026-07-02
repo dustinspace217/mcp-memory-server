@@ -587,17 +587,16 @@ describe('FTS triggers under raw-SQL observation writes', () => {
 	});
 
 	it('obs_fts_au: content-strip UPDATE (eviction Tier-2 shape) re-syncs the index', async () => {
-		// One observation per entity — deliberately: two active observations
-		// sharing a superseded_at would trip the PRE-EXISTING Tier-2 UNIQUE
-		// collision (Issue #83), which is not what this test pins.
 		await store.createEntities([
 			{ name: 'StripTarget', entityType: 'test', observations: ['the wolverine kept its secret'] },
 		]);
 		const db = new Database(dbPath);
 		try {
 			// Raw SQL exactly like evict.ts Tier-2 — bypasses GraphStore entirely;
-			// only the DB-level trigger can keep the index consistent.
-			db.prepare(`UPDATE observations SET content = '' WHERE content = ?`).run('the wolverine kept its secret');
+			// only the DB-level trigger can keep the index consistent. Mirrors the
+			// post-Issue-#83 strip form ('[evicted:<id>]', unique per row so
+			// same-timestamp siblings can't collide with the UNIQUE constraint).
+			db.prepare(`UPDATE observations SET content = '[evicted:' || id || ']' WHERE content = ?`).run('the wolverine kept its secret');
 			const stale = db.prepare(`SELECT rowid FROM obs_fts WHERE obs_fts MATCH '"wolverine"'`).all();
 			expect(stale.length).toBe(0); // old content is out of the index
 		} finally {

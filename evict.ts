@@ -308,6 +308,10 @@ function tombstoneSuperseded(db: Database): number {
       // (WHERE superseded_at = '') is more principled but costs a table-rebuild
       // migration; this one-line strip format fixes the only path that ever
       // rewrites two rows to identical content.
+      // Defense-in-depth note: unlike '', the marker tokenizes to real FTS
+      // tokens ("evicted", the id), so its invisibility in search now rests on
+      // the superseded_at='' join every search path carries (tombstoned rows
+      // are always superseded) — not on being unmatchable by construction.
       db.prepare(
         `UPDATE observations SET content = '[evicted:' || id || ']', tombstoned_at = ? WHERE entity_id IN (${placeholders})`
       ).run(nowIso, ...ids);

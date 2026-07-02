@@ -66,12 +66,16 @@ cd "$CWD" 2>/dev/null || cd "$HOME/Claude"
 # pressure, so 300s is comfortable headroom rather than a race against teardown.
 STDOUT_FILE="/tmp/claude/sessionend-stdout-${SESSION_ID}.txt"
 STDERR_FILE="/tmp/claude/sessionend-stderr-${SESSION_ID}.txt"
+# 9>&- closes the serialization-lock fd for the claude child (and below, for
+# the daemonized audit): exec fds are not close-on-exec, and the nohup'd audit
+# inheriting fd 9 held the BLOCKING flock until the audit finished — needlessly
+# serializing every later session-end save behind it. QA 2026-07-02.
 echo "$PROMPT" | CLAUDE_LIFECYCLE_AGENT=1 timeout -k 10 300 claude -p \
     --permission-mode bypassPermissions \
     --model sonnet \
     --no-session-persistence \
     --output-format text \
-    > "$STDOUT_FILE" 2> "$STDERR_FILE"
+    > "$STDOUT_FILE" 2> "$STDERR_FILE" 9>&-
 RC=$?
 if [ "$RC" -eq 0 ]; then
     log "OK: save completed ($(wc -c < "$STDOUT_FILE") chars output)"
@@ -96,8 +100,13 @@ if [ "$RC" -ne 0 ]; then
         source "$QUEUE_LIB"
         STAGE=$(mq_new_staging "sessionend-save")
         if cp "$EXCERPT" "$STAGE/excerpt.jsonl" 2>/dev/null; then
+            # @@EXCERPT@@ is resolved by job.sh at RUN time — mq_enqueue moves
+            # the job dir, so a staging path baked here would dangle (bug
+            # caught by the harness test, 2026-07-02). The SESSION_ID sed is a
+            # harmless no-op kept for symmetry with the precompact enqueue:
+            # sessionend-prompt.md has no {{SESSION_ID}} placeholder.
             sed \
-                -e "s|{{TRANSCRIPT_PATH}}|$STAGE/excerpt.jsonl|g" \
+                -e "s|{{TRANSCRIPT_PATH}}|@@EXCERPT@@|g" \
                 -e "s|{{CWD}}|${CWD}|g" \
                 -e "s|{{SESSION_ID}}|${SESSION_ID}-retry|g" \
                 "$PROMPT_TEMPLATE" > "$STAGE/prompt.txt"
@@ -108,12 +117,12 @@ if [ "$RC" -ne 0 ]; then
 set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$(cat "$DIR/cwd" 2>/dev/null)" 2>/dev/null || cd "$HOME/Claude" || exit 1
+sed "s|@@EXCERPT@@|$DIR/excerpt.jsonl|g" "$DIR/prompt.txt" | \
 CLAUDE_LIFECYCLE_AGENT=1 claude -p \
     --permission-mode bypassPermissions \
     --model sonnet \
     --no-session-persistence \
-    --output-format text \
-    < "$DIR/prompt.txt"
+    --output-format text
 JOBEOF
             if mq_enqueue "$STAGE" 420; then
                 log "QUEUED: failed save enqueued for retry (queue=$(basename "$STAGE"))"
@@ -129,7 +138,7 @@ fi
 # Chase the fresh memory write with the anti-sycophancy auditor (Phase 7.4),
 # now correctly AFTER the save completes (the old parent launched it in parallel
 # with the save, auditing a not-yet-written record). Self-gates + single-flight.
-nohup python3 "$HOME/.claude/audit/run-memory-audit.py" --cwd "$CWD" >/dev/null 2>&1 &
+nohup python3 "$HOME/.claude/audit/run-memory-audit.py" --cwd "$CWD" >/dev/null 2>&1 9>&- &
 disown 2>/dev/null || true
 
 rm -f "$EXCERPT"

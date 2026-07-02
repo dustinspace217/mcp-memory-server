@@ -58,6 +58,8 @@ harness/
 │   └── checkpoint/SKILL.md
 ├── scripts/
 │   └── run-consolidation.sh           # weekly consolidation runner (systemd timer)
+├── tests/
+│   └── test-retry-queue.sh            # sandboxed queue mechanics + producer tests
 ├── settings/
 │   ├── settings.hooks.example.json    # hooks block to merge into ~/.claude/settings.json
 │   ├── mcp-registration.example.json  # entry to merge into ~/.claude.json mcpServers

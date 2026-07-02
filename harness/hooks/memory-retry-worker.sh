@@ -20,8 +20,10 @@
 
 set -uo pipefail
 
-MQ_ROOT="$HOME/.local/state/claude-memory-queue"
-LOGFILE="$HOME/.claude/hooks/hook-execution.log"
+# Both env-overridable so tests run against a sandbox queue + log instead of
+# the real ones (QA 2026-07-02). Production (systemd) never sets either.
+MQ_ROOT="${MQ_ROOT:-$HOME/.local/state/claude-memory-queue}"
+LOGFILE="${MQ_LOGFILE:-$HOME/.claude/hooks/hook-execution.log}"
 
 MAX_ATTEMPTS=24          # with the 8h backoff cap this spans ~7 days of outage
 TTL_SECS=$(( 7 * 24 * 3600 ))
@@ -86,8 +88,11 @@ for jobdir in "$MQ_ROOT/jobs"/*/; do
 
     # Run the attempt. job.sh finds its payload via $(dirname "$0").
     # -k 15: SIGKILL 15s after the timeout's SIGTERM if the job ignores it.
+    # 9>&- closes the worker's lock fd for the job's process tree: a daemonized
+    # descendant inheriting it would hold the single-flight lock forever and
+    # silently stop all future ticks (flock -n loser exits 0). QA 2026-07-02.
     echo "=== attempt $(( ATTEMPTS + 1 )) at $(date -u '+%Y-%m-%d %H:%M:%S UTC') ===" >> "$jobdir/run.log"
-    timeout -k 15 "$JOB_TIMEOUT" bash "$jobdir/job.sh" >> "$jobdir/run.log" 2>&1
+    timeout -k 15 "$JOB_TIMEOUT" bash "$jobdir/job.sh" >> "$jobdir/run.log" 2>&1 9>&-
     rc=$?
 
     if [ "$rc" -eq 0 ]; then

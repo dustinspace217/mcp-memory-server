@@ -678,20 +678,24 @@ describe('entity_timeline shows tombstoned status', () => {
 
     // Directly set tombstoned_at via raw SQL to simulate what eviction does.
     // This is testing the timeline OUTPUT, not the eviction sweep itself.
+    // Mirrors the post-Issue-#83 strip form ('[evicted:<id>]'): the timeline
+    // is a raw content passthrough, so this doubles as the pin that the
+    // marker surfaces verbatim to the one consumer that renders it.
     const db = new Database(dbPath);
     try {
       const now = new Date().toISOString();
-      db.prepare(`UPDATE observations SET content = '', tombstoned_at = ? WHERE tombstoned_at = ''`).run(now);
+      db.prepare(`UPDATE observations SET content = '[evicted:' || id || ']', tombstoned_at = ? WHERE tombstoned_at = ''`).run(now);
     } finally {
       db.close();
     }
 
-    // entity_timeline should show the observation with status 'tombstoned'.
+    // entity_timeline should show the observation with status 'tombstoned'
+    // and pass the skeleton marker through as content.
     const timeline = await store.entityTimeline('TombstoneTarget');
     expect(timeline).not.toBeNull();
     expect(timeline!.observations.length).toBeGreaterThan(0);
     expect(timeline!.observations[0].status).toBe('tombstoned');
-    expect(timeline!.observations[0].content).toBe('');
+    expect(timeline!.observations[0].content).toMatch(/^\[evicted:\d+\]$/);
   });
 
   it('marks relations as tombstoned in timeline when tombstoned_at is set', async () => {
