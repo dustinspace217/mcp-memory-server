@@ -1198,4 +1198,105 @@ describe('Migration safety validation', () => {
     db2.close();
     await sqliteStore.close();
   });
+
+  it('should migrate v12 → v13: normalize drifted relation-type spellings with collision soft-retire', async () => {
+    // Builds a v10 database (migrations run sequentially through 11/12/13) with
+    // relations exercising the three v13 behaviors:
+    //   1. plain rewrite: 'belongs to' → 'belongs_to'
+    //   2. collision: a drifted 'has_file' whose target 'contains_file' ALREADY
+    //      exists active between the same endpoints → drifted row SOFT-RETIRED
+    //      (superseded_at stamped), never a UNIQUE crash, never a hard delete
+    //   3. superseded rows untouched: an already-retired 'belongs to' keeps its
+    //      drifted spelling (history is preserved as written)
+    const id = Date.now();
+    dbPath = path.join(testDir, `test-v12-to-v13-${id}.db`);
+    jsonlPath = path.join(testDir, `nonexistent-${id}.jsonl`); // not used, just for cleanup
+
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+
+    db.prepare(`CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL)`).run();
+    db.prepare(`INSERT INTO schema_version (id, version) VALUES (1, 10)`).run();
+    db.prepare(`CREATE TABLE entities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      project TEXT,
+      updated_at TEXT NOT NULL DEFAULT '0000-00-00T00:00:00.000Z',
+      created_at TEXT NOT NULL DEFAULT '0000-00-00T00:00:00.000Z',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      normalized_name TEXT NOT NULL DEFAULT '',
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      last_accessed_at TEXT NOT NULL DEFAULT ''
+    )`).run();
+    db.prepare(`CREATE TABLE observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      superseded_at TEXT NOT NULL DEFAULT '',
+      importance REAL NOT NULL DEFAULT 3.0,
+      context_layer TEXT,
+      memory_type TEXT,
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      source_instance TEXT NOT NULL DEFAULT 'unknown',
+      UNIQUE(entity_id, content, superseded_at)
+    )`).run();
+    db.prepare(`CREATE TABLE relations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_entity TEXT NOT NULL,
+      to_entity TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT '',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      UNIQUE(from_entity, to_entity, relation_type, superseded_at)
+    )`).run();
+
+    const ts = '2026-06-01T12:00:00.000Z';
+    for (const name of ['alpha', 'beta', 'gamma']) {
+      db.prepare(`INSERT INTO entities (name, entity_type, updated_at, created_at, normalized_name) VALUES (?, ?, ?, ?, ?)`).run(
+        name, 'concept', ts, ts, name
+      );
+    }
+    const ins = db.prepare(`INSERT INTO relations (from_entity, to_entity, relation_type, created_at, superseded_at) VALUES (?, ?, ?, ?, ?)`);
+    ins.run('alpha', 'beta', 'belongs to', ts, '');                        // case 1: plain rewrite
+    ins.run('alpha', 'gamma', 'has_file', ts, '');                        // case 2: drifted...
+    ins.run('alpha', 'gamma', 'contains_file', ts, '');                   // ...colliding with existing target
+    ins.run('beta', 'gamma', 'belongs to', ts, '2026-06-02T00:00:00.000Z'); // case 3: already superseded
+    db.close();
+
+    const sqliteStore = new SqliteStore(dbPath);
+    await sqliteStore.init();
+
+    const db2 = new Database(dbPath, { readonly: true });
+    const version = (db2.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+    expect(version).toBeGreaterThanOrEqual(13);
+
+    // Case 1: rewritten in place, still active.
+    const rewritten = db2.prepare(
+      `SELECT relation_type FROM relations WHERE from_entity = 'alpha' AND to_entity = 'beta' AND superseded_at = ''`
+    ).all() as { relation_type: string }[];
+    expect(rewritten).toEqual([{ relation_type: 'belongs_to' }]);
+
+    // Case 2: the drifted duplicate is soft-retired; the target row is intact.
+    const alphaGamma = db2.prepare(
+      `SELECT relation_type, superseded_at FROM relations WHERE from_entity = 'alpha' AND to_entity = 'gamma' ORDER BY relation_type`
+    ).all() as { relation_type: string; superseded_at: string }[];
+    expect(alphaGamma).toHaveLength(2);
+    const contains = alphaGamma.find(r => r.relation_type === 'contains_file')!;
+    const hasFile = alphaGamma.find(r => r.relation_type === 'has_file')!;
+    expect(contains.superseded_at).toBe('');       // target survives active
+    expect(hasFile.superseded_at).not.toBe('');    // drifted duplicate retired, not deleted
+
+    // Case 3: superseded history keeps its original spelling.
+    const historical = db2.prepare(
+      `SELECT relation_type FROM relations WHERE from_entity = 'beta' AND to_entity = 'gamma'`
+    ).get() as { relation_type: string };
+    expect(historical.relation_type).toBe('belongs to');
+
+    db2.close();
+    await sqliteStore.close();
+  });
 });

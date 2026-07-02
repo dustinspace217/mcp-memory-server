@@ -130,6 +130,71 @@ describe.each<[string, string, StoreFactory]>([
 			expect(newRelations).toHaveLength(0);
 		});
 
+		// Write-time vocabulary canonicalization (v1.3.0 Phase C2, spec §6.3).
+		// ADVISORY, not an enum: it reuses an existing spelling when the incoming
+		// type's normalized key matches; genuinely novel types store verbatim.
+		describe('relation-type canonicalization', () => {
+			it('canonicalizes case/separator variants of the core vocabulary', async () => {
+				await store.createEntities([
+					{ name: 'RuleEnt', entityType: 'rule', observations: [] },
+					{ name: 'IncidentEnt', entityType: 'incident', observations: [] },
+				]);
+				const created = await store.createRelations([
+					{ from: 'RuleEnt', to: 'IncidentEnt', relationType: 'caused-by' },
+				]);
+				expect(created[0].relationType).toBe('CAUSED_BY'); // core vocab wins its canonical case
+			});
+
+			it('reuses the existing spelling when a variant of an active type arrives', async () => {
+				await store.createEntities([
+					{ name: 'P1', entityType: 'test', observations: [] },
+					{ name: 'P2', entityType: 'test', observations: [] },
+					{ name: 'P3', entityType: 'test', observations: [] },
+				]);
+				await store.createRelations([{ from: 'P1', to: 'P2', relationType: 'belongs_to' }]);
+				const created = await store.createRelations([
+					{ from: 'P2', to: 'P3', relationType: 'Belongs-To' }, // same key, different surface
+				]);
+				expect(created[0].relationType).toBe('belongs_to');
+			});
+
+			it('stores genuinely novel types verbatim (open vocabulary preserved)', async () => {
+				await store.createEntities([
+					{ name: 'MoonEnt', entityType: 'test', observations: [] },
+					{ name: 'PlanetEnt', entityType: 'test', observations: [] },
+				]);
+				const created = await store.createRelations([
+					{ from: 'MoonEnt', to: 'PlanetEnt', relationType: 'orbits' },
+				]);
+				expect(created[0].relationType).toBe('orbits');
+			});
+
+			it('canonicalization converges: repeated variants all land on the first stored spelling', async () => {
+				// Because every write canonicalizes, no two active spellings can share
+				// a key when all writes flow through the store — this pins that
+				// convergence property. (The genuinely-ambiguous case — two stored
+				// spellings sharing a key, possible only in pre-v13 data — is a
+				// SQLite-only raw-SQL fixture, tested in fts-search.test.ts.)
+				await store.createEntities([
+					{ name: 'Q1', entityType: 'test', observations: [] },
+					{ name: 'Q2', entityType: 'test', observations: [] },
+					{ name: 'Q3', entityType: 'test', observations: [] },
+					{ name: 'Q4', entityType: 'test', observations: [] },
+				]);
+				await store.createRelations([{ from: 'Q1', to: 'Q2', relationType: 'linked_to' }]);
+				await store.createRelations([{ from: 'Q2', to: 'Q3', relationType: 'Linked-To' }]);
+				const created = await store.createRelations([
+					{ from: 'Q3', to: 'Q4', relationType: 'LINKED TO' },
+				]);
+				expect(created[0].relationType).toBe('linked_to');
+				const graph = await store.readGraph();
+				const spellings = new Set(graph.relations.map(r => r.relationType));
+				expect(spellings.has('linked_to')).toBe(true);
+				expect(spellings.has('Linked-To')).toBe(false);
+				expect(spellings.has('LINKED TO')).toBe(false);
+			});
+		});
+
 		it('should include createdAt and supersededAt on relations', async () => {
 			await store.createEntities([
 				{ name: 'A', entityType: 'test', observations: ['hello'] },
@@ -3559,7 +3624,8 @@ describe('SqliteStore-specific', () => {
 			// v10 added source_instance to observations for multi-machine tracking.
 			// v11 added the obs_fts FTS5 index over observation content + sync triggers.
 			// v12 added access_count on entities for retrieval strengthening.
-			expect(row!.version).toBe(12);
+			// v13 normalized drifted relation-type spellings (explicit reviewed map).
+			expect(row!.version).toBe(13);
 		});
 	});
 

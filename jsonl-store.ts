@@ -47,6 +47,7 @@ import {
   readGraphFingerprint,
   searchNodesFingerprint,
 } from './cursor.js';
+import { CORE_RELATION_TYPES, relationTypeKey } from './relation-types.js';
 
 /**
  * Handles the legacy memory.json -> memory.jsonl migration.
@@ -408,17 +409,42 @@ export class JsonlStore implements GraphStore {
    */
   async createRelations(relations: RelationInput[]): Promise<Relation[]> {
     const graph = await this.loadGraph();
+    // Relation-type canonicalization (Phase C2) — same advisory as the SQLite
+    // backend so callers see one behavior regardless of configured store: core
+    // vocabulary wins its canonical casing; exactly one existing active
+    // spelling with the same key is reused; novel or ambiguous keys store
+    // verbatim. Map values: spelling to reuse, or null = ambiguous key.
+    const typeKeyMap = new Map<string, string | null>();
+    const coreSpellings = Object.values(CORE_RELATION_TYPES) as string[];
+    for (const core of coreSpellings) {
+      typeKeyMap.set(relationTypeKey(core), core);
+    }
+    for (const rel of graph.relations) {
+      if (rel.supersededAt !== '') continue; // active spellings only, like SQLite's WHERE
+      const k = relationTypeKey(rel.relationType);
+      const held = typeKeyMap.get(k);
+      if (held === undefined) {
+        typeKeyMap.set(k, rel.relationType);
+      } else if (held !== null && held !== rel.relationType && !coreSpellings.includes(held)) {
+        typeKeyMap.set(k, null);
+      }
+    }
     const existingKeys = new Set(graph.relations.map(r => JSON.stringify([r.from, r.to, r.relationType])));
     const newRelations: Relation[] = [];
     for (const r of relations) {
-      const key = JSON.stringify([r.from, r.to, r.relationType]);
+      const typeKey = relationTypeKey(r.relationType);
+      const relType = typeKeyMap.get(typeKey) ?? r.relationType;
+      const key = JSON.stringify([r.from, r.to, relType]);
       if (!existingKeys.has(key)) {
         existingKeys.add(key);
+        if (!typeKeyMap.has(typeKey)) {
+          typeKeyMap.set(typeKey, relType); // within-batch convergence
+        }
         // Build full Relation with temporal defaults (JSONL doesn't store these fields)
         const fullRelation: Relation = {
           from: r.from,
           to: r.to,
-          relationType: r.relationType,
+          relationType: relType,
           createdAt: ENTITY_TIMESTAMP_SENTINEL,
           supersededAt: '',
         };

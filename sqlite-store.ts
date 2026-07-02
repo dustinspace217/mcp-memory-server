@@ -58,6 +58,7 @@ import {
 } from './cursor.js';
 import { normalizeEntityName } from './normalize-name.js';
 import { checkAndEvict, type EvictionResult } from './evict.js';
+import { CORE_RELATION_TYPES, relationTypeKey, RELATION_VOCAB_FIXES } from './relation-types.js';
 
 /**
  * Checks if a file exists at the given path.
@@ -881,6 +882,43 @@ export class SqliteStore implements GraphStore {
       currentVersion = 12;
     }
 
+    if (currentVersion < 13) {
+      // Migration 12 → 13: relation-vocabulary repairs (Phase C).
+      //
+      // The 2026-07-02 audit found 128 distinct relation_type spellings across
+      // 501 active edges — the same verb fragmented into case/separator
+      // variants ('belongs to'/'belongs-to'/'belongs_to'), which silently
+      // breaks get_connected_context's relationTypes filter. This is a DATA
+      // migration driven by the EXPLICIT reviewed map in relation-types.ts
+      // (never an algorithm — direction-differing verbs must not merge).
+      //
+      // Only ACTIVE rows are rewritten: superseded history keeps the spelling
+      // it was written with (goal B — the record of how things were said IS
+      // part of the record).
+      //
+      // Collision handling: if a drifted row's rewrite would collide with an
+      // existing active row on UNIQUE(from_entity, to_entity, relation_type,
+      // superseded_at), the drifted duplicate is SOFT-RETIRED (superseded_at
+      // stamped) — never hard-deleted, never a constraint crash. Retire runs
+      // BEFORE rewrite, inside one IMMEDIATE transaction (house migration rule
+      // since v11 — see the v11 comment for the SQLITE_BUSY_SNAPSHOT rationale).
+      this.db.transaction(() => {
+        const now = new Date().toISOString();
+        for (const [from, to] of RELATION_VOCAB_FIXES) {
+          this.db.prepare(
+            `UPDATE relations SET superseded_at = ? WHERE relation_type = ? AND superseded_at = ''
+             AND EXISTS (SELECT 1 FROM relations r2 WHERE r2.from_entity = relations.from_entity
+               AND r2.to_entity = relations.to_entity AND r2.relation_type = ? AND r2.superseded_at = '')`
+          ).run(now, from, to);
+          this.db.prepare(
+            `UPDATE relations SET relation_type = ? WHERE relation_type = ? AND superseded_at = ''`
+          ).run(to, from);
+        }
+        this.db.prepare('UPDATE schema_version SET version = 13').run();
+      }).immediate();
+      currentVersion = 13;
+    }
+
     // === Indexes (idempotent, run on every startup) ===
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
@@ -1578,6 +1616,36 @@ export class SqliteStore implements GraphStore {
       'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)'
     );
 
+    // ── Relation-type canonicalization (Phase C2, spec §6.3) ─────────────────
+    // ADVISORY that stops the same verb fragmenting into case/separator
+    // variants (the 2026-07-02 audit found 128 spellings across 501 edges).
+    // Resolution: core vocabulary wins its canonical casing; else exactly ONE
+    // existing active spelling with the same key is reused; else — a genuinely
+    // novel type, or an ambiguous key carrying multiple pre-v13 spellings —
+    // the input stores VERBATIM. Open vocabulary is a standing decision
+    // (DEF-CG-03), and the canonicalizer never guesses between ambiguous
+    // spellings. Map values: spelling to reuse, or null = ambiguous key.
+    const typeKeyMap = new Map<string, string | null>();
+    const coreSpellings = Object.values(CORE_RELATION_TYPES) as string[];
+    for (const core of coreSpellings) {
+      typeKeyMap.set(relationTypeKey(core), core);
+    }
+    // One DISTINCT scan per call — ~130 rows in the live graph, trivial.
+    const existingTypes = this.db.prepare(
+      `SELECT DISTINCT relation_type FROM relations WHERE superseded_at = ''`
+    ).all() as { relation_type: string }[];
+    for (const { relation_type } of existingTypes) {
+      const key = relationTypeKey(relation_type);
+      const held = typeKeyMap.get(key);
+      if (held === undefined) {
+        typeKeyMap.set(key, relation_type);
+      } else if (held !== null && held !== relation_type && !coreSpellings.includes(held)) {
+        // Two different stored spellings share this key (pre-v13 data) and
+        // neither is core vocab — ambiguous; store future inputs verbatim.
+        typeKeyMap.set(key, null);
+      }
+    }
+
     const results: Relation[] = [];
 
     const txn = this.db.transaction(() => {
@@ -1593,15 +1661,22 @@ export class SqliteStore implements GraphStore {
         if (!toRow) {
           throw new Error(`Relation references non-existent entity: ${r.to}`);
         }
-        const info = insert.run(fromNorm, toNorm, r.relationType, now);
+        const key = relationTypeKey(r.relationType);
+        const relType = typeKeyMap.get(key) ?? r.relationType; // undefined (novel) / null (ambiguous) → verbatim
+        const info = insert.run(fromNorm, toNorm, relType, now);
         if (info.changes > 0) {
+          // Within-batch convergence: a novel type just written becomes the
+          // spelling later items in this same batch canonicalize onto.
+          if (!typeKeyMap.has(key)) {
+            typeKeyMap.set(key, relType);
+          }
           // Return the CANONICAL display names from the entities table — not the
           // surface variants the caller typed. This keeps the result consistent
           // with what subsequent reads will return.
           results.push({
             from: fromRow.name,
             to: toRow.name,
-            relationType: r.relationType,
+            relationType: relType,
             createdAt: now,
             supersededAt: '',
           });

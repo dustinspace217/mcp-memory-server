@@ -466,7 +466,7 @@ describe('toFtsQuery round-trip through real FTS5', () => {
 			db.prepare(`INSERT INTO t(content) VALUES (?)`).run('vector search calibration notes');
 			const hostile = [
 				'"unbalanced', 'trailing \\', 'NEAR(a b)', 'content:x', '-', '*', '^caret',
-				'a"b', '""', 'foo -', '(paren', 'NOT vector', ' vector',
+				'a"b', '""', 'foo -', '(paren', 'NOT vector', '\u0000vector',
 			];
 			for (const raw of hostile) {
 				// Contract: sanitized MATCH must never throw, whatever the input.
@@ -485,6 +485,40 @@ describe('toFtsQuery round-trip through real FTS5', () => {
 		} finally {
 			db.close();
 		}
+	});
+});
+
+// ── Relation-type canonicalization: the ambiguity guard (SQLite-only fixture) ──
+
+describe('relation-type canonicalization ambiguity guard', () => {
+	beforeEach(async () => {
+		dbPath = tempDbPath();
+		store = new SqliteStore(dbPath);
+		await store.init();
+	});
+
+	it('stores the input VERBATIM when its key matches multiple existing spellings (never guess)', async () => {
+		// Two active spellings sharing one key can only exist via pre-v13 data
+		// (every store write canonicalizes) — construct that state with raw SQL.
+		await store.createEntities([
+			{ name: 'R1', entityType: 'test', observations: [] },
+			{ name: 'R2', entityType: 'test', observations: [] },
+			{ name: 'R3', entityType: 'test', observations: [] },
+			{ name: 'R4', entityType: 'test', observations: [] },
+		]);
+		const db = new Database(dbPath);
+		try {
+			const ins = db.prepare(`INSERT INTO relations (from_entity, to_entity, relation_type, created_at, superseded_at) VALUES (?, ?, ?, ?, '')`);
+			ins.run('r1', 'r2', 'tied_to', '2026-06-01T00:00:00.000Z');
+			ins.run('r2', 'r3', 'Tied-To', '2026-06-01T00:00:00.000Z'); // same key, different spelling
+		} finally {
+			db.close();
+		}
+		// Ambiguous key → the canonicalizer must not pick a side; verbatim storage.
+		const created = await store.createRelations([
+			{ from: 'R3', to: 'R4', relationType: 'TIED TO' },
+		]);
+		expect(created[0].relationType).toBe('TIED TO');
 	});
 });
 
