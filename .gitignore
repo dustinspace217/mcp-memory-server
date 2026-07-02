@@ -8,3 +8,4 @@ dist/
 *.sqlite
 *-wal
 *-shm
+__pycache__/
