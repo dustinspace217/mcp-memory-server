@@ -410,10 +410,73 @@ describe('eviction module (evict.ts)', () => {
         expect(entity.tombstoned_at).not.toBe('');
 
         // Verify observation content was stripped (the key tombstone behavior).
-        const obs = db.prepare('SELECT content, tombstoned_at FROM observations WHERE entity_id = ?')
-          .get(entityId) as { content: string; tombstoned_at: string };
-        expect(obs.content).toBe('');
+        // Stripped content is the per-row-unique skeleton marker, not '' —
+        // see the Issue #83 comment in evict.ts.
+        const obs = db.prepare('SELECT id, content, tombstoned_at FROM observations WHERE entity_id = ?')
+          .get(entityId) as { id: number; content: string; tombstoned_at: string };
+        expect(obs.content).toBe(`[evicted:${obs.id}]`);
         expect(obs.tombstoned_at).not.toBe('');
+      } finally {
+        if (original === undefined) {
+          delete process.env.MEMORY_SIZE_CAP_BYTES;
+        } else {
+          process.env.MEMORY_SIZE_CAP_BYTES = original;
+        }
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('tombstones a multi-observation soft-deleted entity without UNIQUE collision (Issue #83)', () => {
+    // deleteEntities() soft-deletes ALL of an entity's observations with ONE
+    // identical superseded_at timestamp (single UPDATE). The Tier-2 strip used
+    // to rewrite every row's content to the same value (''), so the second row
+    // violated UNIQUE(entity_id, content, superseded_at), the batch rolled
+    // back (including tombstoned_at), and the sweep re-selected and re-failed
+    // the same batch forever — a permanent wedge. The fix strips to a
+    // per-row-unique skeleton marker ('[evicted:<id>]') instead.
+    dbPath = tempDbPath();
+    const db = createTestDb(dbPath);
+    try {
+      const twoYearsAgo = new Date(Date.now() - 2 * 365.25 * 24 * 60 * 60 * 1000).toISOString();
+
+      db.prepare(`
+        INSERT INTO entities (name, normalized_name, entity_type, updated_at, created_at, superseded_at, last_accessed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run('MultiObsDeleted', 'multiobsdeleted', 'test', twoYearsAgo, twoYearsAgo, twoYearsAgo, twoYearsAgo);
+
+      const entityId = (db.prepare('SELECT id FROM entities WHERE name = ?').get('MultiObsDeleted') as { id: number }).id;
+      // Two observations, both superseded at the SAME instant — exactly the
+      // state deleteEntities() leaves behind for a multi-observation entity.
+      const insertObs = db.prepare(`
+        INSERT INTO observations (entity_id, content, created_at, superseded_at)
+        VALUES (?, ?, ?, ?)
+      `);
+      insertObs.run(entityId, 'first observation', twoYearsAgo, twoYearsAgo);
+      insertObs.run(entityId, 'second observation', twoYearsAgo, twoYearsAgo);
+
+      const original = process.env.MEMORY_SIZE_CAP_BYTES;
+      process.env.MEMORY_SIZE_CAP_BYTES = '1';
+      try {
+        // Pre-fix this THREW (UNIQUE constraint) and rolled back the batch.
+        const result = checkAndEvict(db, dbPath);
+        expect(result.triggered).toBe(true);
+        expect(result.tombstoned).toBe(1);
+
+        const entity = db.prepare('SELECT tombstoned_at FROM entities WHERE id = ?')
+          .get(entityId) as { tombstoned_at: string };
+        expect(entity.tombstoned_at).not.toBe('');
+
+        const obs = db.prepare('SELECT id, content, tombstoned_at FROM observations WHERE entity_id = ? ORDER BY id')
+          .all(entityId) as { id: number; content: string; tombstoned_at: string }[];
+        expect(obs).toHaveLength(2);
+        for (const o of obs) {
+          expect(o.tombstoned_at).not.toBe('');
+          // Content is stripped to the skeleton marker, unique per row.
+          expect(o.content).toBe(`[evicted:${o.id}]`);
+        }
+        expect(obs[0].content).not.toBe(obs[1].content);
       } finally {
         if (original === undefined) {
           delete process.env.MEMORY_SIZE_CAP_BYTES;

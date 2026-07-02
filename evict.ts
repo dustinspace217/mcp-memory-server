@@ -250,7 +250,9 @@ function hardDeleteTombstoned(db: Database): number {
  * "Tombstoning" means:
  *   - Set entities.tombstoned_at to current timestamp
  *   - Set observations.tombstoned_at to current timestamp
- *   - Set observations.content to '' (content stripped, skeleton preserved)
+ *   - Set observations.content to '[evicted:<id>]' (content stripped, skeleton
+ *     preserved; per-row-unique marker so same-timestamp siblings can't collide
+ *     with UNIQUE(entity_id, content, superseded_at) — Issue #83)
  *   - Set relations.tombstoned_at to current timestamp
  *   - Delete corresponding vec_observations rows (embeddings no longer useful)
  *
@@ -294,8 +296,20 @@ function tombstoneSuperseded(db: Database): number {
       // Strip observation content and mark as tombstoned.
       // The skeleton (id, entity_id, created_at, superseded_at) is preserved
       // so timeline queries can still answer "X existed at time T."
+      //
+      // The stripped content is '[evicted:<id>]', NOT '' (Issue #83): entities
+      // soft-deleted via deleteEntities() carry ONE identical superseded_at
+      // across all their observations (single UPDATE), so stripping ≥2 of them
+      // to the same '' collides with UNIQUE(entity_id, content, superseded_at),
+      // aborting the batch — and because the rollback restores tombstoned_at,
+      // the sweep re-selected the same batch every trigger and wedged forever.
+      // id is the PK, so '[evicted:<id>]' is unique per row by construction.
+      // Alternative rejected: relaxing the UNIQUE to a partial index
+      // (WHERE superseded_at = '') is more principled but costs a table-rebuild
+      // migration; this one-line strip format fixes the only path that ever
+      // rewrites two rows to identical content.
       db.prepare(
-        `UPDATE observations SET content = '', tombstoned_at = ? WHERE entity_id IN (${placeholders})`
+        `UPDATE observations SET content = '[evicted:' || id || ']', tombstoned_at = ? WHERE entity_id IN (${placeholders})`
       ).run(nowIso, ...ids);
 
       // Mark relations as tombstoned — but ONLY relations that are already
