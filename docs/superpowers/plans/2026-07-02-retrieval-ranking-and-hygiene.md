@@ -8,14 +8,17 @@
 > `docs/superpowers/specs/2026-07-02-retrieval-ranking-and-hygiene-design.md` — §12 is the quality
 > contract, §3 the verified facts, §4-§10 the DECIDED designs. Do not re-litigate decisions here.
 
-## Status (updated 2026-07-02, ~03:50 PDT)
-Phase: A of 7 — COMPLETE including full three-phase QA (Discussion #82) + stabilization fixes
-Done: Tasks A1-A4 (commits 3c4ab71/a622cf4/1e1b899/c2f1cb5) + QA stabilization commit: 6-agent
-  Phase A review, 30-reply Phase B cross-exam, Phase C synthesis all on Discussion #82; fixes
-  applied (toFtsQuery zero-token/NUL hardening, rankingDegraded flag, JSONL cursor guard,
-  migration IMMEDIATE + in-txn recheck, clampLimit floor, wrong-comment fix, 17 new tests).
-  Both pools green (627 + 12 = 639). Pre-existing eviction bug found by review → Issue #83.
-Next: Phase B Task B1 (migration v12 access_count + touch increments)
+## Status (updated 2026-07-02, ~04:35 PDT)
+Phase: B of 7 — code COMPLETE (Tasks B1-B2 committed: 9ce97f8 v12 access_count parity rule,
+  e5b01dc activation as fourth RRF list), QA review launching
+Done: Phase A fully closed (QA on Discussion #82, stabilization 00959b1, branch pushed, Issue #83
+  filed). Phase B: v12 access_count under the PARITY RULE (increments exactly where
+  last_accessed_at writes — including the four inline UPDATE sites + creation seeding 1, a
+  deviation from the plan's helpers-only sketch, rationale in the deviation log); activation
+  (weight 0.5, union-only, never nominates, -Infinity excluded) fused into relevance ranking.
+  Both pools green (630 + 12 = 642).
+Next: Phase B QA (code-reviewer + test-analyzer + performance-analyst), then Phase C Task C1
+  (relation-vocab migration v13)
 Blocked: nothing
 
 **Goal:** Relevance-ranked hybrid search, retrieval strengthening, graph hygiene, valid-time
@@ -687,3 +690,23 @@ restart store, assert vec table cleared and re-swept).
    assert the loser skips the rebuild. Obsolete if migrations ever move to a single-writer lock file.
 10. **[other — pre-existing bug found by review]** Eviction Tier-2 UNIQUE collision → filed as
    Issue #83 (not Phase A scope; multi-agent-verified).
+
+## Phase B (2026-07-02, ~04:35)
+1. **[behavioral-change — semantics widened, with rationale]** The plan's B1 sketch said "in BOTH
+   touch helpers change the UPDATE" — implying helpers-only counting. Implementation discovered
+   FIVE additional `last_accessed_at` write sites the plan (and spec §5.2) didn't account for:
+   createEntities' INSERT and four inline `updated_at`+`last_accessed_at` UPDATEs (addObservations,
+   deleteObservations, supersedeObservations, setObservationMetadata). Helpers-only counting would
+   have made supersede-heavy entities (continuity threads — checkpointed every session, among the
+   most-used memories in the store) rank as never-accessed. Adopted the PARITY RULE instead:
+   access_count increments at exactly the sites that write last_accessed_at; creation seeds 1
+   (ACT-R counts encoding as the first presentation). Goal-first evaluation (goal C) over
+   plan-as-written; documented in the v12 migration comment + CLAUDE.md.
+2. **[other — design detail settled at build time]** Never-accessed entities are EXCLUDED from the
+   activation list rather than ranked last: a tail position would still hand them RRF points, and
+   "no retrieval history" should contribute exactly nothing. Enables the deterministic
+   accessed-beats-cold test construction (raw-inserted twin with access_count 0).
+3. **[other — test-fixture nuance]** The eviction access-discipline test reads counts via a raw
+   connection (observer-effect-safe), and the B2 ordering test constructs its cold entity via raw
+   SQL because every store write path now counts (there is no store-level way to create a
+   never-accessed entity — which is itself evidence the parity rule is airtight).
