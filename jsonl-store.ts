@@ -927,13 +927,26 @@ export class JsonlStore implements GraphStore {
     }
 
     // Build the full relation set before pagination slices the entities.
-    // When project-filtered, use AND logic (both endpoints must be in the result set)
-    // to avoid leaking cross-project relations. Without a project filter, use OR
-    // logic (at least one endpoint matches) for backward compatibility.
+    // Either-endpoint contract (2026-07-02 coverage fix, mirroring SqliteStore):
+    // a relation is included when it TOUCHES a matched entity. Project-scoped
+    // searches additionally require both endpoints inside the PROJECT-WIDE
+    // entity set (project + global — NOT the matched set: an empirical parity
+    // probe showed the matched-set AND dropped matched→unmatched-in-project
+    // relations that SQLite keeps). Cross-project edges stay excluded.
     const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
-    const filteredRelations = normalizedProject
-      ? graph.relations.filter(r => filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to))
-      : graph.relations.filter(r => filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to));
+    let filteredRelations = graph.relations.filter(r =>
+      filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to)
+    );
+    if (normalizedProject) {
+      const scopeSet = new Set(
+        graph.entities
+          .filter(e => e.project === normalizedProject || e.project === null)
+          .map(e => e.name)
+      );
+      filteredRelations = filteredRelations.filter(r =>
+        scopeSet.has(r.from) && scopeSet.has(r.to)
+      );
+    }
 
     const page = this.paginateEntities(filteredEntities, filteredRelations, fingerprint, pagination);
     // Relevance ranking needs the FTS index that only the SQLite backend has;

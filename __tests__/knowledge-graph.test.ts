@@ -1902,6 +1902,39 @@ describe.each<[string, string, StoreFactory]>([
 			);
 		});
 
+		it('project-scoped search keeps relations from a matched entity to an UNMATCHED in-project partner', async () => {
+			// Either-endpoint contract under project scope: the relation filter is
+			// the PROJECT-WIDE entity set, not the matched set. Pre-fix, JSONL
+			// AND-filtered against the matched set and silently dropped this edge
+			// while SQLite kept it — a cross-backend divergence found by an
+			// empirical parity probe (2026-07-02); this pin keeps them locked.
+			await store.createEntities(
+				[{ name: 'MatchedEnt', entityType: 'test', observations: ['wombat search target'] }],
+				'divproj'
+			);
+			await store.createEntities(
+				[{ name: 'QuietPartner', entityType: 'test', observations: ['unrelated content'] }],
+				'divproj'
+			);
+			await store.createEntities(
+				[{ name: 'ForeignPartner', entityType: 'test', observations: ['also unrelated'] }],
+				'otherproj'
+			);
+			await store.createRelations([
+				{ from: 'MatchedEnt', to: 'QuietPartner', relationType: 'linked' },
+				{ from: 'MatchedEnt', to: 'ForeignPartner', relationType: 'cross_project' },
+			]);
+
+			const res = await store.searchNodes('wombat', 'divproj');
+			expect(res.entities.map(e => e.name)).toEqual(['MatchedEnt']);
+			// In-project unmatched partner: relation INCLUDED (partner is a name
+			// the caller can open_nodes). Cross-project partner: EXCLUDED.
+			expect(res.relations).toHaveLength(1);
+			expect(res.relations[0]).toEqual(
+				expect.objectContaining({ from: 'MatchedEnt', to: 'QuietPartner', relationType: 'linked' })
+			);
+		});
+
 		it('should exclude cross-project relations from openNodes with projectId', async () => {
 			// Create entities in two projects plus a global entity
 			await store.createEntities(
