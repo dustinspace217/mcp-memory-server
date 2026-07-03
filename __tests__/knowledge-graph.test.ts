@@ -2395,8 +2395,13 @@ describe.each<[string, string, StoreFactory]>([
 
 		// Verifies that only relations where BOTH endpoints are in the current page
 		// are included. Cross-page relations (one endpoint per page) are excluded.
-		it('should return only relations where both endpoints are in current page', async () => {
-			// Create 4 entities with relations spanning pages
+		it('returns every relation touching a page entity; union across pages is complete', async () => {
+			// The pre-fix contract was page-local AND (a relation appeared only
+			// when BOTH endpoints shared a page), which made the union across
+			// pages permanently incomplete — the live graph read back 156 of 474
+			// relations (the 2026-06-23 audit). New contract: either-endpoint.
+			// A cross-page relation appears on EACH endpoint's page; the partner
+			// endpoint is a self-describing name the caller can open_nodes.
 			await store.createEntities([
 				{ name: 'A', entityType: 'test', observations: ['a'] },
 			]);
@@ -2419,20 +2424,62 @@ describe.each<[string, string, StoreFactory]>([
 				{ from: 'B', to: 'D', relationType: 'cross' },    // Spans pages
 			]);
 
-			// Page 1 (limit=2): D and C (most recent first)
+			const relKey = (r: { from: string; to: string; relationType: string }) =>
+				`${r.from}->${r.to}:${r.relationType}`;
+
+			// Page 1 (limit=2): D and C (most recent first). Relations touching
+			// D or C: C->D (both on-page) AND the cross-page B->D.
 			const page1 = await store.readGraph(undefined, { limit: 2 });
 			expect(page1.entities.map(e => e.name)).toEqual(['D', 'C']);
-			// Only C->D relation should appear (both endpoints on this page)
-			expect(page1.relations).toHaveLength(1);
-			expect(page1.relations[0]).toEqual(expect.objectContaining({ from: 'C', to: 'D' }));
+			expect(page1.relations.map(relKey).sort()).toEqual(['B->D:cross', 'C->D:knows']);
 
-			// Page 2 (limit=2): B and A (older entities)
+			// Page 2 (limit=2): B and A. Relations touching B or A: A->B and
+			// (again) B->D — a spanning relation appears on each endpoint's page.
 			const page2 = await store.readGraph(undefined, { cursor: page1.nextCursor!, limit: 2 });
 			expect(page2.entities.map(e => e.name)).toEqual(['B', 'A']);
-			// Only A->B relation should appear (both endpoints on this page)
+			expect(page2.relations.map(relKey).sort()).toEqual(['A->B:knows', 'B->D:cross']);
+
+			// THE point of the fix: the deduped union across all pages is the
+			// complete active relation set.
+			const union = new Set([...page1.relations, ...page2.relations].map(relKey));
+			expect([...union].sort()).toEqual(['A->B:knows', 'B->D:cross', 'C->D:knows']);
+		});
+
+		it('project-scoped paginated reads keep in-project relations whose endpoints sit on other pages', async () => {
+			// Scoped reads filter endpoints against the PROJECT-WIDE entity set
+			// (project + global), NOT the current page — page-local filtering was
+			// the completeness bug; project-level filtering is the deliberate
+			// cross-project exclusion contract (matches openNodes-with-projectId).
+			await store.createEntities([{ name: 'ScopeA', entityType: 'test', observations: ['a'] }], 'cov-proj');
+			await new Promise(r => setTimeout(r, 10));
+			await store.createEntities([{ name: 'ScopeB', entityType: 'test', observations: ['b'] }], 'cov-proj');
+			await new Promise(r => setTimeout(r, 10));
+			await store.createEntities([{ name: 'ScopeC', entityType: 'test', observations: ['c'] }], 'cov-proj');
+			await store.createEntities([{ name: 'Foreign', entityType: 'test', observations: ['f'] }], 'other-proj');
+			await store.createRelations([
+				{ from: 'ScopeA', to: 'ScopeC', relationType: 'spans_pages' },
+				{ from: 'ScopeA', to: 'Foreign', relationType: 'cross_project' },
+			]);
+
+			// Page 1 (limit=2): ScopeC, ScopeB (Foreign is newer but out-of-project).
+			// ScopeA->ScopeC touches ScopeC and BOTH endpoints are in cov-proj →
+			// included even though ScopeA sits on page 2 (the fix).
+			const page1 = await store.readGraph('cov-proj', { limit: 2 });
+			expect(page1.entities.map(e => e.name)).toEqual(['ScopeC', 'ScopeB']);
+			expect(page1.relations).toHaveLength(1);
+			expect(page1.relations[0]).toEqual(
+				expect.objectContaining({ from: 'ScopeA', to: 'ScopeC', relationType: 'spans_pages' })
+			);
+
+			// Page 2: ScopeA. Its cross_project edge is fetched here (it touches a
+			// page entity) and must be EXCLUDED by the project-wide endpoint filter
+			// — the deliberate scoped-read contract, unchanged by the fix.
+			const page2 = await store.readGraph('cov-proj', { cursor: page1.nextCursor!, limit: 2 });
+			expect(page2.entities.map(e => e.name)).toEqual(['ScopeA']);
 			expect(page2.relations).toHaveLength(1);
-			expect(page2.relations[0]).toEqual(expect.objectContaining({ from: 'A', to: 'B' }));
-			// B->D relation is NOT on either page (endpoints span pages)
+			expect(page2.relations[0]).toEqual(
+				expect.objectContaining({ from: 'ScopeA', to: 'ScopeC', relationType: 'spans_pages' })
+			);
 		});
 
 		// Verifies that pagination on an empty graph returns sensible defaults

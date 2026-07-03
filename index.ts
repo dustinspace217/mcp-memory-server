@@ -279,7 +279,7 @@ const PaginatedOutputSchema = {
 
 const server = new McpServer({
   name: "memory-server",
-  version: "1.3.1",
+  version: "1.4.0",
 });
 
 server.registerTool(
@@ -468,7 +468,7 @@ server.registerTool(
   "read_graph",
   {
     title: "Read Graph",
-    description: "Read the knowledge graph. Returns entities sorted by most recently updated, paginated. Use the returned nextCursor to fetch subsequent pages. Omit cursor for the first page. NOTE: the returned `relations` are PAGE-LOCAL — a relation appears only when both its endpoints are on the current page, so the relation set is incomplete even after paginating all pages. Do NOT use it for orphan/connectivity analysis; use open_nodes (without a projectId) for an entity's full relations, or get_connected_context for traversal.",
+    description: "Read the knowledge graph. Returns entities sorted by most recently updated, paginated. Use the returned nextCursor to fetch subsequent pages. Omit cursor for the first page. Relations: every relation TOUCHING a returned entity is included — the partner endpoint may not be on this page (it's a name; open_nodes it for content), a spanning relation appears on each endpoint's page (dedup on from+to+relationType when unioning), and the union across all pages is the COMPLETE active relation set. With projectId, cross-project relations are excluded (endpoints filtered against the whole project + global set, not the page).",
     inputSchema: {
       projectId: ProjectIdSchema,
       cursor: z.string().max(10000).optional().describe("Opaque cursor from a previous response for fetching the next page. Omit for first page."),
@@ -492,7 +492,7 @@ server.registerTool(
   "search_nodes",
   {
     title: "Search Nodes",
-    description: "Search for nodes in the knowledge graph. Default order is most-recently-updated, paginated (use the returned nextCursor for subsequent pages; omit cursor for the first page). Pass orderBy:'relevance' to get the BEST-MATCHING entities instead — a rank fusion of substring, full-text (BM25), and semantic-vector matches, top-k only (no cursor, no asOf). Prefer relevance when hunting for the right memory by topic; prefer recency (default) when scanning what changed lately or when paginating. NOTE: the returned `relations` are PAGE-LOCAL — a relation appears only when both its endpoints are on the current page, so the relation set is incomplete even across all pages. Use open_nodes (without a projectId) for an entity's full relations, or get_connected_context for traversal.",
+    description: "Search for nodes in the knowledge graph. Default order is most-recently-updated, paginated (use the returned nextCursor for subsequent pages; omit cursor for the first page). Pass orderBy:'relevance' to get the BEST-MATCHING entities instead — a rank fusion of substring, full-text (BM25), and semantic-vector matches, top-k only (no cursor, no asOf). Prefer relevance when hunting for the right memory by topic; prefer recency (default) when scanning what changed lately or when paginating. Relations: every relation TOUCHING a returned entity is included (the partner may not be in this result — it's a name; open_nodes it for content). With projectId, cross-project relations are excluded (filtered against the whole project + global set).",
     inputSchema: {
       query: z.string().min(1).max(5000).describe("The search query to match against entity names, types, and observation content"),
       projectId: ProjectIdSchema,

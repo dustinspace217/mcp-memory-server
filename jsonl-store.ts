@@ -340,18 +340,21 @@ export class JsonlStore implements GraphStore {
 
     // Filter relations to the current page. When all filtered entities fit on one page
     // (no cursor offset and no overflow), pass through the caller's pre-filtered relations
-    // unchanged — this preserves OR-logic relation inclusion for unpaginated searchNodes.
-    // Only narrow to AND-logic (both endpoints on page) when pagination actually slices
-    // the entity set, since showing a relation to an off-page entity would be confusing.
+    // unchanged. When pagination slices, keep every relation TOUCHING a page entity
+    // (either-endpoint, 2026-07-02 coverage fix — the old both-endpoints narrowing made
+    // the union across pages permanently incomplete; a spanning relation now appears on
+    // each endpoint's page and the partner is a self-describing name). The caller's
+    // allRelations already carries the project contract (cross-project edges were
+    // AND-filtered against the FULL project entity set upstream), so this narrowing is
+    // purely page-locality, mirroring SqliteStore.
     let filteredRelations: Relation[];
     if (startIndex === 0 && !hasMore) {
       // Full result set fits on this page — use caller's relation filtering as-is
       filteredRelations = allRelations;
     } else {
-      // Pagination sliced the entity set — only show relations where both endpoints are visible
       const pageEntityNames = new Set(pageEntities.map(e => e.name));
       filteredRelations = allRelations.filter(r =>
-        pageEntityNames.has(r.from) && pageEntityNames.has(r.to)
+        pageEntityNames.has(r.from) || pageEntityNames.has(r.to)
       );
     }
 

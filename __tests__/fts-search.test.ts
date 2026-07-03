@@ -190,6 +190,26 @@ describe('searchNodes relevance mode', () => {
 		]);
 	}
 
+	it('includes relations touching a ranked entity even when the partner is off-result (either-endpoint contract)', async () => {
+		// 2026-07-02 coverage fix: relevance results carry every relation
+		// touching a returned entity — the partner endpoint is a self-
+		// describing name (open_nodes it), not noise. Pre-fix, the ranked
+		// path's both-endpoints filter dropped this edge entirely.
+		await store.createEntities([
+			{ name: 'RankedHit', entityType: 'test', observations: ['ocelot telemetry pipeline design'] },
+			{ name: 'OffResultPartner', entityType: 'test', observations: ['nothing matching the query at all'] },
+		]);
+		await store.createRelations([
+			{ from: 'RankedHit', to: 'OffResultPartner', relationType: 'documented_in' },
+		]);
+		const res = await store.searchNodes('ocelot telemetry', undefined, { limit: 5 }, undefined, undefined, 'relevance');
+		expect(res.entities.map(e => e.name)).toContain('RankedHit');
+		expect(res.entities.map(e => e.name)).not.toContain('OffResultPartner');
+		expect(res.relations).toEqual([
+			expect.objectContaining({ from: 'RankedHit', to: 'OffResultPartner', relationType: 'documented_in' }),
+		]);
+	});
+
 	it('ranks the dense FTS match above the recency winner; recency mode unchanged', async () => {
 		await seedRelevanceFixture();
 		const rel = await store.searchNodes('vector search', undefined, { limit: 10 }, undefined, undefined, 'relevance');

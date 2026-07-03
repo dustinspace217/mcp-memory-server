@@ -2338,6 +2338,35 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
+   * Names of every entity visible to a project scope (project + global), as a
+   * Set holding BOTH display and normalized forms — the dual-form convention
+   * every relation-endpoint filter uses (getConnectedRelations' COALESCE can
+   * emit either form; Issue #73).
+   *
+   * Exists for the 2026-07-02 relation-coverage fix: project-scoped
+   * readGraph/searchNodes used to filter relation endpoints against the
+   * CURRENT PAGE's entities, which silently lost every relation whose
+   * endpoints didn't share a page (the live graph read back 156 of 474
+   * relations). Scoped reads now filter against this PROJECT-WIDE set —
+   * complete under pagination — while still excluding cross-project edges
+   * (the deliberate scoped-read contract, same as openNodes-with-projectId).
+   * A name-only scan; cheap at this table's scale.
+   */
+  private projectEntityNameSet(normalizedProject: string, asOf?: string): Set<string> {
+    const entFilter = this.temporalEntFilter(asOf, '');
+    const rows = this.db.prepare(
+      `SELECT name, normalized_name FROM entities
+       WHERE ${entFilter.clause} AND (project = ? OR project IS NULL)`
+    ).all(...entFilter.params, normalizedProject) as { name: string; normalized_name: string }[];
+    const set = new Set<string>();
+    for (const r of rows) {
+      set.add(r.name);
+      set.add(r.normalized_name);
+    }
+    return set;
+  }
+
+  /**
    * Fetches full Entity objects for a set of entity rows, including their observations.
    * Groups observation rows by entity ID (not name) and assembles complete Entity objects.
    *
@@ -2620,28 +2649,28 @@ export class SqliteStore implements GraphStore {
     // asOf controls temporal filtering — when set, only observations active at that moment.
     const entities = this.buildEntities(pageRows, asOf);
 
-    // Relations: when paginated or project-filtered, only include relations where
-    // both endpoints are in the current page's entity set.
-    // When not paginated and not project-filtered, return all relations (backward compat).
+    // Relations (either-endpoint contract, 2026-07-02 coverage fix): a page
+    // carries EVERY relation touching one of its entities — the partner
+    // endpoint may live on another page (it's a self-describing name;
+    // open_nodes it for content). The old page-local both-endpoints filter
+    // made the union across pages permanently incomplete (156 of 474 live
+    // relations). A relation with endpoints on two pages now appears on each.
     if (isPaginated || projectId) {
-      // Build the name set from both display names AND normalized names. This handles
-      // the COALESCE fallback in getConnectedRelations: when a relation endpoint's
-      // entity is soft-deleted, the LEFT JOIN misses and COALESCE returns the normalized
-      // form instead of the display form. Without the normalized form in the set, those
-      // relations would be silently dropped. Matches the openNodes pattern. (Issue #73.)
-      const entityNames = new Set(pageRows.map(e => e.name));
-      for (const row of pageRows) {
-        try {
-          entityNames.add(normalizeEntityName(row.name));
-        } catch {
-          // Name can't be normalized — display form is already in the set.
-        }
-      }
       const connectedRelations = this.getConnectedRelations(pageRows.map(e => e.name), asOf);
-      const filteredRelations = connectedRelations.filter(r =>
-        entityNames.has(r.from) && entityNames.has(r.to)
-      );
-      return { entities, relations: filteredRelations, nextCursor, totalCount };
+      if (normalizedProject) {
+        // Scoped reads keep the deliberate cross-project exclusion, but filter
+        // against the PROJECT-WIDE entity set (project + global) rather than
+        // the page — page-locality was the bug, project scoping is the contract
+        // (same dual semantics as openNodes-with-projectId).
+        const scopeSet = this.projectEntityNameSet(normalizedProject, asOf);
+        const filteredRelations = connectedRelations.filter(r =>
+          scopeSet.has(r.from) && scopeSet.has(r.to)
+        );
+        return { entities, relations: filteredRelations, nextCursor, totalCount };
+      }
+      // Unscoped + paginated: no endpoint filter — getConnectedRelations is
+      // already the either-endpoint set for this page's entities.
+      return { entities, relations: connectedRelations, nextCursor, totalCount };
     }
 
     // Unscoped + unpaginated: return all active relations (backward compatible with original behavior).
@@ -2996,19 +3025,20 @@ export class SqliteStore implements GraphStore {
       this.touchEntitiesByName(normalizedNames);
     }
 
-    // When paginated or project-filtered, both endpoints must be in the result set.
-    // When not paginated and not project-filtered, use OR logic (backward compat).
-    if (isPaginated || projectId) {
-      const allRelations = this.getConnectedRelations(allEntityNamesList, asOf);
+    // Relations (either-endpoint contract, 2026-07-02 coverage fix — same as
+    // readGraph): every relation touching a returned entity is included; the
+    // page-local both-endpoints filter silently lost cross-page relations.
+    // Project-scoped searches still exclude cross-project edges, filtered
+    // against the PROJECT-WIDE entity set (the scoped-read contract).
+    const allRelations = this.getConnectedRelations(allEntityNamesList, asOf);
+    if (normalizedProject) {
+      const scopeSet = this.projectEntityNameSet(normalizedProject, asOf);
       const filteredRelations = allRelations.filter(r =>
-        entityNames.has(r.from) && entityNames.has(r.to)
+        scopeSet.has(r.from) && scopeSet.has(r.to)
       );
       return { entities, relations: filteredRelations, nextCursor, totalCount };
     }
-
-    // Unscoped + unpaginated: OR logic for relations (at least one endpoint matches)
-    const relations = this.getConnectedRelations(allEntityNamesList, asOf);
-    return { entities, relations, nextCursor, totalCount };
+    return { entities, relations: allRelations, nextCursor, totalCount };
   }
 
   /**
@@ -3258,19 +3288,19 @@ export class SqliteStore implements GraphStore {
       this.touchEntitiesByName(entities.map(e => normalizeEntityName(e.name)));
     }
 
-    // Relations: both-endpoints-in-set, matching the paginated recency path's
-    // semantics — a ranked page is a curated set, and half-dangling edges would
-    // reference entities the caller can't see.
-    const entityNames = new Set(entities.map(e => e.name));
-    for (const entity of entities) {
-      try {
-        entityNames.add(normalizeEntityName(entity.name));
-      } catch {
-        // Name can't be normalized — display form is already in the set.
-      }
+    // Relations (either-endpoint contract, 2026-07-02 coverage fix — one
+    // semantic across all search/read surfaces): every relation touching a
+    // ranked entity is included. The original "curated set" both-endpoints
+    // rationale under-weighted that endpoints are self-describing NAMES — a
+    // half-dangling edge tells the caller what the found entity connects to,
+    // which is signal, not noise. Project-scoped: cross-project edges still
+    // excluded via the project-wide set (the scoped-read contract).
+    const allRelations = this.getConnectedRelations(entities.map(e => e.name), undefined);
+    let relations = allRelations;
+    if (normalizedProject) {
+      const scopeSet = this.projectEntityNameSet(normalizedProject, undefined);
+      relations = allRelations.filter(r => scopeSet.has(r.from) && scopeSet.has(r.to));
     }
-    const allRelations = this.getConnectedRelations([...entityNames], undefined);
-    const relations = allRelations.filter(r => entityNames.has(r.from) && entityNames.has(r.to));
 
     return {
       entities, relations, nextCursor: null, totalCount,
