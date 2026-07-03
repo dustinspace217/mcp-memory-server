@@ -634,6 +634,38 @@ describe('MCP Tool Handler Integration', () => {
 			expect(VT.safeParse({ validFrom: '2019-01-01T00:00:00.000Z' }).success).toBe(true);
 		});
 
+		// ----- summary validation (v16, two-tier L1 index) -----
+		it('accepts a ≤200-char summary, null (clear), and rejects overlong/empty on set_observation_metadata', () => {
+			// Mirrors the production field: .min(1).max(200).nullable().optional().
+			// min(1) matters — an empty-string summary would render an EMPTY hint,
+			// which is strictly worse than the first-100-chars auto-fallback that
+			// null/absent gives; callers wanting the fallback should clear with null.
+			const S = z.object({
+				summary: z.string().min(1).max(200).nullable().optional(),
+			});
+			expect(S.safeParse({ summary: 'moon scoring recalibration decision' }).success).toBe(true);
+			expect(S.safeParse({ summary: null }).success).toBe(true);
+			expect(S.safeParse({}).success).toBe(true);
+			expect(S.safeParse({ summary: '' }).success).toBe(false);
+			expect(S.safeParse({ summary: 'x'.repeat(201) }).success).toBe(false);
+		});
+
+		it('accepts a summary-only update (the at-least-one-field refine includes summary)', () => {
+			// Mirrors the production refine: a bare summary update is legitimate —
+			// annotating an observation for the L1 index without touching its
+			// importance/layer/type is the expected curation move.
+			const U = z.object({
+				importance: z.number().optional(),
+				summary: z.string().min(1).max(200).nullable().optional(),
+			}).refine(
+				(obj) => obj.importance !== undefined || 'summary' in obj,
+				{ message: 'at least one field' }
+			);
+			expect(U.safeParse({ summary: 'hint text' }).success).toBe(true);
+			expect(U.safeParse({ summary: null }).success).toBe(true);
+			expect(U.safeParse({}).success).toBe(false);
+		});
+
 		it('accepts omitting asOf (treats as undefined / current state)', () => {
 			const result = ReadGraphInputSchema.safeParse({});
 			expect(result.success).toBe(true);

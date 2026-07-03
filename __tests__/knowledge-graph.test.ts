@@ -2958,10 +2958,108 @@ describe.each<[string, string, StoreFactory]>([
 
 			const result = await store.getContextLayers();
 
-			// 20 observations * ~1000 chars each = ~20000 chars. Budget is ~16000.
-			// Should be truncated — fewer than 20 L1 observations returned.
+			// 20 observations * ~1000 chars each = ~20000 chars. Featured budget
+			// is ~12000 (v16 two-tier split). Should be truncated — fewer than 20
+			// L1 observations returned in the featured tier.
 			expect(result.L1.length).toBeLessThan(20);
 			expect(result.L1.length).toBeGreaterThan(0);
+		});
+
+		// ── Two-tier L1 index (v16, spec §13) ─────────────────────────────────
+		// The featured tier is the existing L1 behavior at a 12000-char budget;
+		// everything L1 that doesn't fit gets a per-entity breadcrumb in L1Index
+		// instead of silently vanishing.
+
+		it('emits L1Index entries for unfeatured L1 observations, grouped by entity', async () => {
+			const filler = 'F'.repeat(990);
+			const fillerObs = [];
+			for (let i = 0; i < 13; i++) {
+				fillerObs.push({
+					content: `${filler} #${i}`, createdAt: new Date().toISOString(),
+					importance: 5.0, contextLayer: 'L1' as const, memoryType: null,
+				});
+			}
+			const overflowObs = [];
+			for (let i = 0; i < 4; i++) {
+				overflowObs.push({
+					content: `zebra overflow observation number ${i} carrying enough text to matter`,
+					createdAt: new Date().toISOString(),
+					importance: 2.0, contextLayer: 'L1' as const, memoryType: null,
+				});
+			}
+			await store.createEntities([
+				{ name: 'FeaturedFill', entityType: 'filler', observations: fillerObs },
+				{ name: 'OverflowEnt', entityType: 'overflow-type', observations: overflowObs },
+			]);
+
+			const result = await store.getContextLayers();
+
+			// Featured takes the high-importance filler until the budget; the
+			// low-importance OverflowEnt observations land in the index.
+			expect(result.L1Index).toBeDefined();
+			const entry = result.L1Index!.find(e => e.entityName === 'OverflowEnt');
+			expect(entry).toBeDefined();
+			expect(entry!.entityType).toBe('overflow-type');
+			// Every OverflowEnt observation NOT in featured is counted.
+			const featuredOverflow = result.L1.filter(o => o.entityName === 'OverflowEnt').length;
+			expect(entry!.observationCount).toBe(4 - featuredOverflow);
+			expect(entry!.observationCount).toBeGreaterThan(0);
+			// Hint carries content prefixes (auto-fallback: first 100 chars).
+			expect(entry!.hint).toContain('zebra overflow observation');
+			// Featured/index disjointness: nothing counted in the index is also
+			// present as full text (checked per-entity via the count above).
+		});
+
+		it('omits L1Index entirely when all L1 observations fit the featured budget', async () => {
+			await store.createEntities([
+				{ name: 'SmallL1', entityType: 'concept', observations: [
+					{ content: 'fits easily', createdAt: new Date().toISOString(), importance: 3.0, contextLayer: 'L1' as const, memoryType: null },
+				] },
+			]);
+			const result = await store.getContextLayers();
+			expect(result.L1).toHaveLength(1);
+			// Absence (not an empty array) is the pre-v16 compatibility signal:
+			// consumers read "no L1Index" as "L1 is complete".
+			expect(result.L1Index).toBeUndefined();
+		});
+
+		it('drops lowest-importance entities when the index budget overflows', async () => {
+			const filler = 'H'.repeat(990);
+			const fillerObs = [];
+			for (let i = 0; i < 13; i++) {
+				fillerObs.push({
+					content: `${filler} #${i}`, createdAt: new Date().toISOString(),
+					importance: 5.0, contextLayer: 'L1' as const, memoryType: null,
+				});
+			}
+			const entities = [
+				{ name: 'FeaturedFill3', entityType: 'filler', observations: fillerObs },
+			];
+			// 30 index candidates with strictly descending importance; each hint
+			// runs ~103 chars (100-char prefix + '...'), so ~30 serialized entries
+			// comfortably exceed the 4000-char index budget.
+			for (let i = 0; i < 30; i++) {
+				const tag = String(i).padStart(2, '0');
+				entities.push({
+					name: `IdxEnt${tag}`, entityType: 'idx',
+					observations: [{
+						content: `idx entity ${tag} `.repeat(20),
+						createdAt: new Date().toISOString(),
+						importance: 4.0 - i * 0.05, contextLayer: 'L1' as const, memoryType: null,
+					}],
+				});
+			}
+			await store.createEntities(entities);
+
+			const result = await store.getContextLayers();
+			const idxEntries = result.L1Index!.filter(e => e.entityName.startsWith('IdxEnt'));
+			expect(idxEntries.length).toBeGreaterThan(0);
+			expect(idxEntries.length).toBeLessThan(30);
+			// The survivors are the HIGHEST-importance prefix, in order — the
+			// index truncates from the bottom, same strategy as featured.
+			for (let i = 0; i < idxEntries.length; i++) {
+				expect(idxEntries[i].entityName).toBe(`IdxEnt${String(i).padStart(2, '0')}`);
+			}
 		});
 	});
 
@@ -3679,7 +3777,8 @@ describe('SqliteStore-specific', () => {
 			// v13 normalized drifted relation-type spellings (explicit reviewed map).
 			// v14 added valid_from/valid_until (bi-temporal valid time) to observations + relations.
 			// v15 added vec_config (single-row embedding-model identity guard).
-			expect(row!.version).toBe(15);
+			// v16 added summary (nullable) to observations for the two-tier L1 index (§13).
+			expect(row!.version).toBe(16);
 		});
 	});
 
@@ -4268,6 +4367,44 @@ describe('SqliteStore-specific', () => {
 	//   resolution via surface variants (normalized_name).
 	// ----------------------------------------------------------
 	describe('setObservationMetadata', () => {
+
+		it('sets an explicit summary for the L1-index hint, and null clears back to the auto-fallback (v16)', async () => {
+			// SQLite-only: setObservationMetadata is the ONLY write path for
+			// summary (add_observations keeps its plain shape), and JSONL
+			// throws on setObservationMetadata — so the override lives here
+			// while the auto-fallback hint behavior is pinned in the shared
+			// getContextLayers block.
+			const filler = 'G'.repeat(990);
+			const fillerObs = [];
+			for (let i = 0; i < 13; i++) {
+				fillerObs.push({
+					content: `${filler} #${i}`, createdAt: new Date().toISOString(),
+					importance: 5.0, contextLayer: 'L1' as const, memoryType: null,
+				});
+			}
+			const targetContent = '[2026-07-02T23:30:00.000Z metadata prefix that buries the point] the actual insight lives far past the first hundred characters of this observation';
+			await store.createEntities([
+				{ name: 'FeaturedFill2', entityType: 'filler', observations: fillerObs },
+				{ name: 'SummaryTarget', entityType: 'concept', observations: [
+					{ content: targetContent, createdAt: new Date().toISOString(), importance: 1.0, contextLayer: 'L1' as const, memoryType: null },
+				] },
+			]);
+
+			await store.setObservationMetadata([
+				{ entityName: 'SummaryTarget', content: targetContent, summary: 'moon scoring recalibration decision' },
+			]);
+			let result = await store.getContextLayers();
+			let entry = result.L1Index!.find(e => e.entityName === 'SummaryTarget');
+			expect(entry!.hint).toBe('moon scoring recalibration decision');
+
+			// null clears the override — hint falls back to first 100 chars + '...'.
+			await store.setObservationMetadata([
+				{ entityName: 'SummaryTarget', content: targetContent, summary: null },
+			]);
+			result = await store.getContextLayers();
+			entry = result.L1Index!.find(e => e.entityName === 'SummaryTarget');
+			expect(entry!.hint).toBe(targetContent.slice(0, 100) + '...');
+		});
 
 		it('sets and clears valid-time on observations (v14)', async () => {
 			await store.createEntities([

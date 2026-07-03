@@ -6,6 +6,7 @@ import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { promises as fs } from 'fs';
 import { EmbeddingPipeline, EMBEDDING_DIM, EMBED_MODEL, DEFAULT_EMBED_MODEL, SIMILAR_THRESHOLD, DUPLICATE_THRESHOLD, PRECEDENT_FLOOR, type VectorState } from './embedding.js';
+import { buildL1Index, indexCharCost, L1_FEATURED_CHAR_BUDGET, type UnfeaturedL1 } from './context-layers.js';
 import {
   createObservation,
   ENTITY_TIMESTAMP_SENTINEL,
@@ -973,6 +974,35 @@ export class SqliteStore implements GraphStore {
         this.db.prepare('UPDATE schema_version SET version = 15').run();
       }).immediate();
       currentVersion = 15;
+    }
+
+    if (currentVersion < 16) {
+      // Migration 15 → 16: observation summary for the two-tier L1 index
+      // (spec §13, docs/superpowers/specs/2026-04-16-summary-layer-design.md —
+      // designed for "v10" in April, built here as v16).
+      //
+      // NULLABLE by spec — the ONE deliberate exception to the '' sentinel
+      // convention: NULL means "no explicit summary" and getContextLayers
+      // falls back to the observation's first 100 chars when building index
+      // hints. An empty-string summary would be indistinguishable from a
+      // deliberately-blank hint, so NULL carries real meaning here. Max 200
+      // chars enforced by Zod at the tool boundary, not DDL (same division
+      // of labor as every other length limit in this schema). Not indexed —
+      // only read inside getContextLayers' index-tier pass.
+      //
+      // Race safety: try-catch-duplicate-column ALTER (Issue #78 pattern)
+      // inside an IMMEDIATE transaction (house migration rule since v11).
+      this.db.transaction(() => {
+        try {
+          this.db.prepare(`ALTER TABLE observations ADD COLUMN summary TEXT DEFAULT NULL`).run();
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!msg.includes('duplicate column name')) throw err;
+          // Another process already added this column — safe to continue.
+        }
+        this.db.prepare('UPDATE schema_version SET version = 16').run();
+      }).immediate();
+      currentVersion = 16;
     }
 
     // === Indexes (idempotent, run on every startup) ===
@@ -4124,24 +4154,26 @@ export class SqliteStore implements GraphStore {
     };
   }
 
-  // -- Token budget constant for context layers (from spec §7) --
-  // L1 budget: ~4000 tokens ≈ 16000 chars. Session-start context — updated frequently.
-  // History: 800 (v1.1.0) → 2000 (2026-04-14, tombstone cleanup) → 4000 (2026-04-16,
-  // summary layer spec). The summary layer (§13) will split this into ~3000 featured
-  // + ~1000 index, but until implemented, the full budget is used for featured text.
-  // 4000 tokens is 2% of 200k context — safe for attention quality.
+  // -- Token budgets for context layers --
+  // History: single L1 budget 800 (v1.1.0) → 2000 (2026-04-14) → 4000 tokens/16000
+  // chars (2026-04-16 summary-layer spec) → SPLIT in v16 into featured 12000 +
+  // index 4000 (context-layers.ts holds the constants + the shared index logic).
   // L0 has no budget enforcement by design: core identity/rules are always included
   // regardless of size (~100 tokens is a guideline, not a hard cap).
-  private static readonly L1_CHAR_BUDGET = 16000;
 
   /**
    * Returns L0 and L1 observations for a project, sorted by layer then importance DESC.
-   * Enforces soft token budgets: observations that would exceed the budget are truncated
-   * (most important ones kept). Designed to be called by SessionStart / PostCompact hooks.
+   *
+   * Two-tier L1 (v16, spec §13): the FEATURED tier is full observation text up to
+   * L1_FEATURED_CHAR_BUDGET (most important first — identical to the pre-v16 behavior
+   * at a smaller budget); every L1 observation that doesn't fit gets a per-entity
+   * breadcrumb in L1Index (hint = summary ?? first 100 chars) so truncation is
+   * visible instead of silent. L1Index is OMITTED when everything fit — its absence
+   * is the pre-v16 "L1 is complete" signal existing consumers rely on.
    *
    * @param projectId - Optional project scope. When set, includes project + global entities.
    * @param layers - Which layers to return. Defaults to ['L0', 'L1'].
-   * @returns ContextLayersResult with L0 and L1 arrays plus tokenEstimate
+   * @returns ContextLayersResult with L0/L1 arrays, optional L1Index, and tokenEstimate
    */
   async getContextLayers(projectId?: string, layers?: string[]): Promise<Readonly<ContextLayersResult>> {
     // Default to both layers if not specified.
@@ -4160,11 +4192,12 @@ export class SqliteStore implements GraphStore {
     }
     const layerPlaceholders = layerValues.map(() => '?').join(', ');
 
-    // Single query: fetch all matching observations with their entity's display name
-    // and updated_at. Sorted by layer (L0 first) then importance DESC.
+    // Single query: fetch all matching observations with their entity's display name,
+    // type (for index entries), summary (v16 hint override), and updated_at.
+    // Sorted by layer (L0 first) then importance DESC.
     const rows = this.db.prepare(`
-      SELECT e.name AS entityName, o.content, o.importance, o.context_layer, o.memory_type,
-             o.source_instance, e.updated_at
+      SELECT e.name AS entityName, e.entity_type, o.content, o.summary, o.importance,
+             o.context_layer, o.memory_type, o.source_instance, e.updated_at
       FROM observations o
       JOIN entities e ON o.entity_id = e.id
       WHERE o.superseded_at = ''
@@ -4174,7 +4207,9 @@ export class SqliteStore implements GraphStore {
       ORDER BY o.context_layer ASC, o.importance DESC, e.updated_at DESC
     `).all(...layerValues, ...projectParams) as Array<{
       entityName: string;
+      entity_type: string;
       content: string;
+      summary: string | null;
       importance: number;
       context_layer: string;
       memory_type: string | null;
@@ -4182,11 +4217,16 @@ export class SqliteStore implements GraphStore {
       updated_at: string;
     }>;
 
-    // Partition into L0 and L1 arrays, applying character budgets.
+    // Partition into L0 (unbudgeted), featured L1 (budgeted full text), and the
+    // unfeatured L1 remainder (index breadcrumbs). Rows are importance-DESC, so
+    // once the featured budget trips, EVERY later L1 row is unfeatured — no
+    // bin-packing smaller observations past a bigger one that didn't fit.
     const L0: ContextLayerObservation[] = [];
     const L1: ContextLayerObservation[] = [];
+    const unfeatured: UnfeaturedL1[] = [];
     let l0Chars = 0;
     let l1Chars = 0;
+    let l1Full = false;
 
     for (const row of rows) {
       const charCost = row.entityName.length + row.content.length;
@@ -4203,13 +4243,19 @@ export class SqliteStore implements GraphStore {
           // L0 omits updatedAt per spec — these are identity/rules, not timestamped context.
         });
       } else if (row.context_layer === 'L1' && requestedLayers.has('L1')) {
-        // L1 observations truncated at budget — most important first (already sorted).
-        if (l1Chars + charCost > SqliteStore.L1_CHAR_BUDGET && L1.length > 0) {
-          // Budget exceeded — stop adding L1 observations. Using break (not continue)
-          // ensures we don't bin-pack smaller lower-importance observations past a
-          // larger higher-importance one that didn't fit. The first one always gets
-          // included even if it alone exceeds the budget (the L1.length > 0 guard).
-          break;
+        if (l1Full || (l1Chars + charCost > L1_FEATURED_CHAR_BUDGET && L1.length > 0)) {
+          // Featured budget exceeded — this and every later L1 row becomes an
+          // index breadcrumb instead of vanishing (v16). The first observation
+          // is always featured even if it alone exceeds the budget (the
+          // L1.length > 0 guard, unchanged from the single-tier behavior).
+          l1Full = true;
+          unfeatured.push({
+            entityName: row.entityName,
+            entityType: row.entity_type,
+            content: row.content,
+            summary: row.summary,
+          });
+          continue;
         }
         l1Chars += charCost;
         L1.push({
@@ -4223,11 +4269,18 @@ export class SqliteStore implements GraphStore {
       }
     }
 
-    // Token estimate: rough chars / 4 approximation.
-    const totalChars = l0Chars + l1Chars;
+    const L1Index = buildL1Index(unfeatured);
+
+    // Token estimate: rough chars / 4, covering featured text AND the
+    // serialized index (both land in the consumer's context).
+    const totalChars = l0Chars + l1Chars + indexCharCost(L1Index);
     const tokenEstimate = Math.ceil(totalChars / 4);
 
-    return { L0, L1, tokenEstimate };
+    return {
+      L0, L1, tokenEstimate,
+      // Absence (not []) is the "L1 is complete" signal — pre-v16 contract.
+      ...(L1Index.length > 0 ? { L1Index } : {}),
+    };
   }
 
   /**
@@ -4298,6 +4351,14 @@ export class SqliteStore implements GraphStore {
         if ('validUntil' in u) {
           setClauses.push('valid_until = ?');
           params.push(u.validUntil ?? '');
+        }
+        // Summary (v16): the L1-index hint override. String sets, explicit
+        // null clears back to NULL (NOT '' — summary is the one nullable-
+        // sentinel column; see the v16 migration comment), which restores the
+        // first-100-chars auto-fallback in getContextLayers.
+        if ('summary' in u) {
+          setClauses.push('summary = ?');
+          params.push(u.summary ?? null);
         }
 
         // Nothing to update — skip this entry.

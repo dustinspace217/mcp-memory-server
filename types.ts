@@ -30,6 +30,11 @@ export interface Observation {
    *  No query filtering yet — display/record only (DEF-RR-01). */
   validFrom?: string;
   validUntil?: string;
+  /** L1-index hint override (v16, ≤200 chars). Consumed only by
+   *  getContextLayers when building L1Index breadcrumbs; absent/null = the
+   *  first-100-chars auto-fallback. Set via set_observation_metadata (SQLite);
+   *  in JSONL it round-trips from file contents but has no setter. */
+  summary?: string | null;
 }
 
 /**
@@ -386,6 +391,7 @@ export interface SetObservationMetadataInput {
   memoryType?: string | null;   // free-form tag or null (unclassified); only updated if key is present
   validFrom?: string | null;    // VALID TIME start (v14); ISO string sets, null clears; only updated if key is present
   validUntil?: string | null;   // VALID TIME end (v14); ISO string sets, null clears; only updated if key is present
+  summary?: string | null;      // manual L1-index hint override (v16, ≤200 chars); null clears back to the first-100-chars auto-fallback; only updated if key is present
 }
 
 /** A single observation in a context layer response. L0 observations omit updatedAt
@@ -400,12 +406,34 @@ export interface ContextLayerObservation {
   updatedAt?: string;   // present on L1, omitted on L0
 }
 
+/** One entry in the L1 index tier (v16, spec §13): a per-ENTITY breadcrumb for
+ *  L1 observations that didn't fit the featured budget. Entity-level (not
+ *  per-observation) because entity names are often self-describing and
+ *  per-observation entries would be 3-5x the size for marginal gain. */
+export interface L1IndexEntry {
+  entityName: string;
+  entityType: string;
+  /** Number of L1 observations on this entity that were NOT featured. */
+  observationCount: number;
+  /** Compact hint: each unfeatured observation's summary (or its first 100
+   *  chars), comma-joined, truncated to 200 chars total. Enough to decide
+   *  whether to open_nodes the entity. */
+  hint: string;
+}
+
 /** Return type for getContextLayers(). Observations grouped by layer,
  *  with a rough token estimate (chars / 4) so hooks can budget.
- *  L0 and L1 arrays are sorted by importance DESC within each layer. */
+ *  L0 and L1 arrays are sorted by importance DESC within each layer.
+ *
+ *  Two-tier L1 (v16): L1 is the FEATURED tier (full text, ~12000-char budget);
+ *  L1Index carries breadcrumbs for every L1 observation that didn't fit
+ *  (~4000-char budget, lowest-importance entities dropped on overflow).
+ *  L1Index is present only when at least one L1 observation was unfeatured —
+ *  its absence means L1 is complete, which is what pre-v16 consumers assume. */
 export interface ContextLayersResult {
   L0: ContextLayerObservation[];
   L1: ContextLayerObservation[];
+  L1Index?: L1IndexEntry[];
   tokenEstimate: number;
 }
 

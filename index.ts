@@ -725,10 +725,12 @@ server.registerTool(
   "set_observation_metadata",
   {
     title: "Set Observation Metadata",
-    description: "Updates importance, context layer, memory type, and/or VALID TIME on existing observations " +
+    description: "Updates importance, context layer, memory type, VALID TIME, and/or summary on existing observations " +
       "without superseding them. Preserves the observation's identity, timestamps, and embeddings. " +
-      "Use this to promote observations to L0/L1, adjust importance, tag memory type, or record when " +
-      "a fact was true IN THE WORLD (validFrom/validUntil — distinct from when the database learned it). " +
+      "Use this to promote observations to L0/L1, adjust importance, tag memory type, record when " +
+      "a fact was true IN THE WORLD (validFrom/validUntil — distinct from when the database learned it), " +
+      "or set a summary — the compact hint get_context_layers uses for this observation in the L1 index " +
+      "when it doesn't fit the featured budget (default hint: first 100 chars of content). " +
       "Observations are identified by (entityName, content) exact match.",
     inputSchema: {
       updates: z.array(z.object({
@@ -746,11 +748,13 @@ server.registerTool(
           .describe("VALID-TIME start: when the fact became true in the world (ISO 8601 UTC, Z suffix). null clears. Only updated if key present."),
         validUntil: z.string().datetime({ offset: false }).nullable().optional()
           .describe("VALID-TIME end: when the fact stopped being true in the world (ISO 8601 UTC, Z suffix). null clears. Only updated if key present."),
+        summary: z.string().min(1).max(200).nullable().optional()
+          .describe("L1-index hint override (≤200 chars) — shown for this observation when it overflows get_context_layers' featured tier. null clears back to the first-100-chars auto-fallback. Only updated if key present."),
       }).refine(
         // At least one metadata field must be provided — otherwise the update is a no-op
         // and the caller gets a misleading "0 not found" response.
-        (obj) => obj.importance !== undefined || 'contextLayer' in obj || 'memoryType' in obj || 'validFrom' in obj || 'validUntil' in obj,
-        { message: "At least one of importance, contextLayer, memoryType, validFrom, or validUntil must be provided" }
+        (obj) => obj.importance !== undefined || 'contextLayer' in obj || 'memoryType' in obj || 'validFrom' in obj || 'validUntil' in obj || 'summary' in obj,
+        { message: "At least one of importance, contextLayer, memoryType, validFrom, validUntil, or summary must be provided" }
       )).min(1).max(100).describe("Observations to update"),
     },
     outputSchema: {
@@ -784,10 +788,12 @@ server.registerTool(
   {
     title: "Get Context Layers",
     description: "Returns L0 and L1 observations — the 'push' layers that should be restored at session " +
-      "start or after compaction. L0 (~100 token budget) holds core identity and rules that rarely change. " +
-      "L1 (~4000 token budget) holds active project context loaded at session start. Observations are " +
-      "sorted by importance (highest first) and truncated at the token budget. Call this from SessionStart " +
-      "and PostCompact hooks to automatically restore critical context.",
+      "start or after compaction. L0 (~100 token guideline, unbudgeted) holds core identity and rules. " +
+      "L1 is TWO-TIER: the featured tier (~3000 token budget) carries full text sorted by importance; " +
+      "everything L1 that doesn't fit appears in L1Index (~1000 token budget) as per-entity breadcrumbs " +
+      "(entity, type, count, hint) — open_nodes an entity to pull its full content. L1Index is ABSENT " +
+      "when all L1 content fit (L1 is complete). Call this from SessionStart and PostCompact hooks to " +
+      "automatically restore critical context.",
     inputSchema: {
       projectId: ProjectIdSchema,
       layers: z.array(z.enum(['L0', 'L1'])).optional()
@@ -808,8 +814,16 @@ server.registerTool(
         memoryType: z.string().nullable(),
         sourceInstance: z.string(),
         updatedAt: z.string().optional(),
-      })).describe("Session-start context (active work and decisions)"),
-      tokenEstimate: z.number().describe("Approximate token count (chars / 4)"),
+      })).describe("Session-start context, featured tier (full text, most important first)"),
+      // Declared here is load-bearing (SDK output validation strips undeclared
+      // keys — the #86/#87 lesson): the v16 index tier.
+      L1Index: z.array(z.object({
+        entityName: z.string(),
+        entityType: z.string(),
+        observationCount: z.number().describe("L1 observations on this entity that were NOT featured"),
+        hint: z.string().describe("Compact per-entity hint (summaries or first-100-chars, ≤200 chars)"),
+      })).optional().describe("Breadcrumbs for L1 content that overflowed the featured budget. ABSENT when L1 is complete."),
+      tokenEstimate: z.number().describe("Approximate token count (chars / 4), featured + index"),
     }
   },
   async ({ projectId, layers }) => {
@@ -822,6 +836,7 @@ server.registerTool(
     const parts = [];
     if (l0Count > 0) parts.push(`${l0Count} L0 observation(s)`);
     if (l1Count > 0) parts.push(`${l1Count} L1 observation(s)`);
+    if (result.L1Index) parts.push(`${result.L1Index.length} L1-index entr(ies) for unfeatured content`);
     const summary = parts.length > 0
       ? `Context layers: ${parts.join(', ')} (~${result.tokenEstimate} tokens)`
       : 'No L0 or L1 observations found.';

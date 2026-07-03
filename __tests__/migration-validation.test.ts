@@ -1216,6 +1216,15 @@ describe('Migration safety validation', () => {
     const vecCfg = db2.prepare('SELECT model_name FROM vec_config WHERE id = 1').get() as { model_name: string };
     expect(vecCfg.model_name).toBe('Xenova/all-MiniLM-L6-v2');
 
+    // Verify: v16 also ran — summary exists on observations and pre-existing
+    // rows default to NULL (the one nullable-sentinel column: NULL = no
+    // explicit summary → getContextLayers' first-100-chars auto-fallback).
+    expect(version).toBeGreaterThanOrEqual(16);
+    const obsColsV16 = db2.prepare('PRAGMA table_info(observations)').all() as { name: string }[];
+    expect(obsColsV16.map(c => c.name)).toContain('summary');
+    const preexistingSummary = db2.prepare('SELECT summary FROM observations LIMIT 1').get() as { summary: string | null };
+    expect(preexistingSummary.summary).toBeNull();
+
     db2.close();
     await sqliteStore.close();
   });

@@ -48,6 +48,7 @@ import {
   searchNodesFingerprint,
 } from './cursor.js';
 import { CORE_RELATION_TYPES, relationTypeKey } from './relation-types.js';
+import { buildL1Index, indexCharCost, L1_FEATURED_CHAR_BUDGET, type UnfeaturedL1 } from './context-layers.js';
 
 /**
  * Handles the legacy memory.json -> memory.jsonl migration.
@@ -105,7 +106,7 @@ export function normalizeObservation(obs: unknown): Observation {
   }
   if (typeof obs === 'object' && obs !== null && 'content' in obs && typeof (obs as any).content === 'string') {
     // Cast to access optional fields — legacy JSONL data won't have the v1.1 metadata fields
-    const o = obs as { content: string; createdAt?: unknown; importance?: unknown; contextLayer?: unknown; memoryType?: unknown; sourceInstance?: unknown };
+    const o = obs as { content: string; createdAt?: unknown; importance?: unknown; contextLayer?: unknown; memoryType?: unknown; sourceInstance?: unknown; summary?: unknown };
     return {
       content: o.content,
       createdAt: typeof o.createdAt === 'string' ? o.createdAt : 'unknown',
@@ -113,6 +114,9 @@ export function normalizeObservation(obs: unknown): Observation {
       contextLayer: typeof o.contextLayer === 'string' ? o.contextLayer : null,
       memoryType: typeof o.memoryType === 'string' ? o.memoryType : null,
       sourceInstance: typeof o.sourceInstance === 'string' ? o.sourceInstance : 'unknown',
+      // v16 L1-index hint: preserved on round-trip so a file-resident summary
+      // survives load→save (JSONL has no setter; see the Observation type).
+      ...(typeof o.summary === 'string' ? { summary: o.summary } : {}),
     };
   }
   throw new Error(`Invalid observation format: ${JSON.stringify(obs)}`);
@@ -715,25 +719,32 @@ export class JsonlStore implements GraphStore {
 
   // -- Token budget constants for context layers (from spec §7) --
   // L0 has no budget enforcement by design — core identity/rules always included.
-  // ~100 tokens is a guideline, not a hard cap.
-  private static readonly L1_CHAR_BUDGET = 3200;
-
   /**
    * Returns L0 and L1 observations from the in-memory graph. Filters by project
    * (including global entities) and applies soft token budgets. Works by scanning
    * all entities and their observations — no index needed since the graph is in memory.
    *
+   * Two-tier L1 (v16): shares the featured/index budgets AND the index-building
+   * logic with SqliteStore via context-layers.ts — this replaces a JSONL-local
+   * L1_CHAR_BUDGET of 3200 that had silently drifted from SQLite's 16000 (the
+   * exact divergence the shared module exists to prevent). Hints honor a
+   * file-resident `summary` (no setter here — JSONL's setObservationMetadata
+   * throws), falling back to first-100-chars like SQLite.
+   *
    * @param projectId - Optional project scope. When set, includes project + global.
    * @param layers - Which layers to return. Defaults to ['L0', 'L1'].
-   * @returns ContextLayersResult with L0 and L1 arrays plus tokenEstimate
+   * @returns ContextLayersResult with L0/L1 arrays, optional L1Index, and tokenEstimate
    */
   async getContextLayers(projectId?: string, layers?: string[]): Promise<Readonly<ContextLayersResult>> {
     const graph = await this.loadGraph();
     const requestedLayers = new Set(layers ?? ['L0', 'L1']);
 
     // Collect matching observations from all project-matching entities.
+    // L1 rows carry entityType + summary alongside the response shape so the
+    // unfeatured remainder can feed buildL1Index without a second scan.
+    type L1Row = ContextLayerObservation & { entityType: string; summary: string | null };
     const rawL0: ContextLayerObservation[] = [];
-    const rawL1: ContextLayerObservation[] = [];
+    const rawL1: L1Row[] = [];
 
     for (const entity of graph.entities) {
       // Project filter: include if entity matches project OR is global.
@@ -758,6 +769,8 @@ export class JsonlStore implements GraphStore {
             memoryType: obs.memoryType,
             sourceInstance: obs.sourceInstance ?? 'unknown',
             updatedAt: entity.updatedAt,
+            entityType: entity.entityType,
+            summary: obs.summary ?? null,
           });
         }
       }
@@ -770,24 +783,43 @@ export class JsonlStore implements GraphStore {
     rawL0.sort(byImportanceThenRecency);
     rawL1.sort(byImportanceThenRecency);
 
-    // Apply L1 char budget (L0 always included per spec).
+    // Featured tier: full text up to the shared budget (L0 always included per
+    // spec). Once the budget trips, every later row is unfeatured — same
+    // no-bin-packing rule as SQLite.
     const L0 = rawL0;
     const L1: ContextLayerObservation[] = [];
+    const unfeatured: UnfeaturedL1[] = [];
     let l1Chars = 0;
+    let l1Full = false;
 
-    for (const obs of rawL1) {
-      const charCost = obs.entityName.length + obs.content.length;
-      if (l1Chars + charCost > JsonlStore.L1_CHAR_BUDGET && L1.length > 0) {
-        break;  // Don't bin-pack — stop at the budget boundary to preserve importance ordering
+    for (const row of rawL1) {
+      const charCost = row.entityName.length + row.content.length;
+      if (l1Full || (l1Chars + charCost > L1_FEATURED_CHAR_BUDGET && L1.length > 0)) {
+        l1Full = true;
+        unfeatured.push({
+          entityName: row.entityName,
+          entityType: row.entityType,
+          content: row.content,
+          summary: row.summary,
+        });
+        continue;
       }
       l1Chars += charCost;
-      L1.push(obs);
+      // Strip the internal carry fields — the response shape stays exactly
+      // ContextLayerObservation (entityType/summary are index-tier concerns).
+      const { entityType: _et, summary: _s, ...pub } = row;
+      L1.push(pub);
     }
 
+    const L1Index = buildL1Index(unfeatured);
     const l0Chars = L0.reduce((sum, o) => sum + o.entityName.length + o.content.length, 0);
-    const tokenEstimate = Math.ceil((l0Chars + l1Chars) / 4);
+    const tokenEstimate = Math.ceil((l0Chars + l1Chars + indexCharCost(L1Index)) / 4);
 
-    return { L0, L1, tokenEstimate };
+    return {
+      L0, L1, tokenEstimate,
+      // Absence (not []) is the "L1 is complete" signal — pre-v16 contract.
+      ...(L1Index.length > 0 ? { L1Index } : {}),
+    };
   }
 
   /**
