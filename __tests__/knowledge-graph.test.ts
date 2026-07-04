@@ -6,6 +6,7 @@ import type { GraphStore, RelationInput, SupersedeInput } from '../types.js';
 import { InvalidCursorError } from '../types.js';
 import { JsonlStore, normalizeObservation } from '../jsonl-store.js';
 import { SqliteStore } from '../sqlite-store.js';
+import { indexCharCost } from '../context-layers.js';
 
 // Resolve the directory containing this test file, used for temp file paths
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -1547,6 +1548,20 @@ describe.each<[string, string, StoreFactory]>([
 			expect(result.entities[0].name).toBe('Alice');
 		});
 
+		it('paginated recency search includes relations to off-result partners (either-endpoint)', async () => {
+			// Pins the RECENCY-mode search relation contract specifically —
+			// readGraph and relevance mode each have their own pins, but this
+			// path's filter was also changed by the 2026-07-02 coverage fix and
+			// shipped unpinned (QA 2026-07-03 HIGH). Pagination forces the
+			// paginated code path; only Alice matches, yet her relation to the
+			// off-result Acme Corp must be returned.
+			const result = await store.searchNodes('programming', undefined, { limit: 5 });
+			expect(result.entities.map(e => e.name)).toEqual(['Alice']);
+			expect(result.relations).toEqual([
+				expect.objectContaining({ from: 'Alice', to: 'Acme Corp', relationType: 'works_at' }),
+			]);
+		});
+
 		it('should search by entity type', async () => {
 			const result = await store.searchNodes('company');
 			expect(result.entities).toHaveLength(1);
@@ -1892,7 +1907,9 @@ describe.each<[string, string, StoreFactory]>([
 			]);
 
 			// searchNodes with proj-1 should return P1 + Global (both match "searchable"),
-			// and only the P1->Global relation (AND logic: both endpoints in result set)
+			// and only the P1->Global relation — the P1->P2 edge is excluded because
+			// P2 is outside the PROJECT-WIDE (project + global) endpoint filter, the
+			// scoped-read contract kept by the v1.4.0 either-endpoint fix.
 			const result = await store.searchNodes('searchable', 'proj-1');
 			const names = result.entities.map(e => e.name).sort();
 			expect(names).toEqual(['SearchGlobal', 'SearchP1']);
@@ -3018,8 +3035,9 @@ describe.each<[string, string, StoreFactory]>([
 
 		it('truncates L1 at character budget', async () => {
 			// Create an entity with many L1 observations that collectively exceed
-			// the ~16000 char budget (4000 tokens). Each observation is ~1000 chars.
-			// 20 * 1000 = ~20000 chars, well over the 16000 budget.
+			// the featured budget (12000 chars since the v16 two-tier split; was a
+			// single ~16000 budget before). Each observation is ~1000 chars;
+			// 20 * 1000 = ~20000 chars, well over the featured budget.
 			const longContent = 'A'.repeat(990);
 			const observations = [];
 			for (let i = 0; i < 20; i++) {
@@ -3088,6 +3106,13 @@ describe.each<[string, string, StoreFactory]>([
 			expect(entry!.hint).toContain('zebra overflow observation');
 			// Featured/index disjointness: nothing counted in the index is also
 			// present as full text (checked per-entity via the count above).
+
+			// tokenEstimate includes the SERIALIZED index cost, exactly — the
+			// fixture has no L0, so estimate = ceil((featured + index chars)/4).
+			// Pins the indexCharCost term: dropping it from the total fails here
+			// (a QA mutation experiment showed nothing else caught that revert).
+			const featuredChars = result.L1.reduce((sum, o) => sum + o.entityName.length + o.content.length, 0);
+			expect(result.tokenEstimate).toBe(Math.ceil((featuredChars + indexCharCost([...result.L1Index!])) / 4));
 		});
 
 		it('omits L1Index entirely when all L1 observations fit the featured budget', async () => {
@@ -3447,6 +3472,46 @@ describe('JsonlStore-specific', () => {
 		await store.close();
 		try { await fs.unlink(storePath); } catch { /* file may not exist */ }
 		try { await fs.unlink(storePath + '.tmp'); } catch { /* temp file may not exist */ }
+	});
+
+	// ----------------------------------------------------------
+	// Summary round-trip (v16) — JSONL has NO summary setter
+	// (setObservationMetadata throws), so a file-resident summary is the only
+	// source; this pins the documented load→save passthrough + hint behavior
+	// (QA 2026-07-03: the passthrough was shipped unexercised).
+	// ----------------------------------------------------------
+	it('round-trips a file-resident summary and uses it for the L1-index hint', async () => {
+		// Write a JSONL file directly: one big featured-filler entity plus a
+		// low-importance entity whose observation carries an explicit summary.
+		const filler = 'J'.repeat(990);
+		const fillerObs = [];
+		for (let i = 0; i < 13; i++) {
+			fillerObs.push({ content: `${filler} #${i}`, createdAt: '2026-07-01T00:00:00.000Z', importance: 5.0, contextLayer: 'L1', memoryType: null, sourceInstance: 'test' });
+		}
+		const lines = [
+			JSON.stringify({ type: 'entity', name: 'JsonFill', entityType: 'filler', observations: fillerObs, project: null, updatedAt: '2026-07-01T00:00:00.000Z', createdAt: '2026-07-01T00:00:00.000Z' }),
+			JSON.stringify({ type: 'entity', name: 'JsonSummaryEnt', entityType: 'concept', observations: [
+				{ content: 'a long metadata-prefixed observation whose first hundred characters are not the story at all here', createdAt: '2026-07-01T00:00:00.000Z', importance: 1.0, contextLayer: 'L1', memoryType: null, sourceInstance: 'test', summary: 'file-resident hint text' },
+			], project: null, updatedAt: '2026-07-01T00:00:00.000Z', createdAt: '2026-07-01T00:00:00.000Z' }),
+		];
+		await fs.writeFile(storePath, lines.join('\n') + '\n');
+
+		// Load → the summary must drive the index hint...
+		const freshStore = new JsonlStore(storePath);
+		await freshStore.init();
+		const layers = await freshStore.getContextLayers();
+		const entry = layers.L1Index!.find(e => e.entityName === 'JsonSummaryEnt');
+		expect(entry).toBeDefined();
+		expect(entry!.hint).toBe('file-resident hint text');
+
+		// ...and survive a load→mutate→save→reload cycle (normalizeObservation
+		// passthrough — a write to an UNRELATED entity rewrites the whole file).
+		await freshStore.addObservations([{ entityName: 'JsonFill', contents: ['trigger a full-file rewrite'] }]);
+		const reloaded = new JsonlStore(storePath);
+		await reloaded.init();
+		const layers2 = await reloaded.getContextLayers();
+		const entry2 = layers2.L1Index!.find(e => e.entityName === 'JsonSummaryEnt');
+		expect(entry2!.hint).toBe('file-resident hint text');
 	});
 
 	// ----------------------------------------------------------

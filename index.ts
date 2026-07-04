@@ -255,18 +255,19 @@ const SkippedEntitySchema = z.object({
 // Plain object (not z.object()) because registerTool's outputSchema expects { [key]: ZodType }.
 const PaginatedOutputSchema = {
   entities: z.array(EntityOutputSchema),
-  // Page-local relations: a relation is included ONLY when both of its endpoints are
-  // on the current page. This is a deliberate consequence of keyset pagination — it is
-  // NOT a complete relation set, even after paginating every page (cross-page edges,
-  // e.g. a hub→file `contains` edge whose endpoints land on different pages, drop from
-  // every page). For an entity's full relations use open_nodes WITHOUT a projectId — project-scoped
-  // open_nodes applies the SAME both-endpoints AND-filter (sqlite-store.ts ~2709), so it also drops
-  // cross-project edges (11+ in the live graph, verified 2026-06-21). For orphan/connectivity
-  // analysis use get_connected_context or query the store directly. (Surfaced at the
-  // tool boundary 2026-06-08 after a consolidation agent trusted this list for orphan
-  // detection and created 36 false-orphan edges; the limitation was documented in
-  // CLAUDE.md but invisible to callers that don't read it.)
-  relations: z.array(RelationOutputSchema).describe("Page-local: only relations whose BOTH endpoints appear on the current page. NOT a complete relation set even across all pages — use open_nodes WITHOUT a projectId (full relations for specific entities; project-scoped open_nodes drops cross-project edges) or get_connected_context (connectivity/orphan analysis) instead."),
+  // Either-endpoint relations (v1.4.0 coverage fix — this block previously
+  // documented the OPPOSITE page-local contract; the 2026-06-08 incident it
+  // described, a consolidation agent creating 36 false-orphan edges from an
+  // incomplete list, is exactly what the fix retires): a relation is included
+  // when it TOUCHES a returned entity. The partner endpoint may not be in this
+  // response (it's a name — open_nodes it for content); a spanning relation
+  // appears on each endpoint's page, so dedup on (from, to, relationType) when
+  // unioning; the deduped union across all read_graph pages IS the complete
+  // active relation set (verified 496/496 on a live-DB copy). Project-scoped
+  // calls exclude cross-project relations, filtered against the whole
+  // project + global entity set (openNodes-with-projectId keeps the same
+  // scoped contract, sqlite-store.ts openNodes).
+  relations: z.array(RelationOutputSchema).describe("Every relation TOUCHING a returned entity (either-endpoint). The partner endpoint may not be in this response — it's a name; open_nodes it for content. A spanning relation appears on each endpoint's page: dedup on from+to+relationType when unioning, and the deduped union across all read_graph pages is the COMPLETE active relation set. With projectId, cross-project relations are excluded."),
   nextCursor: z.string().nullable().describe("Cursor for the next page, or null if this is the last page"),
   totalCount: z.number().describe("Total number of matching entities across all pages"),
   rankingUnavailable: z.boolean().optional().describe("Present (true) only when orderBy:'relevance' was requested but the backend cannot rank (JSONL has no FTS index) and results fell back to recency order."),

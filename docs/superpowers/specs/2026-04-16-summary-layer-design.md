@@ -1,5 +1,12 @@
 # §13: Summary Layer for Context Layers
 
+> **BUILT 2026-07-02 (v1.4.0)** — as schema **v16**, not the "v10" this spec targeted
+> when written (v10–v15 were claimed by other work in the interim). Implemented as
+> specced with one structural addition: the budgets + index-building logic live in a
+> shared `context-layers.ts` module consumed by both backends (building it surfaced a
+> real drift — JSONL's local L1 budget was 3200 chars vs SQLite's 16000). Plan doc:
+> `docs/superpowers/plans/2026-07-02-summary-layer-and-relation-coverage.md`.
+
 ## Problem
 
 `get_context_layers` returns full observation text for L1 items until the budget runs out.
