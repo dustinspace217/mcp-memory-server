@@ -2,9 +2,9 @@
 
 > Living open-items ledger for the memory system (mcp-memory-server + memory-graph-viz + the
 > ~/.claude hooks). Update this file as items close (check the box, add the resolving date/commit).
-> Last updated **2026-06-21** (orphaned 06-09 work landed to main; embeddings investigation closed —
-> MiniLM for retrieval, bge for the suggester — the coarseness tradeoff is now measured + understood)
-> (conversation `fbe2a512-8519-41c6-be2d-db52f1a2a7a1`). Narrative/decision context lives in MCP:
+> Last updated **2026-07-04** (embeddings section CLOSED end-to-end: granite cutover superseded the
+> retrieval-embedder search; the phase4 held-out panel re-confirmed the tuned model's obs-level NO-GO
+> against the new baseline). Previous update 2026-06-21. Narrative/decision context lives in MCP:
 > entities `concept-aligned-embeddings`, `memory-graph-viz-continuity-thread`, `claude-self`.
 
 **Shipped that session (context, not backlog):** decay gradient (built/QA'd/branch pushed);
@@ -21,17 +21,31 @@ re-scoped, rig-telemetry unblocked, weekly automation); L0 "22 chunks" diagnosed
   16/18 vs bge 1/18). bge wins ENTITY-level clustering (→ the viewer) but loses OBS-level query
   retrieval (→ the server). **Server stays on MiniLM; viewer keeps bge.** Full evidence + steelman in
   `docs/superpowers/plans/2026-06-19-embeddings-server-adoption.md` ("Phase 2 RESULTS").
-- [ ] **(Optional, NEW) Retrieval-preserving server embedder** — separate project: test whether a
-  DIFFERENT model (bge-base untuned, or a retrieval-specialized model) beats MiniLM at *obs-level*
-  retrieval. Our concept-tuned bge does not. Only worth it if MiniLM's obs retrieval proves a real
-  bottleneck — no evidence it does yet.
+- [x] **Retrieval-preserving server embedder — RESOLVED by the granite cutover (2026-07-02, G2/G3).**
+  Exactly the "different model beats MiniLM at obs-level retrieval" test this item proposed: the G2
+  blind panel had granite-small-r2 beat MiniLM 14/18 (arctic-s 11/18) and the G3 cutover shipped it
+  (env-switchable, recalibrated cosine gates 0.969/0.934/0.798, v15 vec_config guard). The live
+  server runs granite-r2.
+- [x] **Tuned-model NO-GO re-confirmed vs granite, held-out (2026-07-04, phase4).** After the granite
+  cutover made the 06-20 NO-GO's baseline stale, a held-out generalizer panel (835 observations
+  created AFTER the tune's training snapshot — the fair test a straight rerun couldn't be, since the
+  tune trained on the June-18 corpus) ran tuned vs granite blind: **granite 16/18, tuned 2/18,
+  unanimous 3-judge majorities.** Consistent with the 06-20 result (tune lost obs-level even
+  in-domain, 1/18 vs MiniLM). The server-adoption thread is closed on TWO independent panels;
+  the tuned model stays viewer-only. Artifacts: memory-graph-viz `concept_embeddings/
+  phase4_generalizer.py` (commit bf64a2d) + local `data/phase4/`. Honest process note: the 06-20
+  NO-GO was already recorded HERE when the 07-04 eval was proposed — the proposal missed it
+  (verify-over-recall), so part of the phase4 spend was avoidable; its added value is the held-out
+  design + the current-baseline confirmation.
 - [ ] **More/better training data** — judge a sample of *far* pairs as hard negatives (the candidate
   set is only MiniLM-near pairs). Was the lever for a bigger *entity*-clustering win; the NO-GO above
   means it would only help the viewer, not the server. Optional, viewer-only now.
 - [ ] **Viewer refresh** — re-run `concept_embeddings/bge_vectors.py` (venv) + `generate.py` to keep
   the concept-aligned viewer current as memory grows (currently a manual snapshot).
-- [ ] **Model versioning / periodic re-tune** as the judged dataset grows (vec table should record
-  which model wrote each vector).
+- [x] **Model versioning DONE (2026-07-02, schema v15)** — `vec_config` records which model wrote
+  `vec_observations`; a configured-vs-recorded mismatch clears stale vectors and re-embeds (the
+  exact "vec table should record which model" ask). Periodic re-tune of the concept model is moot
+  for the server (NO-GO above); viewer-side re-tune remains optional under "More/better training data".
 - [ ] **Viewer: split layout/suggester controls + fix labels** — make the 3D `#layout` dropdown two
   independent controls (layout = MiniLM faithful / suggestion = bge); fix the "MiniLM — vocabulary"
   labels (MiniLM is semantic, not vocabulary). GATED on whether Dustin uses the edge suggester (the
