@@ -608,6 +608,15 @@ export interface GraphStore {
   checkDuplicates(candidates: CheckDuplicateInput[]): Promise<CheckDuplicatesResponse>;
 }
 
+/** Resolves which Claude Code instance is writing, from MEMORY_INSTANCE_NAME.
+ *  Single definition for all three consumers (Issue #80 — they had drifted
+ *  into three independent copies). Read PER CALL (not cached at module load)
+ *  so tests can stub the env without resetModules; trimmed so a
+ *  whitespace-only value can't masquerade as a real instance name. */
+export function resolveSourceInstance(): string {
+  return (process.env.MEMORY_INSTANCE_NAME ?? '').trim() || 'unknown';
+}
+
 /**
  * Creates a new Observation with the current UTC timestamp and optional metadata.
  * Called when observations are added through the API (not during migration).
@@ -624,5 +633,5 @@ export function createObservation(
   contextLayer: string | null = null,
   memoryType: string | null = null
 ): Observation {
-  return { content, createdAt: new Date().toISOString(), importance, contextLayer, memoryType, sourceInstance: process.env.MEMORY_INSTANCE_NAME || 'unknown' };
+  return { content, createdAt: new Date().toISOString(), importance, contextLayer, memoryType, sourceInstance: resolveSourceInstance() };
 }

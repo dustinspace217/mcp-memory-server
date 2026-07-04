@@ -38,6 +38,7 @@ import {
   type FindPrecedentsResult,
   type FindPrecedentsOptions,
   InvalidCursorError,
+  resolveSourceInstance,
 } from './types.js';
 import {
   type CursorPayload,
@@ -500,7 +501,7 @@ export class JsonlStore implements GraphStore {
             importance: o.importances?.[i] ?? 3.0,
             contextLayer: o.contextLayers?.[i] ?? null,
             memoryType: o.memoryTypes?.[i] ?? null,
-            sourceInstance: process.env.MEMORY_INSTANCE_NAME || 'unknown',
+            sourceInstance: resolveSourceInstance(),
           });
         }
       }

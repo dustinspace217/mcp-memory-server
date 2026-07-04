@@ -807,7 +807,9 @@ describe('Migration safety validation', () => {
     const sqliteStore = new SqliteStore(dbPath);
     await sqliteStore.init();
 
-    // Verify schema_version is now 9 (v7→v8 normalization + v8→v9 eviction columns).
+    // Verify the migration chain ran through at least v8 (v7→v8 normalization;
+    // v8→v9 eviction columns and later migrations follow). "At least" per the
+    // convention below — the exact final version is pinned in knowledge-graph.test.ts.
     const db2 = new Database(dbPath);
     const version = (db2.prepare(`SELECT version FROM schema_version`).get() as { version: number }).version;
     // "At least 8" (this test's subject is the v8 columns/rewrites below) rather
@@ -1088,6 +1090,103 @@ describe('Migration safety validation', () => {
 
     const relRow = db2.prepare('SELECT tombstoned_at FROM relations LIMIT 1').get() as { tombstoned_at: string };
     expect(relRow.tombstoned_at).toBe('');
+
+    db2.close();
+    await sqliteStore.close();
+  });
+
+  it('should migrate v9 → v10: add source_instance with fedora backfill', async () => {
+    // Create a v9 database directly (v8 layout + v9 eviction columns, NO
+    // source_instance), then verify that SqliteStore auto-migrates it to v10:
+    //   - adds the source_instance column on observations
+    //   - backfills pre-existing rows to 'fedora' (all pre-v10 data was written
+    //     on the fedora machine, before multi-instance tracking existed)
+    //   - bumps schema_version to at least 10
+    const id = Date.now();
+    dbPath = path.join(testDir, `test-v9-to-v10-${id}.db`);
+    jsonlPath = path.join(testDir, `nonexistent-${id}.jsonl`); // not used, just for cleanup
+
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
+
+    // Build v9 schema directly (v8 layout + v9 eviction columns).
+    db.prepare(`CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL)`).run();
+    db.prepare(`INSERT INTO schema_version (id, version) VALUES (1, 9)`).run();
+
+    db.prepare(`CREATE TABLE entities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      project TEXT,
+      updated_at TEXT NOT NULL DEFAULT '0000-00-00T00:00:00.000Z',
+      created_at TEXT NOT NULL DEFAULT '0000-00-00T00:00:00.000Z',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      normalized_name TEXT NOT NULL DEFAULT '',
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      last_accessed_at TEXT NOT NULL DEFAULT ''
+    )`).run();
+
+    // observations table — v9 schema: has tombstoned_at but NO source_instance
+    // (that column is exactly what the v9 → v10 migration adds).
+    db.prepare(`CREATE TABLE observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      superseded_at TEXT NOT NULL DEFAULT '',
+      importance REAL NOT NULL DEFAULT 3.0,
+      context_layer TEXT,
+      memory_type TEXT,
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      UNIQUE(entity_id, content, superseded_at)
+    )`).run();
+
+    db.prepare(`CREATE TABLE relations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_entity TEXT NOT NULL,
+      to_entity TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT '',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      UNIQUE(from_entity, to_entity, relation_type, superseded_at)
+    )`).run();
+
+    // Pre-existing observation — written before source_instance existed. After
+    // migration it must read 'fedora' (the backfill value), not 'unknown'.
+    const ts = '2026-04-20T12:00:00.000Z';
+    db.prepare(`INSERT INTO entities (name, entity_type, updated_at, created_at, normalized_name, last_accessed_at) VALUES (?, ?, ?, ?, ?, ?)`).run(
+      'PreV10Entity', 'concept', ts, ts, 'prev10entity', ts
+    );
+    const entityId = (db.prepare('SELECT id FROM entities WHERE name = ?').get('PreV10Entity') as { id: number }).id;
+    db.prepare(`INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)`).run(
+      entityId, 'a pre-v10 observation with no source instance', ts
+    );
+
+    db.close();
+
+    // Open with SqliteStore — should auto-migrate v9 → v10 (and beyond).
+    const sqliteStore = new SqliteStore(dbPath);
+    await sqliteStore.init();
+
+    const db2 = new Database(dbPath, { readonly: true });
+    // "At least 10" (matching the sibling migration tests' convention) — this
+    // test's subject is the v10 column/backfill, not the final version.
+    const version = (db2.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+    expect(version).toBeGreaterThanOrEqual(10);
+
+    // Verify: observations has the source_instance column.
+    const obsCols = db2.prepare('PRAGMA table_info(observations)').all() as { name: string }[];
+    expect(obsCols.map(c => c.name)).toContain('source_instance');
+
+    // Verify: the pre-existing row was backfilled to 'fedora' (not left at the
+    // 'unknown' column default — the backfill UPDATE is the migration's point).
+    const preexisting = db2.prepare('SELECT source_instance FROM observations WHERE content = ?').get(
+      'a pre-v10 observation with no source instance'
+    ) as { source_instance: string };
+    expect(preexisting.source_instance).toBe('fedora');
 
     db2.close();
     await sqliteStore.close();

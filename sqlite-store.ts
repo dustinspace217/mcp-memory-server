@@ -9,6 +9,7 @@ import { EmbeddingPipeline, EMBEDDING_DIM, EMBED_MODEL, DEFAULT_EMBED_MODEL, SIM
 import { buildL1Index, indexCharCost, L1_FEATURED_CHAR_BUDGET, type UnfeaturedL1 } from './context-layers.js';
 import {
   createObservation,
+  resolveSourceInstance,
   ENTITY_TIMESTAMP_SENTINEL,
   type Observation,
   type Entity,
@@ -102,13 +103,6 @@ const CHUNK_SIZE = 900;
 // How many write operations between eviction checks. The spec suggests ~1000.
 // Each check is cheap (just a statSync on the DB file) so this can be low.
 const EVICTION_CHECK_INTERVAL = 1000;
-
-// Which Claude Code instance is running. Set via MEMORY_INSTANCE_NAME env var
-// in the MCP server config (e.g. "fedora", "windows-mele"). Tagged on every
-// observation at insert time so cross-instance setups can trace provenance.
-// 'unknown' is the fallback when the env var isn't set — makes misconfigured
-// instances visible rather than silently producing untagged observations.
-const SOURCE_INSTANCE = process.env.MEMORY_INSTANCE_NAME || 'unknown';
 
 /**
  * Final ranking stage for findPrecedents: gate by the minSimilarity floor, rank by similarity
@@ -1737,10 +1731,21 @@ export class SqliteStore implements GraphStore {
       `SELECT name AS existing_name, project FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
     // INSERT includes observation metadata columns + source_instance (schema v6/v10).
-    // Defaults (3.0, NULL, NULL, SOURCE_INSTANCE) match the column defaults.
+    // Defaults (3.0, NULL, NULL) match the column defaults.
     const insertObs = this.db.prepare(
       'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance) VALUES (?, ?, ?, ?, ?, ?, ?)'
     );
+
+    // Which Claude Code instance is writing (MEMORY_INSTANCE_NAME, e.g. "fedora",
+    // "windows-mele"), stamped on every observation so cross-instance setups can
+    // trace provenance; 'unknown' when unset makes a misconfigured instance
+    // visible rather than silently untagged. Resolved PER CALL via the shared
+    // types.ts helper (Issue #80 consolidated three drifted copies into one) —
+    // read here, not cached at module load, so tests can stub the env without
+    // resetModules; the cost is a string trim per write, irrelevant next to the
+    // SQLite write itself. Resolved once here so the INSERT and the returned
+    // Entity always agree on the same value.
+    const sourceInstance = resolveSourceInstance();
 
     const created: Entity[] = [];
     const skipped: SkippedEntity[] = [];
@@ -1782,9 +1787,9 @@ export class SqliteStore implements GraphStore {
           // but EntityInput observations are plain strings or Observation objects --
           // strings get defaults via createObservation(obs), objects pass through as-is
           const o = typeof obs === 'string' ? createObservation(obs) : obs;
-          const obsInfo = insertObs.run(row.id, o.content, o.createdAt, o.importance, o.contextLayer, o.memoryType, SOURCE_INSTANCE);
+          const obsInfo = insertObs.run(row.id, o.content, o.createdAt, o.importance, o.contextLayer, o.memoryType, sourceInstance);
           if (obsInfo.changes > 0) {
-            observations.push({ ...o, sourceInstance: SOURCE_INSTANCE });
+            observations.push({ ...o, sourceInstance });
           }
         }
 
@@ -1973,6 +1978,10 @@ export class SqliteStore implements GraphStore {
 
     const results: AddObservationResult[] = [];
 
+    // Writing instance, resolved once per call (see createEntities for the full
+    // rationale on the shared per-call resolver — Issue #80).
+    const sourceInstance = resolveSourceInstance();
+
     const txn = this.db.transaction(() => {
       for (const o of observations) {
         // normalizeEntityName throws on empty/separator-only — bubbles out as a clean error.
@@ -1993,8 +2002,8 @@ export class SqliteStore implements GraphStore {
           const importance = o.importances?.[i] ?? 3.0;
           const contextLayer = o.contextLayers?.[i] ?? null;
           const memoryType = o.memoryTypes?.[i] ?? null;
-          const obs: Observation = { content, createdAt: now, importance, contextLayer, memoryType, sourceInstance: SOURCE_INSTANCE };
-          const info = insertObs.run(row.id, content, now, importance, contextLayer, memoryType, SOURCE_INSTANCE);
+          const obs: Observation = { content, createdAt: now, importance, contextLayer, memoryType, sourceInstance };
+          const info = insertObs.run(row.id, content, now, importance, contextLayer, memoryType, sourceInstance);
           if (info.changes > 0) {
             addedObservations.push(obs);
           }
@@ -2322,6 +2331,11 @@ export class SqliteStore implements GraphStore {
       'UPDATE entities SET updated_at = ?, last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?'
     );
 
+    // The instance performing THIS supersede (see createEntities for the full
+    // per-call-resolver rationale — Issue #80). Stamped on the replacement so it
+    // records the current writer, not the superseded row's original instance.
+    const sourceInstance = resolveSourceInstance();
+
     // better-sqlite3 transactions are synchronous -- the outer async wrapper
     // satisfies the GraphStore interface contract
     const txn = this.db.transaction(() => {
@@ -2358,7 +2372,7 @@ export class SqliteStore implements GraphStore {
         // Insert the replacement — carry forward importance, context_layer, and memory_type
         // from the old observation so metadata survives content updates.
         // INSERT OR IGNORE: if newContent already exists as an active observation, skip.
-        insertObs.run(entityRow.id, s.newContent, now, obsRow.importance, obsRow.context_layer, obsRow.memory_type, SOURCE_INSTANCE);
+        insertObs.run(entityRow.id, s.newContent, now, obsRow.importance, obsRow.context_layer, obsRow.memory_type, sourceInstance);
 
         // Bump updated_at and last_accessed_at so the entity surfaces in recency-ordered queries
         updateTimestamp.run(now, now, entityRow.id);

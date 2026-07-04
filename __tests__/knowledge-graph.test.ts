@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -3911,7 +3911,7 @@ describe('SqliteStore-specific', () => {
 			conn.close();
 
 			expect(row).toBeDefined();
-			// Fresh databases should be at version 9. v7 added soft-delete on entities
+			// Fresh databases should be at version 17. v7 added soft-delete on entities
 			// via superseded_at + partial unique index. v8 added the `normalized_name`
 			// identity-key column with a partial unique index, and converted relations
 			// to store their endpoints in normalized form. v9 added tombstoned_at on
@@ -3925,6 +3925,84 @@ describe('SqliteStore-specific', () => {
 			// v16 added summary (nullable) to observations for the two-tier L1 index (§13).
 			// v17 recomputed normalized_name to strip Unicode Format (Cf) chars (Issue #59).
 			expect(row!.version).toBe(17);
+		});
+	});
+
+	describe('sourceInstance (Issue #79)', () => {
+		// Per-call resolution (Issue #80) is what lets vi.stubEnv work here WITHOUT
+		// vi.resetModules: each write reads MEMORY_INSTANCE_NAME at call time, not
+		// at module load. The store is constructed in the outer beforeEach before
+		// any stub — that's fine, the stub only needs to be in place before the
+		// WRITE calls each test makes below.
+		afterEach(() => {
+			vi.unstubAllEnvs();
+		});
+
+		it('round-trips the resolved instance name to readGraph and openNodes', async () => {
+			vi.stubEnv('MEMORY_INSTANCE_NAME', 'test-rig');
+			await store.createEntities([{ name: 'Rig', entityType: 'machine', observations: ['created under test-rig'] }]);
+			await store.addObservations([{ entityName: 'Rig', contents: ['added under test-rig'] }]);
+
+			const graph = await store.readGraph();
+			const rig = graph.entities.find(e => e.name === 'Rig')!;
+			expect(rig.observations.map(o => o.sourceInstance)).toEqual(['test-rig', 'test-rig']);
+
+			const opened = await store.openNodes(['Rig']);
+			expect(opened.entities[0].observations.every(o => o.sourceInstance === 'test-rig')).toBe(true);
+		});
+
+		it("stores a whitespace-only MEMORY_INSTANCE_NAME as 'unknown' (trim guard)", async () => {
+			// A whitespace-only value is truthy, so without the trim in
+			// resolveSourceInstance it would masquerade as a real instance name.
+			vi.stubEnv('MEMORY_INSTANCE_NAME', '   ');
+			await store.createEntities([{ name: 'Blank', entityType: 'machine', observations: ['who wrote me?'] }]);
+
+			const graph = await store.readGraph();
+			const blank = graph.entities.find(e => e.name === 'Blank')!;
+			expect(blank.observations[0].sourceInstance).toBe('unknown');
+		});
+
+		it('surfaces sourceInstance through entityTimeline, getContextLayers, and getSummary', async () => {
+			vi.stubEnv('MEMORY_INSTANCE_NAME', 'surface-rig');
+			await store.createEntities([{ name: 'Surfaced', entityType: 'machine', observations: [] }]);
+			// One L0 and one L1 observation so both getContextLayers tiers are exercised.
+			await store.addObservations([{
+				entityName: 'Surfaced',
+				contents: ['an L0 identity rule', 'an L1 status note'],
+				contextLayers: ['L0', 'L1'],
+				importances: [5.0, 4.0],
+			}]);
+
+			const timeline = await store.entityTimeline('Surfaced');
+			expect(timeline.observations.length).toBeGreaterThan(0);
+			expect(timeline.observations.every(o => o.sourceInstance === 'surface-rig')).toBe(true);
+
+			const layers = await store.getContextLayers();
+			expect(layers.L0.length).toBeGreaterThan(0);
+			expect(layers.L0.every(o => o.sourceInstance === 'surface-rig')).toBe(true);
+			expect(layers.L1.length).toBeGreaterThan(0);
+			expect(layers.L1.every(o => o.sourceInstance === 'surface-rig')).toBe(true);
+
+			const summary = await store.getSummary();
+			const surfacedObs = summary.topObservations.filter(o => o.entityName === 'Surfaced');
+			expect(surfacedObs.length).toBeGreaterThan(0);
+			expect(surfacedObs.every(o => o.sourceInstance === 'surface-rig')).toBe(true);
+		});
+
+		it("records the current writer on a supersede, not the superseded row's instance", async () => {
+			vi.stubEnv('MEMORY_INSTANCE_NAME', 'rig-a');
+			await store.createEntities([{ name: 'Handoff', entityType: 'machine', observations: ['written on rig-a'] }]);
+
+			// A DIFFERENT instance performs the supersede — the replacement must
+			// carry the current writer, not inherit the superseded row's instance.
+			vi.stubEnv('MEMORY_INSTANCE_NAME', 'rig-b');
+			await store.supersedeObservations([{ entityName: 'Handoff', oldContent: 'written on rig-a', newContent: 'rewritten on rig-b' }]);
+
+			const timeline = await store.entityTimeline('Handoff');
+			const active = timeline.observations.find(o => o.status === 'active')!;
+			const superseded = timeline.observations.find(o => o.status === 'superseded')!;
+			expect(active.sourceInstance).toBe('rig-b');      // current writer
+			expect(superseded.sourceInstance).toBe('rig-a');  // original writer preserved
 		});
 	});
 
