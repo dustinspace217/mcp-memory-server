@@ -587,12 +587,23 @@ describe('MCP Tool Handler Integration', () => {
 			expect(SearchNodesInputSchema.safeParse({ query: 'foo', orderBy: '' }).success).toBe(false);
 		});
 
-		// ----- rerank parameter validation (find_precedents, Phase E) -----
-		it('accepts boolean rerank and rejects non-boolean on find_precedents', () => {
-			const RerankSchema = z.object({ query: z.string().min(1), rerank: z.boolean().optional() });
-			expect(RerankSchema.safeParse({ query: 'foo', rerank: true }).success).toBe(true);
-			expect(RerankSchema.safeParse({ query: 'foo' }).success).toBe(true);
-			expect(RerankSchema.safeParse({ query: 'foo', rerank: 'yes' }).success).toBe(false);
+		// ----- rerank param REMOVED from the tool surface (2026-07-04) -----
+		// The DEF-RR-02 blind gate failed permanently (3/18), so find_precedents no
+		// longer exposes rerank at the MCP boundary. This pin guards against the
+		// param silently returning: the production input schema must NOT declare it.
+		// (The store-level option + PageRank machinery remain for programmatic
+		// experiments — see vector-integration.test.ts's floor-before-fusion pin.)
+		it('find_precedents input schema does not declare rerank', () => {
+			const strict = z.object({
+				query: z.string().min(1).max(5000),
+				projectId: z.string().min(1).max(500).optional(),
+				memoryType: z.string().min(1).max(50).optional(),
+				limit: z.number().int().min(1).max(50).optional(),
+				minSimilarity: z.number().min(0).max(1).optional(),
+			}).strict();
+			// A rerank key must now fail strict parsing of the mirrored surface.
+			expect(strict.safeParse({ query: 'foo', rerank: true }).success).toBe(false);
+			expect(strict.safeParse({ query: 'foo' }).success).toBe(true);
 		});
 
 		// ----- valid-time validation (v14, Phase F) -----

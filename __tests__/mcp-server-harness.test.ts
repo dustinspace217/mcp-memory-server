@@ -352,4 +352,27 @@ describe('in-process McpServer harness (Issue #81)', () => {
 		expect(sc.skipped).toHaveLength(1);
 		expect(sc.skipped[0].name).toBe('Dup');
 	});
+
+	// ------------------------------------------------------------------
+	// (f) rerank stays REMOVED from find_precedents' advertised surface
+	// ------------------------------------------------------------------
+	// The DEF-RR-02 blind gate failed permanently (rerank-on won 3/18), so the
+	// param was removed from the MCP boundary on 2026-07-04 (Dustin-approved).
+	// This pins the ADVERTISED inputSchema — the binding surface (see the header
+	// comment) — so the param can't silently reappear in a refactor. The
+	// store-level option remains for programmatic experiments; only the tool
+	// surface is closed.
+	it('(f) does not advertise a rerank parameter on find_precedents', async () => {
+		const tools = await client.listTools();
+		const fp = tools.tools.find((t) => t.name === 'find_precedents');
+		expect(fp).toBeDefined();
+		const inProps = (fp!.inputSchema as { properties?: Record<string, unknown> })?.properties ?? {};
+		expect('rerank' in inProps).toBe(false);
+		// Positive control: a real param is present, so an empty/missing properties
+		// object can't vacuously pass the absence check above.
+		expect('minSimilarity' in inProps).toBe(true);
+		const outProps = (fp!.outputSchema as { properties?: Record<string, unknown> })?.properties ?? {};
+		expect('rerankApplied' in outProps).toBe(false);
+		expect('precedents' in outProps).toBe(true);
+	});
 });
