@@ -6,17 +6,30 @@
  * instantiates an McpServer. That leaves two things with zero CI coverage:
  *   1. the REAL tool handlers registered in index.ts (they close over the
  *      module-level `store`), and
- *   2. the SDK's output-schema validation, which STRIPS any key from
- *      structuredContent that the tool's outputSchema does not declare.
+ *   2. the outputSchema DECLARATIONS the server advertises via tools/list —
+ *      the contract clients discover fields through.
  * The class this guards against has bitten repeatedly (#58, #86, #87): an
- * undeclared output key silently vanishes from every MCP response while all
- * 700+ store-level tests stay green.
+ * output key the store produces but the schema never declares, invisible to
+ * all 700+ store-level tests.
+ *
+ * WHAT THE SDK'S OUTPUT VALIDATION ACTUALLY DOES (verified empirically
+ * 2026-07-04 against the installed SDK, correcting this file's original
+ * premise): validateToolOutput THROWS when structuredContent fails the
+ * declared schema (e.g. a declared-required field is missing), but it does
+ * NOT strip undeclared keys — the original result object is forwarded to the
+ * client unmodified (mcp.js validates then `return result`; the parse's
+ * stripped copy is discarded). So "delete a declaration and the key vanishes
+ * from responses" is FALSE; what deleting a declaration DOES change is the
+ * tools/list-advertised outputSchema JSON. The schema-drift guards in cases
+ * (a) and (c) therefore assert against tools/list, and the end-to-end
+ * structuredContent assertions pin the handler WIRING (store → handler →
+ * client), not stripping behavior.
  *
  * HOW: index.ts exports a TEST-ONLY seam, wireForTesting(store), that points
  * the module-level `store` at a test instance and returns the already-registered
  * McpServer. We drive that server through a linked in-memory transport with a
  * real MCP Client, so requests traverse the exact production path — Zod input
- * validation, handler, Zod output validation (with key-stripping) — end to end.
+ * validation, handler, Zod output validation — end to end.
  *
  * CONNECT-ONCE PATTERN (documented SDK constraint): the module-level server can
  * only connect once per process. So beforeAll connects it once; each test swaps
@@ -86,6 +99,10 @@ describe('in-process McpServer harness (Issue #81)', () => {
 		await client.close();
 		await bootStore.close();
 		await unlinkAll(bootPath);
+		// Restore the env so no later code in this worker inherits the guard.
+		// (Vitest's default forks pool isolates per file, so this is belt-and-
+		// suspenders — but env mutations should be symmetric on principle.)
+		delete process.env.MEMORY_SKIP_MAIN;
 	});
 
 	beforeEach(async () => {
@@ -121,15 +138,23 @@ describe('in-process McpServer harness (Issue #81)', () => {
 	}
 
 	// ------------------------------------------------------------------
-	// (a) L1Index survives SDK output validation
+	// (a) L1Index: declared in the advertised schema AND wired end-to-end
 	// ------------------------------------------------------------------
-	// The v16 L1Index key is declared in get_context_layers' outputSchema. If that
-	// declaration is ever removed, the SDK's key-stripping validation drops L1Index
-	// from every response and this class of feature silently disappears. Seed enough
+	// Two independent pins. (1) DECLARATION GUARD: the v16 L1Index key must appear
+	// in get_context_layers' tools/list-advertised outputSchema — deleting the
+	// declaration changes that JSON, so this assertion fails on schema drift (the
+	// SDK does NOT strip undeclared keys from responses, so a response-side check
+	// alone cannot catch drift — see the header comment). (2) WIRING: seed enough
 	// featured L1 content to overflow the 12000-char featured budget, plus a
 	// low-importance overflow entity, and assert L1Index comes back through the
 	// CLIENT with its four fields.
-	it('(a) surfaces L1Index through SDK output validation when featured budget overflows', async () => {
+	it('(a) declares L1Index in the advertised schema and surfaces it on featured-budget overflow', async () => {
+		// (1) Declaration guard against tools/list.
+		const tools = await client.listTools();
+		const gcl = tools.tools.find((t) => t.name === 'get_context_layers');
+		expect(gcl).toBeDefined();
+		const gclProps = (gcl!.outputSchema as { properties?: Record<string, unknown> })?.properties ?? {};
+		expect('L1Index' in gclProps).toBe(true);
 		// 13 unique ~1000-char L1 observations at importance 5 on one entity.
 		// charCost = entityName.length + content.length ≈ 1015 each; 13 × ≈1015
 		// exceeds the 12000-char featured budget, forcing overflow into the index.
@@ -232,13 +257,21 @@ describe('in-process McpServer harness (Issue #81)', () => {
 	});
 
 	// ------------------------------------------------------------------
-	// (c) rankingUnavailable declaration survives on the JSONL backend
+	// (c) rankingUnavailable: declared in the advertised schema AND set by JSONL
 	// ------------------------------------------------------------------
 	// JSONL cannot rank (no FTS index), so orderBy:'relevance' falls back to recency
-	// and sets rankingUnavailable:true. That flag is an OPTIONAL key in
-	// PaginatedOutputSchema; if the declaration were dropped, the SDK would strip it
-	// and the caller could not tell ranking silently degraded.
-	it('(c) surfaces rankingUnavailable:true from a JSONL store under orderBy relevance', async () => {
+	// and sets rankingUnavailable:true. Two pins, same split as case (a):
+	// (1) DECLARATION GUARD — the flag must appear in search_nodes' advertised
+	// outputSchema, because that JSON is what a client discovers the field through
+	// (dropping the declaration would NOT strip it from responses, but it would
+	// erase it from the contract). (2) WIRING — the JSONL fallback actually sets it.
+	it('(c) declares rankingUnavailable and surfaces it from a JSONL store under orderBy relevance', async () => {
+		// (1) Declaration guard against tools/list.
+		const tools = await client.listTools();
+		const sn = tools.tools.find((t) => t.name === 'search_nodes');
+		expect(sn).toBeDefined();
+		const snProps = (sn!.outputSchema as { properties?: Record<string, unknown> })?.properties ?? {};
+		expect('rankingUnavailable' in snProps).toBe(true);
 		// This case needs a JSONL store, so it wires its own (the beforeEach SQLite
 		// store stays assigned and is still closed by afterEach). The JSONL store is
 		// closed and cleaned up here in a finally.

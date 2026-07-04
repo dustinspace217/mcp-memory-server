@@ -26,17 +26,16 @@
 /**
  * Normalizes an entity name into its canonical identity key.
  *
- * Steps:
- *   1. trim whitespace
- *   2. throw if empty after trim
- *   3. NFC unicode normalize (so 'café' written two different ways collapses)
- *   4. strip Unicode Format (Cf) characters (zero-width space, ZWNJ, ZWJ, BOM,
+ * Steps (numbers match the inline Step comments below):
+ *   1. trim whitespace (throw if empty after trim)
+ *   2. NFC unicode normalize (so 'café' written two different ways collapses)
+ *   3. strip Unicode Format (Cf) characters (zero-width space, ZWNJ, ZWJ, BOM,
  *      soft hyphen, word joiner, ...) so invisible copy-paste artifacts can't
  *      create visually-identical-but-distinct identity keys (Issue #59)
- *   5. lowercase
- *   6. strip separator characters: C0 control chars, whitespace, hyphen,
+ *   4. lowercase
+ *   5. strip separator characters: C0 control chars, whitespace, hyphen,
  *      underscore, slash, dot, backslash, colon
- *   7. throw if empty after stripping
+ *   6. throw if empty after stripping
  *
  * Examples:
  *   'Dustin-Space'    -> 'dustinspace'

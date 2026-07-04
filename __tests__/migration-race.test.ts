@@ -35,6 +35,9 @@ import { existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
+// SOURCE import (vitest transpiles it) — used by the deterministic pragma pin
+// below, which must run even when dist/ is absent and the race tests skip.
+import { SqliteStore } from '../sqlite-store.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const childPath = path.join(testDir, 'helpers', 'race-init-child.mjs');
@@ -192,6 +195,13 @@ describe('migration chain — two-connection race', () => {
 		}
 	});
 
+	// Per-test timeout MUST exceed CHILD_TIMEOUT_MS (60s): vitest's default 5s
+	// timeout would fire FIRST on a genuine deadlock, killing the test before the
+	// watchdog can SIGKILL the children and report their captured stderr — the
+	// rich diagnostic this harness exists for would be dead code, and the orphaned
+	// children would still hold WAL locks when afterEach tries to unlink the DB.
+	const TEST_TIMEOUT_MS = CHILD_TIMEOUT_MS + 10_000;
+
 	it.runIf(distAvailable)('survives two SIMULTANEOUS init()s on a fresh DB', async () => {
 		dbPath = path.join(testDir, `race-simultaneous-${Date.now()}.db`);
 
@@ -199,7 +209,7 @@ describe('migration chain — two-connection race', () => {
 		// as close together as the OS scheduler allows — the both-at-version-1 case.
 		const results = await Promise.all([runChild(dbPath), runChild(dbPath)]);
 		await assertUsableDb(dbPath, results);
-	});
+	}, TEST_TIMEOUT_MS);
 
 	it.runIf(distAvailable)('survives a STAGGERED init() arriving mid-chain', async () => {
 		dbPath = path.join(testDir, `race-staggered-${Date.now()}.db`);
@@ -212,5 +222,29 @@ describe('migration chain — two-connection race', () => {
 		const bPromise = runChild(dbPath);
 		const results = await Promise.all([aPromise, bPromise]);
 		await assertUsableDb(dbPath, results);
+	}, TEST_TIMEOUT_MS);
+
+	// Deterministic pin for race-fix layer 1. The two race tests above exercise the
+	// busy_timeout-before-WAL ordering only probabilistically (~13-20% of runs hit
+	// the contended path), so a refactor that dropped or reordered the pragma could
+	// slip through flakily. This pins the OBSERVABLE half deterministically: after
+	// init(), the store's own connection must report busy_timeout = 5000. (The
+	// ordering itself — set BEFORE journal_mode/foreign_keys — and the WAL retry
+	// loop's error classification remain probabilistically covered by the races;
+	// pinning those deterministically needs fault injection, deferred.)
+	it('sets busy_timeout=5000 on its connection during init', async () => {
+		dbPath = path.join(testDir, `race-pragma-pin-${Date.now()}.db`);
+		const store = new SqliteStore(dbPath);
+		await store.init();
+		try {
+			// Reach into the private handle deliberately: busy_timeout is per-connection
+			// state, so only the store's OWN connection can attest to it — a second
+			// connection to the same file would report its own (default) value.
+			const db = (store as unknown as { db: Database.Database }).db;
+			const timeout = db.pragma('busy_timeout', { simple: true });
+			expect(timeout).toBe(5000);
+		} finally {
+			await store.close();
+		}
 	});
 });

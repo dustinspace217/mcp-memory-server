@@ -1631,7 +1631,11 @@ describe('Migration safety validation', () => {
 
     const sqliteStore = new SqliteStore(dbPath);
     await expect(sqliteStore.init()).rejects.toThrow(/collision/i);
-    // Error names both display forms and the key they collapse to.
+    // Error names BOTH display forms. Asserting only /zebra/i would pass if the
+    // message named just one (both contain "zebra"), so pin the ZWSP-carrying
+    // form specifically via the \u escape (an embedded literal ZWSP would be
+    // invisible to a reader of this test).
+    await expect(sqliteStore.init()).rejects.toThrow(/Zebra\u200B/);
     await expect(sqliteStore.init()).rejects.toThrow(/zebra/i);
 
     // v17 rolled back: schema_version did NOT advance to 17 and the stale
