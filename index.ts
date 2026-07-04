@@ -265,8 +265,9 @@ const PaginatedOutputSchema = {
   // unioning; the deduped union across all read_graph pages IS the complete
   // active relation set (verified 496/496 on a live-DB copy). Project-scoped
   // calls exclude cross-project relations, filtered against the whole
-  // project + global entity set (openNodes-with-projectId keeps the same
-  // scoped contract, sqlite-store.ts openNodes).
+  // project + global entity set. (openNodes-with-projectId also excludes
+  // cross-project relations, though via its own narrower filter — both
+  // endpoints within the OPENED result set, not the project-wide set.)
   relations: z.array(RelationOutputSchema).describe("Every relation TOUCHING a returned entity (either-endpoint). The partner endpoint may not be in this response — it's a name; open_nodes it for content. A spanning relation appears on each endpoint's page: dedup on from+to+relationType when unioning, and the deduped union across all read_graph pages is the COMPLETE active relation set. With projectId, cross-project relations are excluded."),
   nextCursor: z.string().nullable().describe("Cursor for the next page, or null if this is the last page"),
   totalCount: z.number().describe("Total number of matching entities across all pages"),

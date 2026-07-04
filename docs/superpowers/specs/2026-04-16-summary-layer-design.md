@@ -4,7 +4,9 @@
 > when written (v10–v15 were claimed by other work in the interim). Implemented as
 > specced with one structural addition: the budgets + index-building logic live in a
 > shared `context-layers.ts` module consumed by both backends (building it surfaced a
-> real drift — JSONL's local L1 budget was 3200 chars vs SQLite's 16000). Plan doc:
+> real drift — JSONL's local L1 budget was 3200 chars vs SQLite's 16000). One parity
+> caveat vs the Compatibility section below: JSONL summaries ROUND-TRIP from file
+> contents but have no write path (setObservationMetadata throws there). Plan doc:
 > `docs/superpowers/plans/2026-07-02-summary-layer-and-relation-coverage.md`.
 
 ## Problem

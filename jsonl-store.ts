@@ -829,8 +829,11 @@ export class JsonlStore implements GraphStore {
    * Returns the knowledge graph, optionally filtered by project, with cursor-based pagination.
    * Entities are sorted by most recently updated first.
    * When projectId is provided, returns entities belonging to that project
-   * plus global entities (project === null). Relations are included only
-   * when both endpoints are in the filtered entity set.
+   * plus global entities (project === null); relations are restricted to
+   * endpoints within that PROJECT-WIDE set (cross-project exclusion). Pages
+   * then carry every such relation TOUCHING a page entity (either-endpoint,
+   * v1.4.0 — see paginateEntities), so the deduped union across pages is the
+   * complete in-scope relation set.
    * When projectId is omitted and no pagination is requested, returns the entire unfiltered graph
    * (fast path — no sorting, for backward compat with existing tests).
    *
