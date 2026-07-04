@@ -195,11 +195,35 @@ export class SqliteStore implements GraphStore {
     // --- Open database and create schema ---
     // new Database() creates the file if it doesn't exist (this is why we check first)
     this.db = new Database(this.dbPath);
-    this.db.pragma('journal_mode = WAL');
-    // Wait up to 5 seconds if another process holds the write lock (e.g. weekly
-    // consolidation running concurrently with an active Claude session). Without
-    // this, better-sqlite3 defaults to 0ms and throws SQLITE_BUSY immediately.
+    // busy_timeout FIRST, before any pragma that can take a lock: better-sqlite3
+    // defaults to 0ms, and `journal_mode = WAL` below needs a brief WRITE lock —
+    // with two processes opening the same DB concurrently, the loser used to die
+    // right there with SQLITE_BUSY before its 5s timeout was ever configured
+    // (~20% reproduction in the DEF-RR-04 race harness; the exact "weekly
+    // consolidation concurrent with an active session" case this timeout was
+    // added for).
     this.db.pragma('busy_timeout = 5000');
+    // The delete→WAL journal-mode CONVERSION (first-ever open of a fresh DB)
+    // is the one lock the busy handler does NOT cover: SQLite returns
+    // SQLITE_BUSY immediately for it rather than waiting, so busy_timeout
+    // can't queue the loser when two processes race the very first open
+    // (~13%/run residual in the DEF-RR-04 harness even with the timeout set
+    // first). Bounded retry converges fast — the winner's conversion completes
+    // in milliseconds, after which this pragma on an already-WAL database is a
+    // lock-free no-op read. 20 × 100ms cap (Power-of-Ten rule 2); anything
+    // still locked after 2s is a real fault and should throw.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        this.db.pragma('journal_mode = WAL');
+        break;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes('database is locked') || attempt >= 20) throw err;
+        // Synchronous sleep — better-sqlite3 is synchronous; there is no event
+        // loop turn to yield to here, so Atomics.wait is the standard idiom.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      }
+    }
     this.db.pragma('foreign_keys = ON');
 
     // === Create tables with current (v4) schema ===
@@ -306,20 +330,59 @@ export class SqliteStore implements GraphStore {
 
       // Seed the version table so future startups skip the pragma detection.
       // id=1 is enforced by CHECK(id = 1) — only one row can ever exist.
-      this.db.prepare('INSERT INTO schema_version (id, version) VALUES (1, ?)').run(currentVersion);
+      //
+      // INSERT OR IGNORE + re-read (race-retrofit 2026-07-04): two processes can
+      // both open a fresh DB, both find no version row in the SELECT above, and
+      // both reach this seed. A plain INSERT makes the loser crash on the
+      // PRIMARY KEY / CHECK(id=1) constraint; OR IGNORE turns that into a no-op.
+      // The winner may have not just seeded but ALREADY advanced the version
+      // through several migrations between our SELECT and this INSERT, so the
+      // authoritative current version is whatever the table now holds — re-read
+      // it rather than trusting our local pragma detection. See the block comment
+      // above the v2 migration for the full retrofit rationale.
+      this.db.prepare('INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, ?)').run(currentVersion);
+      currentVersion = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
     }
 
     // === Run sequential migrations ===
     // Each migration checks "if version < N", upgrades, and bumps the version.
     // Only runs for databases that predate the target version.
 
+    // === Legacy migration race-retrofit (2026-07-04) ===
+    // Migrations v2→v10 predate the house race discipline that v11+ follow
+    // (IMMEDIATE transaction + in-transaction version re-check + duplicate-column-
+    // tolerant ALTERs). A FRESH database runs the ENTIRE chain, so two processes
+    // opening one fresh DB simultaneously (the weekly-consolidation-concurrent-
+    // with-an-active-session case) could both enter a legacy migration; the loser
+    // then crashed on a non-idempotent statement. The DEF-RR-04 race harness
+    // (__tests__/migration-race.test.ts) empirically caught this as
+    // "SqliteError: duplicate column name: normalized_name" from v7→v8 at
+    // ~25%/run. The retrofit below brings v2→v10 up to the v11 shape: each
+    // transaction is IMMEDIATE (the loser blocks on the write lock instead of
+    // reading a stale snapshot, and busy_timeout queues it), and its FIRST
+    // statement re-reads the version and returns early when a racing winner has
+    // already applied the migration — converting the loser's crash into a skip.
+    // Bare `ADD COLUMN` statements additionally get the Issue #78 duplicate-column
+    // catch as belt-and-suspenders: beyond the loser path it recovers a legacy DB
+    // left half-migrated (column added, version not bumped) by the pre-retrofit
+    // non-transactional code. The per-block comments below point back here rather
+    // than repeating this rationale.
     if (currentVersion < 2) {
-      // v1 → v2: add project column to entities
-      this.db.exec(`
-        ALTER TABLE entities ADD COLUMN project TEXT;
-        CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project);
-      `);
-      this.db.prepare('UPDATE schema_version SET version = 2').run();
+      // v1 → v2: add project column to entities. (race-retrofit 2026-07-04, see
+      // the block comment above.)
+      this.db.transaction(() => {
+        const v = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+        if (v >= 2) return; // racing winner already applied — skip
+        try {
+          this.db.prepare(`ALTER TABLE entities ADD COLUMN project TEXT`).run();
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!msg.includes('duplicate column name')) throw err;
+          // Another process already added this column — safe to continue.
+        }
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project)`);
+        this.db.prepare('UPDATE schema_version SET version = 2').run();
+      }).immediate();
       currentVersion = 2;
     }
 
@@ -327,11 +390,22 @@ export class SqliteStore implements GraphStore {
       // v2 → v3: add entity timestamps with backfill from observation data.
       // Wrapped in an explicit transaction so a crash between ALTER and backfill
       // doesn't leave entities with permanent sentinel timestamps.
+      // (race-retrofit 2026-07-04, see the block comment above v2.)
       this.db.transaction(() => {
-        this.db.exec(`
-          ALTER TABLE entities ADD COLUMN updated_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}';
-          ALTER TABLE entities ADD COLUMN created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}';
-        `);
+        const v = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+        if (v >= 3) return; // racing winner already applied — skip
+        for (const stmt of [
+          `ALTER TABLE entities ADD COLUMN updated_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}'`,
+          `ALTER TABLE entities ADD COLUMN created_at TEXT NOT NULL DEFAULT '${ENTITY_TIMESTAMP_SENTINEL}'`,
+        ]) {
+          try {
+            this.db.prepare(stmt).run();
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!msg.includes('duplicate column name')) throw err;
+            // Another process already added this column — safe to continue.
+          }
+        }
         this.db.exec(`
           UPDATE entities SET updated_at = (
             SELECT MAX(created_at) FROM observations
@@ -350,8 +424,8 @@ export class SqliteStore implements GraphStore {
             SELECT 1 FROM observations WHERE entity_id = entities.id AND created_at != 'unknown'
           );
         `);
-      })();
-      this.db.prepare('UPDATE schema_version SET version = 3').run();
+        this.db.prepare('UPDATE schema_version SET version = 3').run();
+      }).immediate();
       currentVersion = 3;
     }
 
@@ -359,7 +433,11 @@ export class SqliteStore implements GraphStore {
       // v3 → v4: add superseded_at to observations (table rebuild).
       // SQLite can't ALTER a UNIQUE constraint, so we rebuild the table.
       // superseded_at = '' means active; ISO timestamp means retired.
+      // (race-retrofit 2026-07-04, see the block comment above v2 — the recheck
+      // is what stops a racing loser from rebuilding an already-rebuilt table.)
       this.db.transaction(() => {
+        const v = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+        if (v >= 4) return; // racing winner already applied — skip
         this.db.exec(`
           CREATE TABLE observations_new (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -374,8 +452,8 @@ export class SqliteStore implements GraphStore {
           DROP TABLE observations;
           ALTER TABLE observations_new RENAME TO observations;
         `);
-      })();
-      this.db.prepare('UPDATE schema_version SET version = 4').run();
+        this.db.prepare('UPDATE schema_version SET version = 4').run();
+      }).immediate();
       currentVersion = 4;
     }
 
@@ -386,7 +464,10 @@ export class SqliteStore implements GraphStore {
       // created_at tracks when the relation was established.
       // UNIQUE constraint includes superseded_at so the same triple can exist
       // with multiple time windows (active after re-creation post-invalidation).
+      // (race-retrofit 2026-07-04, see the block comment above v2.)
       this.db.transaction(() => {
+        const v = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+        if (v >= 5) return; // racing winner already applied — skip
         this.db.exec(`
           CREATE TABLE relations_new (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -402,8 +483,8 @@ export class SqliteStore implements GraphStore {
           DROP TABLE relations;
           ALTER TABLE relations_new RENAME TO relations;
         `);
-      })();
-      this.db.prepare('UPDATE schema_version SET version = 5').run();
+        this.db.prepare('UPDATE schema_version SET version = 5').run();
+      }).immediate();
       currentVersion = 5;
     }
 
@@ -421,12 +502,25 @@ export class SqliteStore implements GraphStore {
       // Wrapped in a transaction so a crash between ALTER TABLEs doesn't leave the
       // schema half-migrated (columns added but version not bumped → next startup
       // retries and hits "duplicate column" errors).
+      // (race-retrofit 2026-07-04, see the block comment above v2.)
       this.db.transaction(() => {
-        this.db.prepare(`ALTER TABLE observations ADD COLUMN importance REAL NOT NULL DEFAULT 3.0`).run();
-        this.db.prepare(`ALTER TABLE observations ADD COLUMN context_layer TEXT DEFAULT NULL`).run();
-        this.db.prepare(`ALTER TABLE observations ADD COLUMN memory_type TEXT DEFAULT NULL`).run();
+        const v = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+        if (v >= 6) return; // racing winner already applied — skip
+        for (const stmt of [
+          `ALTER TABLE observations ADD COLUMN importance REAL NOT NULL DEFAULT 3.0`,
+          `ALTER TABLE observations ADD COLUMN context_layer TEXT DEFAULT NULL`,
+          `ALTER TABLE observations ADD COLUMN memory_type TEXT DEFAULT NULL`,
+        ]) {
+          try {
+            this.db.prepare(stmt).run();
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!msg.includes('duplicate column name')) throw err;
+            // Another process already added this column — safe to continue.
+          }
+        }
         this.db.prepare('UPDATE schema_version SET version = 6').run();
-      })();
+      }).immediate();
       currentVersion = 6;
     }
 
@@ -469,8 +563,14 @@ export class SqliteStore implements GraphStore {
       // Each DDL statement uses this.db.prepare(...).run() individually rather than
       // a single multi-statement string — same workaround as in
       // __tests__/migration-validation.test.ts (see comment at line 451).
+      // race-retrofit 2026-07-04 (see the block comment above v2): IMMEDIATE +
+      // in-transaction recheck, following v17's shape for a withForeignKeysDisabled
+      // rebuild (pragma toggle stays OUTSIDE the transaction; recheck is the first
+      // statement inside it).
       this.withForeignKeysDisabled(() => {
         this.db.transaction(() => {
+          const v = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+          if (v >= 7) return; // racing winner already applied — skip
           // Part 1: rebuild entities
           this.db.prepare(`
             CREATE TABLE entities_new (
@@ -515,7 +615,7 @@ export class SqliteStore implements GraphStore {
           this.db.prepare(`ALTER TABLE relations_new RENAME TO relations`).run();
 
           this.db.prepare('UPDATE schema_version SET version = 7').run();
-        })();
+        }).immediate();
       });
       currentVersion = 7;
     }
@@ -560,11 +660,26 @@ export class SqliteStore implements GraphStore {
       // integrity we need is enforced explicitly by the orphan check in
       // Step 5 below. Pragma runs OUTSIDE the transaction (SQLite does not
       // allow `PRAGMA foreign_keys` inside an open transaction).
+      // race-retrofit 2026-07-04 (see the block comment above v2): this is the
+      // block the DEF-RR-04 harness caught crashing at ~25%/run — two fresh-DB
+      // inits both reached v7→v8 and the loser died on "duplicate column name:
+      // normalized_name". IMMEDIATE + the in-transaction recheck below convert
+      // that crash into a skip; the ADD COLUMN also gets the Issue #78 catch.
+      // Follows v17's withForeignKeysDisabled shape (pragma toggle OUTSIDE the
+      // transaction; recheck first statement inside it).
       this.withForeignKeysDisabled(() => {
         this.db.transaction(() => {
+          const v = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+          if (v >= 8) return; // racing winner already applied — skip
           // Step 1: add the normalized_name column with empty default so
         // existing rows satisfy NOT NULL until the backfill runs.
-        this.db.prepare(`ALTER TABLE entities ADD COLUMN normalized_name TEXT NOT NULL DEFAULT ''`).run();
+        try {
+          this.db.prepare(`ALTER TABLE entities ADD COLUMN normalized_name TEXT NOT NULL DEFAULT ''`).run();
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!msg.includes('duplicate column name')) throw err;
+          // Another process already added this column — safe to continue.
+        }
 
         // Step 2: backfill normalized_name for every existing row.
         // SQLite has no built-in NFC/lowercase/separator-strip helper, so
@@ -679,7 +794,7 @@ export class SqliteStore implements GraphStore {
         `).run();
 
           this.db.prepare('UPDATE schema_version SET version = 8').run();
-        })();
+        }).immediate();
       });
       currentVersion = 8;
     }
@@ -701,14 +816,27 @@ export class SqliteStore implements GraphStore {
       // - `relations.tombstoned_at`: mirrors entity tombstoning at the relation level.
       //
       // Each ALTER TABLE is a separate statement (SQLite limitation: one ALTER per statement).
+      // (race-retrofit 2026-07-04, see the block comment above v2.)
       this.db.transaction(() => {
+        const v = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+        if (v >= 9) return; // racing winner already applied — skip
         // Entities: add tombstoned_at and last_accessed_at.
-        this.db.prepare(
-          `ALTER TABLE entities ADD COLUMN tombstoned_at TEXT NOT NULL DEFAULT ''`
-        ).run();
-        this.db.prepare(
-          `ALTER TABLE entities ADD COLUMN last_accessed_at TEXT NOT NULL DEFAULT ''`
-        ).run();
+        // Observations / Relations: add tombstoned_at. Issue #78 duplicate-column
+        // catch on each ADD COLUMN (belt-and-suspenders under the recheck above).
+        for (const stmt of [
+          `ALTER TABLE entities ADD COLUMN tombstoned_at TEXT NOT NULL DEFAULT ''`,
+          `ALTER TABLE entities ADD COLUMN last_accessed_at TEXT NOT NULL DEFAULT ''`,
+          `ALTER TABLE observations ADD COLUMN tombstoned_at TEXT NOT NULL DEFAULT ''`,
+          `ALTER TABLE relations ADD COLUMN tombstoned_at TEXT NOT NULL DEFAULT ''`,
+        ]) {
+          try {
+            this.db.prepare(stmt).run();
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!msg.includes('duplicate column name')) throw err;
+            // Another process already added this column — safe to continue.
+          }
+        }
 
         // Backfill last_accessed_at from updated_at so existing entities aren't immediately
         // eligible for eviction. Entities with sentinel timestamps ('0000-...') get the
@@ -717,18 +845,8 @@ export class SqliteStore implements GraphStore {
           `UPDATE entities SET last_accessed_at = updated_at`
         ).run();
 
-        // Observations: add tombstoned_at.
-        this.db.prepare(
-          `ALTER TABLE observations ADD COLUMN tombstoned_at TEXT NOT NULL DEFAULT ''`
-        ).run();
-
-        // Relations: add tombstoned_at.
-        this.db.prepare(
-          `ALTER TABLE relations ADD COLUMN tombstoned_at TEXT NOT NULL DEFAULT ''`
-        ).run();
-
         this.db.prepare('UPDATE schema_version SET version = 9').run();
-      })();
+      }).immediate();
       currentVersion = 9;
     }
 
@@ -750,6 +868,10 @@ export class SqliteStore implements GraphStore {
       // DEFAULT 'unknown' (not NULL) prevents query issues with NULL comparisons
       // and makes misconfigured instances visible rather than silently broken.
       this.db.transaction(() => {
+        // race-retrofit 2026-07-04 (see the block comment above v2): recheck first
+        // so a racing loser that already saw v10 applied skips the backfill too.
+        const v = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+        if (v >= 10) return; // racing winner already applied — skip
         // try-catch on ALTER TABLE: when multiple MCP server instances share
         // the same database (11 concurrent sessions in this deployment), they
         // all read schema_version=9 and race to migrate. The first one adds
