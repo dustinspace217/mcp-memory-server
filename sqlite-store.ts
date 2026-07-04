@@ -1356,8 +1356,11 @@ export class SqliteStore implements GraphStore {
     // INSERT includes metadata columns — schema v6 guarantees they exist.
     // Legacy JSONL observations will have default values (3.0, null, null).
     // source_instance = 'fedora' for migrated data (all JSONL data predates multi-instance).
+    // summary (v16) is carried — d6c8f48 made file-resident summaries
+    // round-trip-safe in JSONL, so dropping them at the one JSONL→SQLite
+    // hand-off would betray that contract (QA workflow finding, 2026-07-03).
     const insertObs = this.db.prepare(
-      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance, summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
     );
     // Relations store the NORMALIZED form for from_entity / to_entity (post-v8). The
     // JSONL file holds display names, so we normalize before insert.
@@ -1404,7 +1407,7 @@ export class SqliteStore implements GraphStore {
         for (const obs of entity.observations) {
           // obs is already a normalized Observation object (JsonlStore.readGraph() calls normalizeObservation).
           // Read metadata fields with defaults for legacy JSONL data that predates v1.1.
-          insertObs.run(row.id, obs.content, obs.createdAt, obs.importance ?? 3.0, obs.contextLayer ?? null, obs.memoryType ?? null, 'fedora');
+          insertObs.run(row.id, obs.content, obs.createdAt, obs.importance ?? 3.0, obs.contextLayer ?? null, obs.memoryType ?? null, 'fedora', obs.summary ?? null);
         }
       }
       for (const rel of graph.relations) {

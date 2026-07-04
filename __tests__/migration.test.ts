@@ -130,7 +130,42 @@ describe('JSONL to SQLite migration', () => {
     await sqliteStore.close();
   });
 
-  it('should tolerate duplicate entities in corrupted JSONL', async () => {
+  it('carries a file-resident summary through JSONL→SQLite migration (v16)', async () => {
+		// d6c8f48 made summaries round-trip-safe in JSONL files; the migration
+		// is the one hand-off where they could still be silently dropped (QA
+		// workflow finding, 2026-07-03 — insertObs omitted the column). Verify
+		// via raw SQL: summary isn't part of general observation hydration.
+		const id = Date.now();
+		jsonlPath = path.join(testDir, `test-migrate-${id}.jsonl`);
+		dbPath = path.join(testDir, `test-migrate-${id}.db`);
+
+		const line = JSON.stringify({
+			type: 'entity', name: 'SummaryCarrier', entityType: 'test',
+			observations: [{
+				content: 'observation whose first hundred characters are not the story',
+				createdAt: '2026-07-01T00:00:00.000Z', importance: 2.0,
+				contextLayer: 'L1', memoryType: null, sourceInstance: 'test',
+				summary: 'migrated hint text',
+			}],
+		});
+		await fs.writeFile(jsonlPath, line + '\n');
+
+		const sqliteStore = new SqliteStore(dbPath);
+		await sqliteStore.init();
+		await sqliteStore.close();
+
+		const Database = (await import('better-sqlite3')).default;
+		const db = new Database(dbPath, { readonly: true });
+		try {
+			const row = db.prepare('SELECT summary FROM observations WHERE content LIKE ?')
+				.get('%not the story%') as { summary: string | null };
+			expect(row.summary).toBe('migrated hint text');
+		} finally {
+			db.close();
+		}
+	});
+
+	it('should tolerate duplicate entities in corrupted JSONL', async () => {
     const id = Date.now();
     jsonlPath = path.join(testDir, `test-migrate-${id}.jsonl`);
     dbPath = path.join(testDir, `test-migrate-${id}.db`);

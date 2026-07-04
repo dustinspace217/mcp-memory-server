@@ -1862,7 +1862,7 @@ describe.each<[string, string, StoreFactory]>([
 			expect(result.entities).toHaveLength(2);
 		});
 
-		it('should only include relations where both endpoints are in the result set', async () => {
+		it('project-scoped read excludes cross-project relations (project-wide endpoint filter)', async () => {
 			await store.createEntities(
 				[{ name: 'P1', entityType: 'test', observations: ['p1'] }],
 				'proj-1'
@@ -2443,8 +2443,8 @@ describe.each<[string, string, StoreFactory]>([
 			expect(result.nextCursor).toBeNull();
 		});
 
-		// Verifies that only relations where BOTH endpoints are in the current page
-		// are included. Cross-page relations (one endpoint per page) are excluded.
+		// Verifies the v1.4.0 either-endpoint contract: pages carry every relation
+		// touching their entities, and the deduped union across pages is complete.
 		it('returns every relation touching a page entity; union across pages is complete', async () => {
 			// The pre-fix contract was page-local AND (a relation appeared only
 			// when BOTH endpoints shared a page), which made the union across

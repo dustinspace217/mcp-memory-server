@@ -210,6 +210,30 @@ describe('searchNodes relevance mode', () => {
 		]);
 	});
 
+	it('project-scoped relevance search filters relations against the project-wide set', async () => {
+		// Pins searchNodesRanked's scope-filter branch specifically — a QA
+		// mutation probe deleted it and both pools stayed green (2026-07-03).
+		// In-project off-result partner: relation kept. Cross-project: excluded.
+		await store.createEntities([
+			{ name: 'RankedScoped', entityType: 'test', observations: ['axolotl habitat notes'] },
+		], 'rankproj');
+		await store.createEntities([
+			{ name: 'InProjPartner', entityType: 'test', observations: ['no query tokens here'] },
+		], 'rankproj');
+		await store.createEntities([
+			{ name: 'OtherProjPartner', entityType: 'test', observations: ['also no query tokens'] },
+		], 'elsewhere');
+		await store.createRelations([
+			{ from: 'RankedScoped', to: 'InProjPartner', relationType: 'kept' },
+			{ from: 'RankedScoped', to: 'OtherProjPartner', relationType: 'dropped' },
+		]);
+		const res = await store.searchNodes('axolotl habitat', 'rankproj', { limit: 5 }, undefined, undefined, 'relevance');
+		expect(res.entities.map(e => e.name)).toContain('RankedScoped');
+		expect(res.relations).toEqual([
+			expect.objectContaining({ from: 'RankedScoped', to: 'InProjPartner', relationType: 'kept' }),
+		]);
+	});
+
 	it('ranks the dense FTS match above the recency winner; recency mode unchanged', async () => {
 		await seedRelevanceFixture();
 		const rel = await store.searchNodes('vector search', undefined, { limit: 10 }, undefined, undefined, 'relevance');
