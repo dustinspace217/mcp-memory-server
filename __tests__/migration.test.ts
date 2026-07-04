@@ -152,6 +152,51 @@ describe('JSONL to SQLite migration', () => {
 		}
 	});
 
+	it('carries relation temporal + valid-time fields through migration', async () => {
+		// QA finding (v1.6.0 retirement, test-analyzer LOW): every prior fixture's
+		// relation lines carried only from/to/relationType, so jsonl-reader.ts's
+		// present-branches for serialized createdAt/supersededAt/validFrom/validUntil
+		// only ever ran their default arms. Recent real .jsonl files DO carry these
+		// (JsonlStore serialized them from v1.0.0 on), so this fixture exercises the
+		// present arms and pins that the values survive into SQLite.
+		const id = Date.now();
+		jsonlPath = path.join(testDir, `test-migrate-${id}.jsonl`);
+		dbPath = path.join(testDir, `test-migrate-${id}.db`);
+
+		const lines = [
+			JSON.stringify({ type: 'entity', name: 'RelFrom', entityType: 'test', observations: ['a'] }),
+			JSON.stringify({ type: 'entity', name: 'RelTo', entityType: 'test', observations: ['b'] }),
+			JSON.stringify({
+				type: 'relation', from: 'RelFrom', to: 'RelTo', relationType: 'depends_on',
+				createdAt: '2026-05-01T00:00:00.000Z',
+				validFrom: '2026-04-01T00:00:00.000Z', validUntil: '2026-06-01T00:00:00.000Z',
+			}),
+			// A SUPERSEDED relation, exactly as JsonlStore serialized one after an
+			// invalidate_relations call. Pre-fix, the migration insert dropped
+			// supersededAt and this row RESURRECTED as active (column default '').
+			JSON.stringify({
+				type: 'relation', from: 'RelFrom', to: 'RelTo', relationType: 'used_to_depend_on',
+				createdAt: '2026-03-01T00:00:00.000Z', supersededAt: '2026-04-15T00:00:00.000Z',
+			}),
+		];
+		await fs.writeFile(jsonlPath, lines.join('\n') + '\n');
+
+		const sqliteStore = new SqliteStore(dbPath);
+		await sqliteStore.init();
+		const graph = await sqliteStore.readGraph();
+		await sqliteStore.close();
+
+		const rel = graph.relations.find(r => r.relationType === 'depends_on');
+		expect(rel).toBeDefined();
+		expect(rel!.createdAt).toBe('2026-05-01T00:00:00.000Z');
+		// Valid time is emitted only when set — the present arms must have run.
+		expect(rel!.validFrom).toBe('2026-04-01T00:00:00.000Z');
+		expect(rel!.validUntil).toBe('2026-06-01T00:00:00.000Z');
+		// The superseded relation must NOT be active after migration (readGraph
+		// filters superseded_at != '' — presence here means it resurrected).
+		expect(graph.relations.find(r => r.relationType === 'used_to_depend_on')).toBeUndefined();
+	});
+
 	it('should tolerate duplicate entities in corrupted JSONL', async () => {
     const id = Date.now();
     jsonlPath = path.join(testDir, `test-migrate-${id}.jsonl`);

@@ -1600,8 +1600,13 @@ export class SqliteStore implements GraphStore {
     // JSONL file holds display names, so we normalize before insert.
     // valid_from/valid_until (v14): JSONL relations can carry valid time —
     // migrate it rather than dropping it (review #87 minor).
+    // created_at/superseded_at (v1.6.0 QA finding): JSONL files written since the
+    // v1.0.0 type split serialize BOTH temporal fields, and the reader parses them —
+    // but this insert historically dropped them, which (a) lost the relation's real
+    // creation time (goal B: faithful WHEN) and (b) RESURRECTED superseded relations
+    // as active, since the column default is '' = active. Carry both through.
     const insertRel = this.db.prepare(
-      'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type, valid_from, valid_until) VALUES (?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type, created_at, superseded_at, valid_from, valid_until) VALUES (?, ?, ?, ?, ?, ?, ?)'
     );
 
     // Track valid normalized names so we can skip dangling relations (no FK to enforce
@@ -1655,7 +1660,9 @@ export class SqliteStore implements GraphStore {
           continue;
         }
         // INSERT OR IGNORE handles duplicate relations
-        insertRel.run(fromNorm, toNorm, rel.relationType, rel.validFrom ?? '', rel.validUntil ?? '');
+        // readJsonlGraph always populates createdAt (sentinel when the file lacked
+        // it) and supersededAt ('' = active); the ?? fallbacks are pure defense.
+        insertRel.run(fromNorm, toNorm, rel.relationType, rel.createdAt ?? '', rel.supersededAt ?? '', rel.validFrom ?? '', rel.validUntil ?? '');
       }
     });
     txn();

@@ -13,14 +13,16 @@ export const MAX_PAGE_SIZE = 100;
 /**
  * Internal cursor payload -- encoded as base64 JSON in the opaque cursor string.
  * u: updatedAt of last entity on page (sort key)
- * i: SQLite entity id (tiebreaker for stable ordering); always 0 for JSONL
- * n: entity name (tiebreaker for JSONL backend -- unused by SQLite but preserved for compat)
+ * i: SQLite entity id (tiebreaker for stable ordering)
+ * n: entity name -- VESTIGIAL since the v1.6.0 JSONL retirement (it was the
+ *    JSONL backend's tiebreaker). Retained so cursors minted before the
+ *    retirement still decode; no live code reads it.
  * q: query fingerprint (prevents using a cursor from one query on a different query)
  */
 export interface CursorPayload {
   u: string;   // updatedAt timestamp of the last entity on the page
-  i: number;   // SQLite entity id for tiebreaking (0 for JSONL)
-  n?: string;  // entity name -- used by JSONL, included by SQLite for compat
+  i: number;   // SQLite entity id for tiebreaking
+  n?: string;  // vestigial (ex-JSONL tiebreaker) -- kept for cursor-payload compat
   q: string;   // query fingerprint -- must match for cursor reuse
 }
 
@@ -43,8 +45,9 @@ export function encodeCursor(payload: CursorPayload): string {
  *
  * Validation rules:
  * - u: must be a string (updatedAt timestamp)
- * - i: must be a finite positive integer (SQLite entity id) or 0 (JSONL placeholder)
- * - n: if present, must be a string (entity name for JSONL tiebreaking)
+ * - i: must be a non-negative finite integer (SQLite entity id; 0 tolerated
+ *      from pre-retirement JSONL-era cursors)
+ * - n: if present, must be a string (vestigial ex-JSONL tiebreaker)
  * - q: must be a string matching the expected fingerprint
  *
  * @param cursor - Base64-encoded cursor string from the client
@@ -60,7 +63,8 @@ export function decodeCursor(cursor: string, expectedFingerprint: string): Curso
     if (typeof parsed.u !== 'string' || typeof parsed.i !== 'number' || typeof parsed.q !== 'string') {
       throw new InvalidCursorError('Cursor has invalid structure');
     }
-    // Validate i is a non-negative finite integer (0 is valid for JSONL, positive for SQLite)
+    // Validate i is a non-negative finite integer (0 tolerated for pre-v1.6.0
+    // JSONL-era cursors, positive for SQLite)
     // Rejects: Infinity, -Infinity, NaN, -1, 3.14, etc.
     if (!Number.isFinite(parsed.i) || !Number.isInteger(parsed.i) || parsed.i < 0) {
       throw new InvalidCursorError('Cursor has invalid structure');

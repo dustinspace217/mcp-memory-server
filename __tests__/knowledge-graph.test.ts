@@ -551,10 +551,6 @@ describe.each<[string, string, StoreFactory]>([
 			expect(target.path).toEqual(['AlphaSeed', 'mid', 'Target']);
 		});
 
-		it('throws on the JSONL backend (SQLite-only feature)', async function() {
-			if (ext !== 'jsonl') return;
-			await expect(store.getConnectedContext('A')).rejects.toThrow(/not supported|JSONL/i);
-		});
 	});
 
 	// ----------------------------------------------------------
@@ -1085,13 +1081,6 @@ describe.each<[string, string, StoreFactory]>([
 			expect(graph.entities).toHaveLength(0);
 		});
 
-		it('JSONL backend throws on deleteEntities (soft-delete unsupported)', async function() {
-			if (ext !== 'jsonl') return;
-			await store.createEntities([
-				{ name: 'Alice', entityType: 'person', observations: [] },
-			]);
-			await expect(store.deleteEntities(['Alice'])).rejects.toThrow(/not supported in JSONL/);
-		});
 	});
 
 	// ----------------------------------------------------------
@@ -1351,15 +1340,6 @@ describe.each<[string, string, StoreFactory]>([
 	// supersedeObservations
 	// ----------------------------------------------------------
 	describe('supersedeObservations', () => {
-		it('should throw in JSONL backend', async function() {
-			if (ext !== 'jsonl') return;
-			await store.createEntities([
-				{ name: 'Entity1', entityType: 'test', observations: ['old fact'] },
-			]);
-			await expect(store.supersedeObservations([
-				{ entityName: 'Entity1', oldContent: 'old fact', newContent: 'new fact' },
-			])).rejects.toThrow('migrate to SQLite');
-		});
 
 		it('should replace an observation atomically', async function() {
 			if (ext === 'jsonl') return;
