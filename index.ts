@@ -1,17 +1,19 @@
 #!/usr/bin/env node
 
 // index.ts -- MCP server entry point. Registers tools, wires store, starts transport.
-// All data types live in types.ts; store implementations in jsonl-store.ts / sqlite-store.ts.
+// All data types live in types.ts; the sole live storage backend is sqlite-store.ts.
 // Store selection (StoreConfig, ensureMemoryFilePath) lives here because it's an
-// entry-point concern -- deciding which backend to instantiate based on file extension.
+// entry-point concern -- resolving the storage path and honoring the one-time
+// .jsonl -> SQLite upgrade (the JSONL backend itself was retired in v1.6.0).
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import path from 'path';
+import { promises as fs } from 'fs';
 import { fileURLToPath } from 'url';
 import type { GraphStore } from './types.js';
-import { JsonlStore, migrateJsonToJsonl } from './jsonl-store.js';
+import { migrateJsonToJsonl } from './jsonl-reader.js';
 import { RELATION_TYPE_GUIDANCE } from './relation-types.js';
 import { SqliteStore } from './sqlite-store.js';
 import { normalizeEntityName } from './normalize-name.js';
@@ -23,8 +25,12 @@ import { SIMILAR_THRESHOLD, DUPLICATE_THRESHOLD, PRECEDENT_FLOOR } from './embed
 // --- Store configuration ---
 // Determines which backend to use and where to store data.
 
-/** Configuration returned by ensureMemoryFilePath() -- determines which store to use. */
-export type StoreConfig = { path: string; storeType: 'jsonl' | 'sqlite' };
+/** Configuration returned by ensureMemoryFilePath() -- resolves the SQLite path.
+ *  storeType is always 'sqlite' since the v1.6.0 JSONL-backend retirement; it's
+ *  kept as a single-value field rather than dropped so the shape stays stable for
+ *  any external caller reading the config, and so re-adding a backend later is a
+ *  narrowing change, not a shape change. */
+export type StoreConfig = { path: string; storeType: 'sqlite' };
 
 // Default memory file path, used when MEMORY_FILE_PATH env var is not set.
 // Points to memory.db alongside the compiled script in dist/.
@@ -38,13 +44,17 @@ export const defaultMemoryPath = path.join(
  * Determines the store type from the file extension and handles legacy migrations.
  *
  * Selection logic:
- * - .jsonl extension -> JSONL store (with .json->.jsonl migration)
+ * - .jsonl extension -> one-time upgrade only: if the file exists, serve SQLite
+ *   from the sibling .db and let SqliteStore.init() migrate the .jsonl into it
+ *   (renaming it .bak). If no file exists there, throw — the JSONL backend was
+ *   retired in v1.6.0 and there is nothing to migrate.
  * - .db or .sqlite extension -> SQLite store
  * - Other extension -> throws with helpful message
  * - No env var -> defaults to memory.db (SQLite)
  *
- * @returns StoreConfig with the resolved path and store type
- * @throws Error if MEMORY_FILE_PATH has an unrecognized extension
+ * @returns StoreConfig with the resolved SQLite path
+ * @throws Error if MEMORY_FILE_PATH has an unrecognized extension, or points at a
+ *         .jsonl path with no file behind it (retired backend, nothing to migrate)
  */
 export async function ensureMemoryFilePath(): Promise<StoreConfig> {
   const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -55,16 +65,32 @@ export async function ensureMemoryFilePath(): Promise<StoreConfig> {
       : path.join(scriptDir, process.env.MEMORY_FILE_PATH);
 
     if (envPath.endsWith('.jsonl')) {
-      // Handle legacy .json -> .jsonl migration for JSONL users
+      // The JSONL backend is retired (v1.6.0). A .jsonl path is honored ONLY as a
+      // one-time upgrade: run the legacy memory.json -> memory.jsonl hop, then, if
+      // a .jsonl file actually exists, hand back the sibling .db path — SqliteStore
+      // .init() finds the .jsonl, migrates it, and renames it .bak (see its init()).
       await migrateJsonToJsonl(scriptDir, envPath);
-      return { path: envPath, storeType: 'jsonl' };
+      const jsonlExists = await fs.access(envPath).then(() => true).catch(() => false);
+      if (!jsonlExists) {
+        // Nothing to migrate. Rather than silently create an empty SQLite DB under
+        // a .jsonl-derived name (confusing and un-greppable), fail loudly with the
+        // fix — "every error tells the user what went wrong."
+        throw new Error(
+          `MEMORY_FILE_PATH="${process.env.MEMORY_FILE_PATH}" points at a .jsonl file, but the ` +
+          `JSONL storage backend was retired in v1.6.0 and no file exists there to migrate. ` +
+          `Set MEMORY_FILE_PATH to a .db path (e.g. memory.db) to use SQLite storage.`
+        );
+      }
+      // Swap .jsonl -> .db; the sibling-file migration in SqliteStore.init() does the rest.
+      const dbPath = envPath.replace(/\.jsonl$/, '.db');
+      return { path: dbPath, storeType: 'sqlite' };
     }
     if (envPath.endsWith('.db') || envPath.endsWith('.sqlite')) {
       return { path: envPath, storeType: 'sqlite' };
     }
     throw new Error(
       `Unsupported file extension for MEMORY_FILE_PATH: "${process.env.MEMORY_FILE_PATH}". ` +
-      `Use .jsonl for JSONL storage or .db/.sqlite for SQLite storage.`
+      `Use .db or .sqlite for SQLite storage.`
     );
   }
 
@@ -74,7 +100,7 @@ export async function ensureMemoryFilePath(): Promise<StoreConfig> {
 
 // Re-export types that tests and external consumers may need
 export { type Observation, type Entity, type Relation, type RelationInput, type KnowledgeGraph, type CreateEntitiesResult, type SkippedEntity, type PaginationParams, type PaginatedKnowledgeGraph, InvalidCursorError } from './types.js';
-export { JsonlStore, normalizeObservation } from './jsonl-store.js';
+export { normalizeObservation } from './jsonl-reader.js';
 export { SqliteStore } from './sqlite-store.js';
 
 // Module-level store reference -- initialized in main(), used by all tool handlers
@@ -92,8 +118,11 @@ const ObservationSchema = z.object({
   contextLayer: z.enum(['L0', 'L1']).nullable().describe("Context layer: 'L0' = always loaded, 'L1' = session start, null = L2 (on-demand)"),
   memoryType: z.string().nullable().describe("Memory type tag (e.g., 'decision', 'preference', 'fact'). null = unclassified"),
   sourceInstance: z.string().describe("Which Claude Code instance created this observation (e.g., 'fedora', 'windows-mele')"),
-  // Declaring these here is load-bearing (SDK output validation strips
-  // undeclared keys): valid time (v14) — when the fact was true in the world.
+  // Valid time (v14) — when the fact was true in the world. Declared so the
+  // fields live in the tools/list-advertised contract clients discover fields
+  // through. (Verified 2026-07-04: the installed SDK's output validation
+  // throws-on-failure but does NOT strip undeclared keys — an earlier comment
+  // here claimed stripping; see mcp-server-harness.test.ts's header.)
   validFrom: z.string().optional().describe("VALID-TIME start (set via set_observation_metadata) — present only when set"),
   validUntil: z.string().optional().describe("VALID-TIME end — present only when set"),
 });
@@ -244,7 +273,9 @@ export function normalizeProjectId(projectId?: string): string | undefined {
 // Schema for entities that were skipped during create_entities (name collision).
 // existingName reports which display form the input collided with — important when
 // the input was a surface variant (e.g. 'Dustin-Space' → collides with 'dustin-space').
-// Without this, Zod strips the field from the MCP output (issue #58).
+// Declared so the field is part of the advertised output contract (issue #58 was a
+// field vanishing from MCP output; whatever that era's mechanism, today's verified
+// SDK does not strip undeclared keys — the declaration is the contract, not a filter).
 const SkippedEntitySchema = z.object({
   name: z.string(),
   existingProject: z.string().nullable(),
@@ -271,11 +302,10 @@ const PaginatedOutputSchema = {
   relations: z.array(RelationOutputSchema).describe("Every relation TOUCHING a returned entity (either-endpoint). The partner endpoint may not be in this response — it's a name; open_nodes it for content. A spanning relation appears on each endpoint's page: dedup on from+to+relationType when unioning, and the deduped union across all read_graph pages is the COMPLETE active relation set. With projectId, cross-project relations are excluded."),
   nextCursor: z.string().nullable().describe("Cursor for the next page, or null if this is the last page"),
   totalCount: z.number().describe("Total number of matching entities across all pages"),
-  rankingUnavailable: z.boolean().optional().describe("Present (true) only when orderBy:'relevance' was requested but the backend cannot rank (JSONL has no FTS index) and results fell back to recency order."),
-  // Declaring this here is load-bearing, not just documentation: the MCP SDK
-  // validates structuredContent against this schema with key-stripping
-  // semantics, so a flag the store sets but this schema omits would vanish
-  // silently — the degradation signal itself failing silently.
+  // Declared so the degradation flag is part of the tools/list-advertised
+  // contract — a caller can only know to look for a signal the schema names.
+  // (Verified 2026-07-04: the SDK does NOT strip undeclared structuredContent
+  // keys — an earlier version of this comment claimed key-stripping semantics.)
   rankingDegraded: z.array(z.enum(['fts', 'vector'])).optional().describe("Present (non-empty) only when orderBy:'relevance' ran but a candidate signal was LOST this call: 'fts' = the BM25 full-text list failed; 'vector' = the semantic KNN list failed or the embedding model was still loading. Degraded runs can MISS results a healthy run would return (treat as partial). Not set when vector search is configured off."),
 };
 
@@ -713,7 +743,8 @@ server.registerTool(
         supersededAt: z.string(),
         sourceInstance: z.string(),
         status: z.enum(['active', 'superseded', 'tombstoned']),
-        // Valid time (v14) — declared so SDK output validation doesn't strip it.
+        // Valid time (v14) — declared so it's in the advertised output contract
+        // (the SDK does not strip undeclared keys; verified 2026-07-04).
         validFrom: z.string().optional(),
         validUntil: z.string().optional(),
       })),
@@ -840,8 +871,10 @@ server.registerTool(
         sourceInstance: z.string(),
         updatedAt: z.string().optional(),
       })).describe("Session-start context, featured tier (full text, most important first)"),
-      // Declared here is load-bearing (SDK output validation strips undeclared
-      // keys — the #86/#87 lesson): the v16 index tier.
+      // The v16 index tier — declared so L1Index is in the tools/list-advertised
+      // contract (the #86/#87 lesson was undeclared output fields going unnoticed;
+      // note the SDK does NOT strip undeclared keys — verified 2026-07-04, see
+      // mcp-server-harness.test.ts's header and its case (a) declaration guard).
       L1Index: z.array(z.object({
         entityName: z.string(),
         entityType: z.string(),
@@ -946,7 +979,7 @@ server.registerTool(
     description: "Pre-write duplicate check. Embeds candidate observations and queries for " +
       `semantically similar existing observations (cosine > ${DUPLICATE_THRESHOLD}) on the same entity. ` +
       "Does NOT write anything — use before add_observations to avoid redundancy. " +
-      "Returns modelReady: false if embeddings are unavailable (JSONL backend or model not loaded).",
+      "Returns modelReady: false if embeddings are unavailable (vector search off or model not loaded).",
     inputSchema: {
       candidates: z.array(z.object({
         entityName: z.string().min(1).max(500).describe("Name of the entity to check against"),
@@ -985,12 +1018,9 @@ server.registerTool(
 async function main() {
   const config = await ensureMemoryFilePath();
 
-  // Instantiate the appropriate store based on file extension
-  if (config.storeType === 'sqlite') {
-    store = new SqliteStore(config.path);
-  } else {
-    store = new JsonlStore(config.path);
-  }
+  // SQLite is the only backend since v1.6.0; ensureMemoryFilePath already resolved
+  // (and, for a legacy .jsonl path, redirected) the path to a .db file.
+  store = new SqliteStore(config.path);
   await store.init();
 
   const transport = new StdioServerTransport();

@@ -17,7 +17,7 @@
     "index.ts",
     "types.ts",
     "cursor.ts",
-    "jsonl-store.ts",
+    "jsonl-reader.ts",
     "sqlite-store.ts",
     "embedding.ts"
   ],

@@ -1,5 +1,6 @@
 // types.ts -- Shared interfaces and types for the knowledge graph.
-// Both JsonlStore and SqliteStore depend on these types.
+// SqliteStore (the sole live backend since v1.6.0) and the jsonl-reader migration
+// parser both depend on these types.
 
 /**
  * A single piece of knowledge attached to an entity.
@@ -32,8 +33,7 @@ export interface Observation {
   validUntil?: string;
   /** L1-index hint override (v16, ≤200 chars). Consumed only by
    *  getContextLayers when building L1Index breadcrumbs; absent/null = the
-   *  first-100-chars auto-fallback. Set via set_observation_metadata (SQLite);
-   *  in JSONL it round-trips from file contents but has no setter. */
+   *  first-100-chars auto-fallback. Set via set_observation_metadata. */
   summary?: string | null;
 }
 
@@ -223,11 +223,6 @@ export interface PaginationParams {
 export interface PaginatedKnowledgeGraph extends KnowledgeGraph {
   nextCursor: string | null;  // null = no more pages
   totalCount: number;         // Total matching entities (may vary between pages if data mutates)
-  /** Set true only when the caller asked for orderBy:'relevance' but the backend
-   *  can't rank (JSONL has no FTS index) and fell back to recency order. Absent
-   *  (not false) on the SQLite path — same optional-flag convention as
-   *  similarityCheckFailed on AddObservationResult. */
-  rankingUnavailable?: boolean;
   /** Present (non-empty) only when orderBy:'relevance' ran but one of its candidate
    *  lists was LOST to an error or transient unavailability — 'fts' when the BM25
    *  query failed, 'vector' when the KNN list failed or the embedding model was
@@ -236,7 +231,7 @@ export interface PaginatedKnowledgeGraph extends KnowledgeGraph {
    *  so per goal A it must surface to the caller, not just stderr. Deliberately
    *  NOT set when vector search is configured off (MEMORY_VECTOR_SEARCH=off):
    *  that is chosen configuration, not degradation, and flagging it would train
-   *  callers to ignore the flag. Same convention family as rankingUnavailable /
+   *  callers to ignore the flag. Same convention family as
    *  vectorSearchEnabled / modelReady. */
   rankingDegraded?: ('fts' | 'vector')[];
 }
@@ -341,7 +336,7 @@ export interface CheckDuplicateResult {
 }
 
 /** Full response from checkDuplicates. modelReady is false when the
- *  embedding pipeline isn't available (JSONL backend, or model failed to load)
+ *  embedding pipeline isn't available (vector search off, or model failed to load)
  *  — results will have empty matches in that case. When errorCount > 0,
  *  some candidates failed (database corruption, embedding failure, etc.)
  *  and their results have empty matches even though duplicates may exist. */
@@ -482,15 +477,17 @@ export interface SupersedeInput {
 }
 
 /**
- * The GraphStore interface -- the contract both JsonlStore and SqliteStore implement.
- * Methods mirror the MCP tool operations. Return types use Readonly to prevent
- * accidental mutation of returned data.
+ * The GraphStore interface -- the storage contract SqliteStore implements (the
+ * sole live backend since the v1.6.0 JSONL retirement). Kept as an interface so
+ * the store stays swappable in tests and so a future backend has a contract to
+ * meet. Methods mirror the MCP tool operations. Return types use Readonly to
+ * prevent accidental mutation of returned data.
  */
 export interface GraphStore {
-  /** One-time setup: create tables, run migrations, etc. No-op for JSONL. */
+  /** One-time setup: create tables, run migrations, etc. */
   init(): Promise<void>;
 
-  /** Cleanup: close DB connection. No-op for JSONL. */
+  /** Cleanup: close DB connection. */
   close(): Promise<void>;
 
   /** Signals the store to stop background work (e.g., embedding sweep) and
@@ -524,9 +521,8 @@ export interface GraphStore {
    *  Idempotent — silently ignores non-existent relations. */
   deleteRelations(relations: RelationInput[]): Promise<void>;
   /** Atomically retires old observations and inserts replacements in a single transaction.
-   *  Not supported by JSONL backend (throws).
    *  @param supersessions - Array of { entityName, oldContent, newContent }
-   *  @throws Error if entity or active observation not found, or if JSONL backend */
+   *  @throws Error if entity or active observation not found */
   supersedeObservations(supersessions: SupersedeInput[]): Promise<void>;
   /** Invalidates relations by setting superseded_at to current timestamp.
    * Idempotent — ignores already-invalidated relations.
@@ -538,7 +534,7 @@ export interface GraphStore {
    *  @param projectId - Optional project scope. When set, includes project + global entities.
    *  @param pagination - Optional cursor and limit. Omit for all results (backward compat).
    *  @param asOf - Optional ISO 8601 UTC timestamp for point-in-time queries. When set,
-   *    returns only observations/relations that were active at that moment. JSONL ignores this. */
+   *    returns only observations/relations that were active at that moment. */
   readGraph(projectId?: string, pagination?: PaginationParams, asOf?: string): Promise<Readonly<PaginatedKnowledgeGraph>>;
   /** Searches for entities matching a case-insensitive substring query against name,
    *  entityType, or observation content. Augmented with vector similarity search when
@@ -549,8 +545,7 @@ export interface GraphStore {
    *  @param asOf - Optional ISO 8601 UTC timestamp for point-in-time queries
    *  @param memoryType - Optional filter: only return entities with at least one observation of this type (e.g., 'procedure', 'decision')
    *  @param orderBy - 'recency' (default, historical behavior) or 'relevance' (RRF over
-   *    LIKE/FTS/vector lists, top-k, no cursor). Incompatible with cursor and asOf —
-   *    SQLite throws; JSONL falls back to recency with rankingUnavailable: true. */
+   *    LIKE/FTS/vector lists, top-k, no cursor). Incompatible with cursor and asOf — throws. */
   searchNodes(query: string, projectId?: string, pagination?: PaginationParams, asOf?: string, memoryType?: string, orderBy?: SearchOrderBy): Promise<Readonly<PaginatedKnowledgeGraph>>;
   /** Retrieves specific entities by exact name match plus connected relations.
    *  Non-existent names are silently skipped. Use this instead of readGraph when you
@@ -561,14 +556,14 @@ export interface GraphStore {
    *  structurally-connected neighborhood (lightweight nodes + the active edges among them).
    *  Surfaces INDIRECT facts that semantic/recency search misses because they aren't
    *  textually similar to the seed (e.g. a sanction two hops from a loan applicant).
-   *  Cycle-safe; nearest hop wins. SQLite only — JSONL backend throws.
+   *  Cycle-safe; nearest hop wins.
    *  @param seedEntity - entity to traverse from (any surface form)
    *  @param opts - traversal options (maxHops, direction, relationTypes, projectId, asOf, maxNodes) */
   getConnectedContext(seedEntity: string, opts?: ConnectedContextOptions): Promise<Readonly<ConnectedContextResult>>;
   /** Retrieves observations RANKED by semantic (cosine) similarity to `query` — the most similar
    *  PRIOR decisions/situations, which search_nodes (recency) and get_connected_context (structure)
    *  can't surface. Degrades to empty + flags when the model/vectors are unavailable; never silently
-   *  recency-falls-back. SQLite only; JSONL returns disabled flags.
+   *  recency-falls-back.
    *  @param query - situation/scenario to find precedents for
    *  @param projectId - optional scope (project + global); pre-normalized by the caller
    *  @param opts - memoryType filter, limit (default 5), minSimilarity floor (default 0.25) */
@@ -602,7 +597,7 @@ export interface GraphStore {
   /** Pre-write duplicate check. Embeds candidate observations and queries for
    *  semantically similar existing observations (cosine > 0.80) on the same entity.
    *  Does NOT write anything — the caller decides what to do with the results.
-   *  JSONL backend returns modelReady: false with empty matches (no vector search).
+   *  Returns modelReady: false with empty matches when vector search is unavailable.
    *  @param candidates - Array of { entityName, content } to check
    *  @returns Per-candidate matches plus a modelReady flag */
   checkDuplicates(candidates: CheckDuplicateInput[]): Promise<CheckDuplicatesResponse>;

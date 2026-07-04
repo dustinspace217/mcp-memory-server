@@ -6,7 +6,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { JsonlStore } from '../jsonl-store.js';
+import { writeJsonlFixture } from './helpers/write-jsonl.js';
 import { SqliteStore } from '../sqlite-store.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -29,17 +29,13 @@ describe('JSONL to SQLite migration', () => {
     jsonlPath = path.join(testDir, `test-migrate-${id}.jsonl`);
     dbPath = path.join(testDir, `test-migrate-${id}.db`);
 
-    // Seed a JSONL file with data
-    const jsonlStore = new JsonlStore(jsonlPath);
-    await jsonlStore.init();
-    await jsonlStore.createEntities([
+    // Seed a JSONL file with data (the fixture the migration path reads)
+    await writeJsonlFixture(jsonlPath, [
       { name: 'Alice', entityType: 'person', observations: ['works at Acme'] },
       { name: 'Bob', entityType: 'person', observations: ['likes coding'] },
-    ]);
-    await jsonlStore.createRelations([
+    ], [
       { from: 'Alice', to: 'Bob', relationType: 'knows' },
     ]);
-    await jsonlStore.close();
 
     // Open a SqliteStore at the same base path -- should trigger migration
     const sqliteStore = new SqliteStore(dbPath);
@@ -62,10 +58,7 @@ describe('JSONL to SQLite migration', () => {
     jsonlPath = path.join(testDir, `test-migrate-${id}.jsonl`);
     dbPath = path.join(testDir, `test-migrate-${id}.db`);
 
-    const jsonlStore = new JsonlStore(jsonlPath);
-    await jsonlStore.init();
-    await jsonlStore.createEntities([{ name: 'Test', entityType: 'test', observations: [] }]);
-    await jsonlStore.close();
+    await writeJsonlFixture(jsonlPath, [{ name: 'Test', entityType: 'test', observations: [] }]);
 
     const sqliteStore = new SqliteStore(dbPath);
     await sqliteStore.init();
@@ -83,20 +76,14 @@ describe('JSONL to SQLite migration', () => {
     dbPath = path.join(testDir, `test-migrate-${id}.db`);
 
     // Seed JSONL and create DB via first migration
-    const jsonlStore = new JsonlStore(jsonlPath);
-    await jsonlStore.init();
-    await jsonlStore.createEntities([{ name: 'Original', entityType: 'test', observations: [] }]);
-    await jsonlStore.close();
+    await writeJsonlFixture(jsonlPath, [{ name: 'Original', entityType: 'test', observations: [] }]);
 
     const sqliteStore1 = new SqliteStore(dbPath);
     await sqliteStore1.init();
     await sqliteStore1.close();
 
     // Re-create a JSONL file (simulating leftover data)
-    const jsonlStore2 = new JsonlStore(jsonlPath);
-    await jsonlStore2.init();
-    await jsonlStore2.createEntities([{ name: 'ShouldNotAppear', entityType: 'test', observations: [] }]);
-    await jsonlStore2.close();
+    await writeJsonlFixture(jsonlPath, [{ name: 'ShouldNotAppear', entityType: 'test', observations: [] }]);
 
     // Second init should NOT re-migrate
     const sqliteStore2 = new SqliteStore(dbPath);

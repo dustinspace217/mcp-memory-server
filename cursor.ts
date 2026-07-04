@@ -1,5 +1,4 @@
-// cursor.ts -- Shared cursor utilities for keyset pagination.
-// Both SqliteStore and JsonlStore import from here to avoid duplication.
+// cursor.ts -- Shared cursor utilities for keyset pagination, used by SqliteStore.
 // Cursors are opaque base64-encoded JSON strings that encode a position
 // in a sorted result set plus a query fingerprint for cross-query safety.
 

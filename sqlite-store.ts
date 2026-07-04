@@ -49,7 +49,7 @@ import {
   type SearchOrderBy,
 } from './types.js';
 import { fuseRanks, toFtsQuery, activationScore } from './rank-fusion.js';
-import { JsonlStore } from './jsonl-store.js';
+import { readJsonlGraph } from './jsonl-reader.js';
 import {
   type CursorPayload,
   encodeCursor,
@@ -133,7 +133,7 @@ export function rankAndFloorPrecedents(precedents: PrecedentMatch[], minSimilari
  * SQLite-backed knowledge graph store. Uses WAL mode for concurrent read performance
  * and foreign key constraints for referential integrity.
  *
- * Implements GraphStore so it can be swapped with JsonlStore transparently.
+ * Implements GraphStore — the sole live backend since the v1.6.0 JSONL retirement.
  */
 export class SqliteStore implements GraphStore {
   // The '!' (definite assignment) tells TypeScript this is set in init() before use.
@@ -184,11 +184,9 @@ export class SqliteStore implements GraphStore {
       const jsonlPath = this.dbPath.replace(/\.(db|sqlite)$/, '.jsonl');
       if (jsonlPath !== this.dbPath && await fileExists(jsonlPath)) {
         console.error(`DETECTED: Found ${jsonlPath}, will migrate to SQLite`);
-        // JsonlStore.init() is a no-op, but we call it for interface consistency
-        const jsonlStore = new JsonlStore(jsonlPath);
-        await jsonlStore.init();
-        migrationData = await jsonlStore.readGraph();
-        await jsonlStore.close();
+        // readJsonlGraph is the retirement-era parser (jsonl-reader.ts) — a plain
+        // file read into a KnowledgeGraph, no store lifecycle to open/close.
+        migrationData = await readJsonlGraph(jsonlPath);
       }
     }
 
@@ -1290,10 +1288,7 @@ export class SqliteStore implements GraphStore {
         const jsonlPath = this.dbPath.replace(/\.(db|sqlite)$/, '.jsonl');
         if (jsonlPath !== this.dbPath && await fileExists(jsonlPath)) {
           console.error(`DETECTED: Empty database with ${jsonlPath} present — recovering from interrupted migration`);
-          const jsonlStore = new JsonlStore(jsonlPath);
-          await jsonlStore.init();
-          migrationData = await jsonlStore.readGraph();
-          await jsonlStore.close();
+          migrationData = await readJsonlGraph(jsonlPath);
         }
       }
     }
@@ -1466,7 +1461,7 @@ export class SqliteStore implements GraphStore {
    * is called after migration). The universal embedding sweep catches all un-embedded
    * observations after the model is ready, regardless of how they were created.
    *
-   * @param graph - KnowledgeGraph loaded from the JSONL file by JsonlStore.readGraph()
+   * @param graph - KnowledgeGraph loaded from the JSONL file by readJsonlGraph()
    */
 
   /**
@@ -1644,7 +1639,7 @@ export class SqliteStore implements GraphStore {
         }
         validNormalizedNames.add(normalizedName);
         for (const obs of entity.observations) {
-          // obs is already a normalized Observation object (JsonlStore.readGraph() calls normalizeObservation).
+          // obs is already a normalized Observation object (readJsonlGraph() calls normalizeObservation).
           // Read metadata fields with defaults for legacy JSONL data that predates v1.1.
           insertObs.run(row.id, obs.content, obs.createdAt, obs.importance ?? 3.0, obs.contextLayer ?? null, obs.memoryType ?? null, 'fedora', obs.summary ?? null);
         }

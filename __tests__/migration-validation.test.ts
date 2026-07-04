@@ -10,7 +10,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { JsonlStore } from '../jsonl-store.js';
+import { writeJsonlFixture } from './helpers/write-jsonl.js';
+import { readJsonlGraph } from '../jsonl-reader.js';
 import { SqliteStore } from '../sqlite-store.js';
 import { ENTITY_TIMESTAMP_SENTINEL } from '../types.js';
 
@@ -34,36 +35,26 @@ describe('Migration safety validation', () => {
     jsonlPath = path.join(testDir, `test-full-migrate-${id}.jsonl`);
     dbPath = path.join(testDir, `test-full-migrate-${id}.db`);
 
-    // Seed JSONL with entities covering all variants
-    const jsonlStore = new JsonlStore(jsonlPath);
-    await jsonlStore.init();
-
-    // 1. Modern entity with project, timestamps, and multiple observations
-    await jsonlStore.createEntities(
-      [{ name: 'ModernEntity', entityType: 'test', observations: ['obs1', 'obs2', 'obs3'] }],
-      'my-project'
-    );
-
-    // 2. Global entity (no project)
-    await jsonlStore.createEntities([
-      { name: 'GlobalEntity', entityType: 'global', observations: ['global obs'] },
-    ]);
-
-    // 3. Entity with no observations
-    await jsonlStore.createEntities(
-      [{ name: 'EmptyEntity', entityType: 'empty', observations: [] }],
-      'my-project'
-    );
-
-    // 4. Relations between entities
-    await jsonlStore.createRelations([
+    // Seed JSONL with entities covering all variants. Explicit timestamps stand
+    // in for what JsonlStore.createEntities used to stamp (now() at write time);
+    // fixing them keeps the field-by-field timestamp assertions deterministic.
+    const ts = '2026-01-15T12:00:00.000Z';
+    const obj = (content: string) => ({ content, createdAt: ts, importance: 3.0, contextLayer: null, memoryType: null, sourceInstance: 'unknown' });
+    await writeJsonlFixture(jsonlPath, [
+      // 1. Modern entity with project, timestamps, and multiple observations
+      { name: 'ModernEntity', entityType: 'test', observations: [obj('obs1'), obj('obs2'), obj('obs3')], project: 'my-project', updatedAt: ts, createdAt: ts },
+      // 2. Global entity (no project)
+      { name: 'GlobalEntity', entityType: 'global', observations: [obj('global obs')], project: null, updatedAt: ts, createdAt: ts },
+      // 3. Entity with no observations
+      { name: 'EmptyEntity', entityType: 'empty', observations: [], project: 'my-project', updatedAt: ts, createdAt: ts },
+    ], [
+      // 4. Relations between entities
       { from: 'ModernEntity', to: 'GlobalEntity', relationType: 'references' },
       { from: 'GlobalEntity', to: 'EmptyEntity', relationType: 'related_to' },
     ]);
 
-    // Read JSONL data for comparison
-    const originalGraph = await jsonlStore.readGraph();
-    await jsonlStore.close();
+    // Read the fixture through the same parser the migration uses, for comparison
+    const originalGraph = await readJsonlGraph(jsonlPath);
 
     // Migrate to SQLite
     const sqliteStore = new SqliteStore(dbPath);
@@ -296,12 +287,9 @@ describe('Migration safety validation', () => {
     dbPath = path.join(testDir, `test-post-migrate-ops-${id}.db`);
 
     // Seed JSONL
-    const jsonlStore = new JsonlStore(jsonlPath);
-    await jsonlStore.init();
-    await jsonlStore.createEntities([
+    await writeJsonlFixture(jsonlPath, [
       { name: 'Alice', entityType: 'person', observations: ['original obs'] },
     ]);
-    await jsonlStore.close();
 
     // Migrate to SQLite
     const sqliteStore = new SqliteStore(dbPath);
@@ -356,12 +344,9 @@ describe('Migration safety validation', () => {
     dbPath = path.join(testDir, `test-crash-recovery-${id}.db`);
 
     // Seed JSONL
-    const jsonlStore = new JsonlStore(jsonlPath);
-    await jsonlStore.init();
-    await jsonlStore.createEntities([
+    await writeJsonlFixture(jsonlPath, [
       { name: 'Alice', entityType: 'test', observations: ['data'] },
     ]);
-    await jsonlStore.close();
 
     // First migration (normal)
     const sqliteStore1 = new SqliteStore(dbPath);
@@ -393,12 +378,9 @@ describe('Migration safety validation', () => {
     dbPath = path.join(testDir, `test-empty-db-recovery-${id}.db`);
 
     // Seed JSONL with real data
-    const jsonlStore = new JsonlStore(jsonlPath);
-    await jsonlStore.init();
-    await jsonlStore.createEntities([
+    await writeJsonlFixture(jsonlPath, [
       { name: 'Recovered', entityType: 'test', observations: ['important data'] },
     ]);
-    await jsonlStore.close();
 
     // Simulate crash: create an empty .db file with schema but no data.
     // This is what happens if the process dies after new Database() + CREATE TABLE

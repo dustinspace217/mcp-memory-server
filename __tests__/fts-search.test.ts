@@ -18,7 +18,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import { SqliteStore } from '../sqlite-store.js';
-import { JsonlStore } from '../jsonl-store.js';
 
 // Resolve the directory containing this test file, used for temp file paths.
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -544,7 +543,7 @@ describe('findPrecedents rerank degraded path', () => {
 	it('vectors off + rerank requested → empty precedents, flags set, rerankApplied ABSENT', async () => {
 		// rerank cannot apply without a cosine candidate set to rerank — the
 		// degraded path must not claim it ran (absent, not false: same optional-
-		// flag convention as rankingDegraded/rankingUnavailable).
+		// flag convention as rankingDegraded).
 		await store.createEntities([
 			{ name: 'PrecEnt', entityType: 'test', observations: ['a decision precedent about caching'] },
 		]);
@@ -686,74 +685,5 @@ describe('FTS triggers under raw-SQL observation writes', () => {
 		expect(recency.entities).toHaveLength(0);
 		const relevance = await store.searchNodes('evicted', undefined, { limit: 10 }, undefined, undefined, 'relevance');
 		expect(relevance.entities).toHaveLength(0);
-	});
-});
-
-// ── JSONL backend: relevance gracefully degrades to recency + flag ────────────
-
-describe('JSONL relevance fallback', () => {
-	it('returns recency order with rankingUnavailable flag', async () => {
-		const jsonlPath = path.join(testDir, `test-fts-jsonl-${Date.now()}.jsonl`);
-		const jstore = new JsonlStore(jsonlPath);
-		try {
-			await jstore.init();
-			await jstore.createEntities([
-				{ name: 'JsonlEnt', entityType: 'test', observations: ['vector search note'] },
-			]);
-			const res = await jstore.searchNodes('vector search', undefined, { limit: 10 }, undefined, undefined, 'relevance');
-			expect(res.entities.map(e => e.name)).toContain('JsonlEnt');
-			expect(res.rankingUnavailable).toBe(true);
-		} finally {
-			try { await fs.unlink(jsonlPath); } catch { /* ok */ }
-		}
-	});
-
-	it('ambiguity guard: JSONL stores verbatim when two file-resident spellings share a key', async () => {
-		// Parity pin for the SQLite raw-SQL ambiguity test: JSONL's ambiguity
-		// branch is reachable via pre-C2 file contents — write the two spellings
-		// directly into the .jsonl (the file IS the store), then create a third
-		// variant through the API.
-		const jsonlPath = path.join(testDir, `test-fts-jsonl-ambig-${Date.now()}.jsonl`);
-		const jstore = new JsonlStore(jsonlPath);
-		try {
-			await jstore.init();
-			await jstore.createEntities([
-				{ name: 'J1', entityType: 'test', observations: [] },
-				{ name: 'J2', entityType: 'test', observations: [] },
-				{ name: 'J3', entityType: 'test', observations: [] },
-				{ name: 'J4', entityType: 'test', observations: [] },
-			]);
-			const lines = [
-				JSON.stringify({ type: 'relation', from: 'J1', to: 'J2', relationType: 'wired_to', createdAt: '2026-06-01T00:00:00.000Z', supersededAt: '' }),
-				JSON.stringify({ type: 'relation', from: 'J2', to: 'J3', relationType: 'Wired-To', createdAt: '2026-06-01T00:00:00.000Z', supersededAt: '' }),
-				// Superseded same-key spelling: must NOT seed or poison the map —
-				// jsonl-store's map build skips superseded rows, mirroring SQLite's
-				// WHERE superseded_at = '' (cross-exam #85 refinement pin).
-				JSON.stringify({ type: 'relation', from: 'J1', to: 'J3', relationType: 'WIRED_TO', createdAt: '2026-06-01T00:00:00.000Z', supersededAt: '2026-06-02T00:00:00.000Z' }),
-			];
-			await fs.appendFile(jsonlPath, lines.join('\n') + '\n');
-			const created = await jstore.createRelations([
-				{ from: 'J3', to: 'J4', relationType: 'WIRED TO' },
-			]);
-			expect(created[0].relationType).toBe('WIRED TO'); // ambiguous → verbatim, same as SQLite
-		} finally {
-			try { await fs.unlink(jsonlPath); } catch { /* ok */ }
-		}
-	});
-
-	it('rejects cursor + relevance (contract mirrors the SQLite guard)', async () => {
-		// Even though JSONL's fallback is recency (which paginates fine), the
-		// cursor+relevance combination must behave identically across backends —
-		// otherwise caller behavior silently depends on store configuration.
-		const jsonlPath = path.join(testDir, `test-fts-jsonl-guard-${Date.now()}.jsonl`);
-		const jstore = new JsonlStore(jsonlPath);
-		try {
-			await jstore.init();
-			await expect(
-				jstore.searchNodes('anything', undefined, { limit: 1, cursor: 'x' }, undefined, undefined, 'relevance')
-			).rejects.toThrow(/relevance/);
-		} finally {
-			try { await fs.unlink(jsonlPath); } catch { /* ok */ }
-		}
 	});
 });

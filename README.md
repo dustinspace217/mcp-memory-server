@@ -23,7 +23,7 @@ This project is derived from [`@modelcontextprotocol/server-memory`](https://git
 - **Four-tier eviction** — Active → Superseded → Tombstoned → Hard-deleted degradation chain with 6-month LRU shield and configurable size cap (default 1 GB)
 - **Cursor-based pagination** — sorted by most-recently-updated, stable under concurrent use
 - **Project scoping** — optional `projectId` parameter isolates entities by project
-- **Auto-migration** — upgrades from JSONL to SQLite automatically on first run
+- **Auto-migration** — an existing JSONL file is upgraded to SQLite automatically on first run (the JSONL backend itself was retired in v1.6.0)
 
 ## Installation
 
@@ -69,7 +69,7 @@ Add to your MCP server configuration:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MEMORY_FILE_PATH` | `memory.db` (alongside script) | Path to database file. Extension determines backend: `.db`/`.sqlite` → SQLite, `.jsonl` → JSONL |
+| `MEMORY_FILE_PATH` | `memory.db` (alongside script) | Path to the SQLite database file (`.db`/`.sqlite`). A `.jsonl` path is accepted only for one-time migration: an existing file is upgraded into the sibling `.db`; a nonexistent one errors (the JSONL backend was retired in v1.6.0) |
 | `MEMORY_VECTOR_SEARCH` | `on` | Set to `off` to disable vector search entirely |
 | `MEMORY_SIZE_CAP_BYTES` | `1000000000` (1 GB) | Database size cap for the eviction system. Eviction triggers at 90% of cap |
 | `MEMORY_EMBED_MODEL` | `Xenova/all-MiniLM-L6-v2` | Embedding model ID. Switching models requires a restart; stale vectors are cleared and re-embedded automatically |
@@ -134,14 +134,14 @@ Vector search is automatic when using the SQLite backend:
 
 SQLite is the default and recommended backend. Features: WAL mode, FK constraints, database-level deduplication, vector search, temporal versioning, schema migrations.
 
-### JSONL (deprecated)
+### JSONL (retired in v1.6.0)
 
-The JSONL backend is maintained for environments without C build tools but does not support vector search, `as_of` queries, entity soft-delete, `entity_timeline`, `set_observation_metadata`, `invalidate_relations`, or eviction. Set `MEMORY_FILE_PATH` to a `.jsonl` path to use it.
+The JSONL flat-file backend was deprecated since v1.0.0 and removed in v1.6.0. SQLite is now the only live backend. The one-time upgrade path remains: point `MEMORY_FILE_PATH` at an existing `.jsonl` file (or keep the same path across the upgrade) and the server migrates it into SQLite once. A `.jsonl` path with no file behind it errors, since there is nothing to migrate.
 
 ### Migration from JSONL
 
-1. Change `MEMORY_FILE_PATH` to a `.db` path (or remove it to use the default)
-2. On first run, the server auto-migrates data from the `.jsonl` file
+1. Change `MEMORY_FILE_PATH` to a `.db` path (or point it at your existing `.jsonl` — the server redirects to the sibling `.db`)
+2. On first run, the server auto-migrates data from the `.jsonl` file into SQLite in a single transaction
 3. The original JSONL file is renamed to `.jsonl.bak`
 
 ## Known Limitations

@@ -27,10 +27,25 @@ describe('ensureMemoryFilePath', () => {
   });
 
   describe('with MEMORY_FILE_PATH environment variable', () => {
-    it('should return JSONL config for .jsonl extension', async () => {
-      process.env.MEMORY_FILE_PATH = '/tmp/custom-memory.jsonl';
-      const config = await ensureMemoryFilePath();
-      expect(config).toEqual({ path: '/tmp/custom-memory.jsonl', storeType: 'jsonl' });
+    // v1.6.0 retired the JSONL backend. A .jsonl path with NO file behind it has
+    // nothing to migrate, so it's now a hard error rather than a live-JSONL config.
+    it('should throw the retirement error for a .jsonl path with no file to migrate', async () => {
+      process.env.MEMORY_FILE_PATH = '/tmp/does-not-exist-memory.jsonl';
+      await expect(ensureMemoryFilePath()).rejects.toThrow(/retired in v1\.6\.0/);
+    });
+
+    // A .jsonl path that DOES exist is honored as a one-time upgrade: the config
+    // points at the sibling .db, and SqliteStore.init() migrates the .jsonl into it.
+    it('should redirect an existing .jsonl to the sibling .db (SQLite migration path)', async () => {
+      const existingJsonl = path.join(testDir, `retire-existing-${Date.now()}.jsonl`);
+      await fs.writeFile(existingJsonl, JSON.stringify({ type: 'entity', name: 'X', entityType: 't', observations: [] }) + '\n');
+      try {
+        process.env.MEMORY_FILE_PATH = existingJsonl;
+        const config = await ensureMemoryFilePath();
+        expect(config).toEqual({ path: existingJsonl.replace(/\.jsonl$/, '.db'), storeType: 'sqlite' });
+      } finally {
+        await fs.unlink(existingJsonl).catch(() => {});
+      }
     });
 
     it('should return SQLite config for .db extension', async () => {
@@ -46,11 +61,11 @@ describe('ensureMemoryFilePath', () => {
     });
 
     it('should resolve relative paths against script directory', async () => {
-      process.env.MEMORY_FILE_PATH = 'custom-memory.jsonl';
+      process.env.MEMORY_FILE_PATH = 'custom-memory.db';
       const config = await ensureMemoryFilePath();
       expect(path.isAbsolute(config.path)).toBe(true);
-      expect(config.path).toContain('custom-memory.jsonl');
-      expect(config.storeType).toBe('jsonl');
+      expect(config.path).toContain('custom-memory.db');
+      expect(config.storeType).toBe('sqlite');
     });
 
     it('should throw on unrecognized file extension', async () => {
@@ -76,15 +91,24 @@ describe('ensureMemoryFilePath', () => {
     });
   });
 
-  describe('legacy .json to .jsonl migration', () => {
-    it('should migrate memory.json to memory.jsonl when using default JSONL path', async () => {
+  // The legacy memory.json -> memory.jsonl rename is the FIRST hop of the upgrade
+  // chain (json -> jsonl -> db). Post-v1.6.0 the rename still runs, then the
+  // now-existing .jsonl redirects to the sibling .db for SQLite to migrate.
+  describe('legacy .json to .jsonl to .db upgrade chain', () => {
+    afterEach(async () => {
+      try { await fs.unlink(path.join(testDir, '..', 'memory.db')); } catch { /* ignore */ }
+    });
+
+    it('should rename memory.json to memory.jsonl and hand back the sibling .db config', async () => {
       process.env.MEMORY_FILE_PATH = path.join(testDir, '..', 'memory.jsonl');
       await fs.writeFile(oldMemoryPath, '{"test":"data"}');
 
       const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
       const config = await ensureMemoryFilePath();
 
-      expect(config.storeType).toBe('jsonl');
+      // The renamed .jsonl now exists, so the config points at the sibling .db.
+      expect(config.storeType).toBe('sqlite');
+      expect(config.path).toMatch(/memory\.db$/);
       const newExists = await fs.access(jsonlMemoryPath).then(() => true).catch(() => false);
       const oldExists = await fs.access(oldMemoryPath).then(() => true).catch(() => false);
       expect(newExists).toBe(true);
@@ -93,7 +117,7 @@ describe('ensureMemoryFilePath', () => {
       consoleErrorSpy.mockRestore();
     });
 
-    it('should preserve content during migration', async () => {
+    it('should preserve content during the json to jsonl rename', async () => {
       process.env.MEMORY_FILE_PATH = path.join(testDir, '..', 'memory.jsonl');
       const testContent = '{"entities": [{"name": "test"}]}';
       await fs.writeFile(oldMemoryPath, testContent);

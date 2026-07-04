@@ -20,10 +20,10 @@
  * client unmodified (mcp.js validates then `return result`; the parse's
  * stripped copy is discarded). So "delete a declaration and the key vanishes
  * from responses" is FALSE; what deleting a declaration DOES change is the
- * tools/list-advertised outputSchema JSON. The schema-drift guards in cases
- * (a) and (c) therefore assert against tools/list, and the end-to-end
- * structuredContent assertions pin the handler WIRING (store → handler →
- * client), not stripping behavior.
+ * tools/list-advertised outputSchema JSON. The schema-drift guard in case (a)
+ * therefore asserts against tools/list, and the end-to-end structuredContent
+ * assertions pin the handler WIRING (store → handler → client), not stripping
+ * behavior.
  *
  * HOW: index.ts exports a TEST-ONLY seam, wireForTesting(store), that points
  * the module-level `store` at a test instance and returns the already-registered
@@ -51,8 +51,8 @@ import type { GraphStore } from '../types.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 
-// Sidecar suffixes SQLite leaves next to the .db (WAL/SHM) and JSONL leaves as
-// a temp file — the same cleanup set knowledge-graph.test.ts uses.
+// Sidecar suffixes SQLite leaves next to the .db (WAL/SHM); '.tmp' is a harmless
+// defensive leftover — the same cleanup set knowledge-graph.test.ts uses.
 const SIDECARS = ['', '.tmp', '-wal', '-shm'];
 async function unlinkAll(basePath: string): Promise<void> {
 	for (const suffix of SIDECARS) {
@@ -256,48 +256,9 @@ describe('in-process McpServer harness (Issue #81)', () => {
 		expect(entry!.hint).toBe(validSummary);
 	});
 
-	// ------------------------------------------------------------------
-	// (c) rankingUnavailable: declared in the advertised schema AND set by JSONL
-	// ------------------------------------------------------------------
-	// JSONL cannot rank (no FTS index), so orderBy:'relevance' falls back to recency
-	// and sets rankingUnavailable:true. Two pins, same split as case (a):
-	// (1) DECLARATION GUARD — the flag must appear in search_nodes' advertised
-	// outputSchema, because that JSON is what a client discovers the field through
-	// (dropping the declaration would NOT strip it from responses, but it would
-	// erase it from the contract). (2) WIRING — the JSONL fallback actually sets it.
-	it('(c) declares rankingUnavailable and surfaces it from a JSONL store under orderBy relevance', async () => {
-		// (1) Declaration guard against tools/list.
-		const tools = await client.listTools();
-		const sn = tools.tools.find((t) => t.name === 'search_nodes');
-		expect(sn).toBeDefined();
-		const snProps = (sn!.outputSchema as { properties?: Record<string, unknown> })?.properties ?? {};
-		expect('rankingUnavailable' in snProps).toBe(true);
-		// This case needs a JSONL store, so it wires its own (the beforeEach SQLite
-		// store stays assigned and is still closed by afterEach). The JSONL store is
-		// closed and cleaned up here in a finally.
-		const jsonlPath = path.join(testDir, `harness-jsonl-${Date.now()}.jsonl`);
-		const jstore = new mod.JsonlStore(jsonlPath);
-		try {
-			await jstore.init();
-			mod.wireForTesting(jstore);
-			await jstore.createEntities([
-				{ name: 'Note', entityType: 'topic', observations: ['searchable content'] },
-			]);
-
-			const res = await client.callTool({
-				name: 'search_nodes',
-				arguments: { query: 'searchable', orderBy: 'relevance' },
-			});
-			const sc = res.structuredContent as { rankingUnavailable?: boolean };
-			expect(sc.rankingUnavailable).toBe(true);
-		} finally {
-			await jstore.close();
-			await unlinkAll(jsonlPath);
-			// Re-point at the per-test SQLite store so afterEach's close is coherent
-			// (defensive — beforeEach re-wires anyway before the next test).
-			mod.wireForTesting(store);
-		}
-	});
+	// (Case (c) — rankingUnavailable surfaced from a JSONL store — was removed in
+	// the v1.6.0 JSONL retirement: the backend and the flag both no longer exist.
+	// Case (a) still covers the tools/list declaration-guard pattern.)
 
 	// ------------------------------------------------------------------
 	// (d) read_graph relation contract fields survive; unset validFrom is absent
