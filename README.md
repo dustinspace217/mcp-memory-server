@@ -9,13 +9,14 @@ This project is derived from [`@modelcontextprotocol/server-memory`](https://git
 ## Features
 
 - **SQLite storage** with WAL mode, foreign key constraints, and database-level deduplication
-- **Semantic vector search** via sqlite-vec + all-MiniLM-L6-v2 ONNX embeddings (automatic, no config needed)
+- **Semantic vector search** via sqlite-vec + local ONNX embeddings (384-dim; `all-MiniLM-L6-v2` by default, swappable via `MEMORY_EMBED_MODEL`)
+- **Relevance-ranked search** — `search_nodes` with `orderBy: 'relevance'` fuses LIKE, BM25 full-text, vector, and activation signals via reciprocal-rank fusion
 - **Temporal versioning** — observations and relations track `superseded_at` timestamps; old data is preserved for history but hidden from active queries
 - **Point-in-time queries** — `as_of` parameter on read/search operations recovers the graph state at any past timestamp
 - **Entity soft-delete** — `delete_entities` marks entities as superseded (preserving history) rather than hard-deleting
 - **Entity name normalization** — surface variants like `Dustin-Space`, `dustin/space`, and `DUSTIN SPACE` all resolve to the same identity key
-- **Observation metadata** — `importance` (1-5 scale), `context_layer` (L0/L1/null), and `memory_type` classification on observations
-- **Context layers** — `get_context_layers` returns L0 (always-loaded rules) and L1 (session-start context) observations with token budgets
+- **Observation metadata** — `importance` (1-5 scale), `context_layer` (L0/L1/null), `memory_type` classification, and caller-supplied valid-time (`validFrom`/`validUntil`) on observations
+- **Context layers** — `get_context_layers` returns L0 (always-loaded rules) and a two-tier L1 (session-start context): a featured tier of full text plus a per-entity breadcrumb index for the overflow, both under char budgets
 - **Session-start briefing** — `get_summary` returns top observations by importance, recently updated entities, and aggregate stats
 - **Entity timeline** — view full change history (active + superseded + tombstoned observations and relations)
 - **Similarity detection** — `add_observations` warns when new observations are semantically similar to existing ones
@@ -71,6 +72,12 @@ Add to your MCP server configuration:
 | `MEMORY_FILE_PATH` | `memory.db` (alongside script) | Path to database file. Extension determines backend: `.db`/`.sqlite` → SQLite, `.jsonl` → JSONL |
 | `MEMORY_VECTOR_SEARCH` | `on` | Set to `off` to disable vector search entirely |
 | `MEMORY_SIZE_CAP_BYTES` | `1000000000` (1 GB) | Database size cap for the eviction system. Eviction triggers at 90% of cap |
+| `MEMORY_EMBED_MODEL` | `Xenova/all-MiniLM-L6-v2` | Embedding model ID. Switching models requires a restart; stale vectors are cleared and re-embedded automatically |
+| `MEMORY_EMBED_POOLING` | `mean` | Pooling strategy (`mean` or `cls`). Must match the configured model — a mismatch is a silent cosine drift |
+| `MEMORY_EMBED_QUERY_PREFIX` | `` (empty) | Instruction prefix applied to query-side embeddings only (for asymmetric retrieval models) |
+| `MEMORY_SIMILAR_THRESHOLD` | `0.85` | Cosine gate for the `add_observations` similarity warning. Model-geometry-coupled — recalibrate when changing models |
+| `MEMORY_DUPLICATE_THRESHOLD` | `0.80` | Cosine gate for `check_duplicates` |
+| `MEMORY_PRECEDENT_FLOOR` | `0.25` | Minimum cosine for `find_precedents` results |
 
 ## Tools
 
@@ -84,14 +91,17 @@ Add to your MCP server configuration:
 | `delete_relations` | Delete relations between entities | `relations[]` (from, to, relationType) |
 | `supersede_observations` | Atomically retire old observations and insert replacements. Preserves history | `supersessions[]` (entityName, oldContent, newContent) |
 | `invalidate_relations` | Mark relations as no longer active. Preserves history. Idempotent | `relations[]` (from, to, relationType) |
-| `set_observation_metadata` | Update importance, context layer, and/or memory type on existing observations in-place | `updates[]` (entityName, content, importance?, contextLayer?, memoryType?) |
+| `set_observation_metadata` | Update importance, context layer, memory type, valid-time, and/or summary on existing observations in-place | `updates[]` (entityName, content, importance?, contextLayer?, memoryType?, validFrom?, validUntil?, summary?) |
 | `read_graph` | Read the knowledge graph (paginated, sorted by most recently updated) | `projectId?`, `asOf?`, `cursor?`, `limit?` |
-| `search_nodes` | Search entities by name, type, or observation content. LIKE + semantic vector search | `query`, `projectId?`, `asOf?`, `cursor?`, `limit?` |
+| `search_nodes` | Search entities by name, type, or observation content. LIKE + semantic vector search; optional relevance ranking | `query`, `projectId?`, `memoryType?`, `orderBy?`, `asOf?`, `cursor?`, `limit?` |
 | `open_nodes` | Retrieve specific entities by name with full relations | `names[]`, `projectId?`, `asOf?` |
+| `check_duplicates` | Pre-write semantic duplicate check — embeds candidates and reports similar existing observations without writing | `candidates[]` (entityName, content) |
+| `get_connected_context` | Bounded multi-hop graph traversal from a seed entity. Structure-only, with directed-cycle detection | `seedEntity`, `maxHops?`, `direction?`, `maxNodes?`, `relationTypes?`, `projectId?`, `asOf?` |
+| `find_precedents` | Similarity-ranked observation retrieval — the most semantically similar prior observations to a query, scored | `query`, `projectId?`, `memoryType?`, `limit?`, `minSimilarity?` |
 | `list_projects` | List all project names in the knowledge graph | — |
 | `entity_timeline` | Full change history for an entity (active + superseded + tombstoned items) | `entityName`, `projectId?` |
-| `get_context_layers` | Returns L0/L1 observations sorted by importance with token budgets | `projectId?`, `layers?` |
-| `get_summary` | Session-start briefing: top observations, recent entities, aggregate stats | `projectId?`, `excludeContextLayers?`, `limit?` |
+| `get_context_layers` | Returns L0/L1 observations sorted by importance with token budgets (two-tier L1: featured text + breadcrumb index) | `projectId?`, `layers?` |
+| `get_summary` | Session-start briefing: top observations, recent entities, aggregate stats | `projectId?`, `excludeContextLayers?`, `limit?`, `memoryType?` |
 
 ## Data Model
 
@@ -112,7 +122,7 @@ Observations, relations, and entities support a four-tier lifecycle:
 ## Vector Search
 
 Vector search is automatic when using the SQLite backend:
-- Uses `sqlite-vec` (brute-force KNN) with `all-MiniLM-L6-v2` ONNX embeddings (384 dimensions)
+- Uses `sqlite-vec` (brute-force KNN) with local ONNX embeddings (384 dimensions; `all-MiniLM-L6-v2` by default, configurable via `MEMORY_EMBED_MODEL`)
 - Model downloads ~23MB on first startup (cached thereafter)
 - LIKE substring search always runs; vector search adds supplementary semantic matches
 - Set `MEMORY_VECTOR_SEARCH=off` to disable
@@ -138,7 +148,7 @@ The JSONL backend is maintained for environments without C build tools but does 
 
 - **Entity names are globally unique** across all projects (relations use names as FK)
 - **Project filtering is advisory**, not a security boundary
-- **Paginated relation coverage is incomplete** — use `open_nodes` for full relations on specific entities
+- **Paginated relations use either-endpoint semantics** — each page carries every relation touching one of its entities (the partner may be on another page; it's a name — `open_nodes` it for content). The deduped union across all pages is the complete active relation set
 - **Vector search is best-effort** — degrades to LIKE-only if model/extension unavailable
 - **vec0 is brute-force KNN** — fine at current scale, consider ANN at ~50,000+ observations
 - **Context layers and memory types are caller-managed** — the server stores them but does not auto-classify
@@ -148,13 +158,13 @@ See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation and the full 
 ## Development
 
 ```bash
-npm test           # run tests (520 tests across 9 test files)
+npm test           # run tests (723 non-vector tests across 16 files, plus the opt-in vector-integration suite)
 npm run test:watch # run tests in watch mode
 npm run build      # compile TypeScript
 npm run watch      # compile in watch mode
 ```
 
-Set `SKIP_VECTOR_INTEGRATION=1` to skip the vector integration tests (which download the embedding model) for faster CI runs.
+Set `SKIP_VECTOR_INTEGRATION=1` to skip the vector integration tests (which load the embedding model) for faster CI runs. The vector-integration suite should be run single-fork (it loads a real ONNX model) — see `MEMORY_VECTOR_SEARCH`/`SKIP_VECTOR_INTEGRATION` and the test-pool notes in CLAUDE.md.
 
 ## License
 

@@ -50,7 +50,7 @@
           {
             "type": "command",
             "command": "bash $HOME/.claude/hooks/pre-compact-agent.sh",
-            "timeout": 300
+            "timeout": 480
           }
         ]
       }

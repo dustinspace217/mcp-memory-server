@@ -37,9 +37,9 @@
 #                                merges additively (doesn't replace user hooks). The hooks fire but
 #                                agent-type hooks fail harmlessly in -p mode. Cosmetic log noise only.
 #   permissions.deny           — restricts Bash to read-only commands (compensates for --dangerously-skip-permissions)
-#   CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 — forces extended thinking on every step; prevents
-#                                the model from skipping reasoning on "simple" consolidation steps
-#   MAX_THINKING_TOKENS=128000 — full thinking budget for deep reasoning about observation quality
+#   (CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING + MAX_THINKING_TOKENS were removed
+#    2026-07-04: inert on Opus 4.8+, which ignores both — pending cleanup since
+#    the 2026-06-05 checkpoint. effortLevel xhigh is the live thinking knob.)
 
 set -euo pipefail
 
