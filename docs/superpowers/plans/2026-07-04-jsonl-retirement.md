@@ -6,10 +6,13 @@
 > parameterized test suite. Decision surfaced in the v1.5.0 close-out review of
 > project-wide open questions; Dustin ruled retire.
 
-## Status (updated 2026-07-04, ~04:55 PDT)
-Phase: 1 of 2 (implementation — Opus builder dispatched with the DECIDED spec below)
-Done: decision recorded; scope ruled by the goal hierarchy (see Decisions)
-Next: builder report -> head verification (diff read + both test pools) -> slim QA pair -> v1.6.0 bump -> commit
+## Status (updated 2026-07-04, ~05:35 PDT)
+Phase: COMPLETE — v1.6.0 shipped (3e214ee implementation, 56b3570 QA round + bump)
+Done: JsonlStore deleted (-1,314 net lines); jsonl-reader.ts upgrade path live-probed
+  end-to-end; both QA verdicts SHIP; the QA round's new fixture test found + fixed a
+  REAL pre-existing migrateFromJsonl defect (relation created_at/superseded_at dropped
+  → superseded relations resurrected as active). 540 tests / 18 files, both pools green.
+Next: Discussion thread post (Phase B replies pending), then nothing.
 Blocked: nothing
 
 ## Decisions (settled — do not relitigate)
@@ -48,4 +51,25 @@ Blocked: nothing
    History v1.6.0 entry), README.
 
 ## Deviation log
-(appended at close)
+
+1. **Builder kept the describe.each scaffolding** (other, minimal-diff call): single-entry
+   array + ~45 now-permanently-false `ext === 'jsonl'` guards left verbatim rather than
+   flattening ~48 test bodies. Accepted; but THREE guards were INVERTED (`!==`) and became
+   vacuous green tests — QA (test-analyzer MEDIUM) caught them; deleted in 56b3570.
+2. **migration-validation.test.ts touched though not in the spec's list** (scope-change,
+   forced): it imported JsonlStore for fixture seeding; the builder flagged rather than
+   hid it. Correct call — a direct consequence of the delete.
+3. **The QA round found a real pre-existing defect the retirement exposed** (fix, from
+   review): the TA's LOW ("no fixture feeds a relation with serialized temporal fields")
+   was implemented as a test and immediately failed — `migrateFromJsonl`'s insertRel
+   dropped relation `created_at`/`superseded_at` (the #87 fix added only valid-time), so
+   a superseded relation in a real .jsonl RESURRECTED as active on migration. Fixed +
+   pinned (no-resurrection assertion) in 56b3570. Note for the review record: the CR's
+   Phase A had rated migration losslessness "verified sound" — its trace covered the
+   reader's branches and the entity/observation defaults but not the relation INSERT's
+   column list; the empirical test beat the trace, again (the night's recurring theme).
+4. **Head-agent additions beyond the spec** (scope, small): five stale "SDK strips
+   undeclared keys" comments in index.ts corrected during diff verification (same false
+   premise the sweep QA killed; pre-dated the builder), and an end-to-end live probe of
+   the composed upgrade path (legacy fixture → sibling .db → migrate → .bak → retirement
+   throw) run through the compiled dist before commit.
