@@ -6,7 +6,7 @@
 Phase: pre-implementation (spec written; NO code yet on these items)
 Approved to BUILD (Dustin 2026-06-04): **#1 semantic-NN suggester, #3 FTS5 search, #4 provenance/verify, #5 retrieval-strengthening.**
 Deferred (do eventually): **#6 relation rationale + valid-time.**
-Pending decision: **#2 automatic capture** (mechanism specced below; Dustin evaluating "is the 3rd capture mechanism + per-session cost worth it?").
+Pending decision: NONE — **#2 automatic capture** CLOSED UNADOPTED (Dustin, 2026-07-04). Rationale: the Stop-hook checkpoint already gives mechanical mid-session triggering with in-context authorship (the fidelity Phase-7 showed transcript extraction cannot match); the retry queue (v1.3.1) replays killed saves; Pass D/E closed the classification/orphan gaps. Auto-capture's residual coverage — backfilling the ≤10-turn un-checkpointed tail of an abruptly-killed session, at transcript fidelity — did not justify a third writer + per-session cost. Reopening condition: a recurring, NAMED class of lost mechanical detail that checkpoints + retry queue + lifecycle hooks all miss. The spec below stays as the build recipe if that day comes.
 Resolved this session: **#7 Phase-6 decay = stay deferred, evidence-based** (freshness flags ~1.3% stale ≪ the 20% trigger; see Evidence below).
 Suggested build order (by size/independence): **#3 → #5 → #4 → #1.** (#3/#4/#5 are mcp-memory-server server code; #1 is the viewer + needs embedding access.)
 Next: pick the first item; write its own focused implementation sub-plan if it exceeds ~100 lines or trips the Architect scope-audit triggers (CLAUDE.md).
