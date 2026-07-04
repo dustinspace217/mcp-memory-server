@@ -284,6 +284,25 @@ const server = new McpServer({
   version: "1.4.0",
 });
 
+/**
+ * TEST-ONLY seam (Issue #81): wires a store into the module-level handlers and
+ * returns the already-registered McpServer so an in-process harness can drive
+ * the REAL tools through the REAL Zod schemas over a linked InMemoryTransport.
+ * Production entry (main) never calls this; it assigns `store` directly.
+ *
+ * Why a seam at all: every tool handler below closes over the module-level
+ * `store` (line 81) and is registered at import time. The only way to exercise
+ * those exact handlers -- and the SDK's output-schema validation, which STRIPS
+ * any response key not declared in outputSchema -- is to point `store` at a
+ * test instance and connect the same `server`. Returning `server` (rather than
+ * re-creating one) is deliberate: the tools are bound to THIS instance, so the
+ * harness must connect this one.
+ */
+export function wireForTesting(s: GraphStore): McpServer {
+  store = s;
+  return server;
+}
+
 server.registerTool(
   "create_entities",
   {
@@ -975,10 +994,16 @@ async function main() {
   console.error("Knowledge Graph MCP Server running on stdio");
 }
 
-main().catch((error) => {
-  console.error("Fatal error in main():", error);
-  process.exit(1);
-});
+// Guard the entry-point call so tests can `import` this module for the
+// wireForTesting() seam without booting stdio + opening the default DB.
+// MEMORY_SKIP_MAIN=1 (set by the in-process harness before import) skips main;
+// unset -- the production case -- runs main exactly as before (byte-identical).
+if (process.env.MEMORY_SKIP_MAIN !== '1') {
+  main().catch((error) => {
+    console.error("Fatal error in main():", error);
+    process.exit(1);
+  });
+}
 
 // Graceful shutdown: signal the embedding sweep to stop, then close the database
 // to release SQLite file locks and flush WAL. Without this, -wal and -shm sidecar
