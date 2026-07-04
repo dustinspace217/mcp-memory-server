@@ -6,11 +6,14 @@
 > model-economy directive: Fable specs/verifies/decides, Opus implements; specs are
 > DECIDED — implementation agents do not relitigate them.
 
-## Status (updated 2026-07-04, ~02:15 PDT)
-Phase: starting — triage locked, live-data probe for #59 done (0 Cf chars, 0 collisions
-  → v17 re-normalization is a verified no-op on this deployment).
-Done: worklist + skip-list decided (below).
-Next: #59 (Opus build), then #81 harness, #79/#80, polish items, sweep QA, close-out.
+## Status (updated 2026-07-04, ~04:15 PDT)
+Phase: COMPLETE — all 8 worklist items + the DEF-RR-04 stretch item shipped; v1.5.0.
+Done: commits 9f9a4ad (#81), b762e19 (#59/v17), e736287 (#79+#80), 9c34fee (#20 audit
+  + polish), f95bcc9 (DEF-RR-04 — 3 real races found+fixed), 3b07cb6 (docs+version),
+  a7ef977 (sweep-QA fixes). Issues #59/#79/#80/#81/#20 closed. QA thread: Discussion #90.
+  741 tests / 18 files green (Pool 1 726 + Pool 2 15).
+Next: nothing in this plan — deploy note: live memory.db is already v16+granite from an
+  earlier 2026-07-04 session; the next server restart applies only v17 (verified no-op).
 Blocked: nothing.
 
 ## Worklist (in order)
@@ -55,4 +58,65 @@ Blocked: nothing.
   open-by-design conditions unmet.
 
 ## Deviation log
-(appended per item at close)
+Classified per the Post-Phase Deviation Summary convention.
+
+1. **#80 design flipped mid-build: per-call resolver, not a cached constant**
+   (behavioral-change, deliberate). The plan said "single shared cached constant";
+   shipped `resolveSourceInstance()` reads the env PER CALL. Reason: a module-level
+   const freezes at import time, which breaks `vi.stubEnv`-based tests without
+   `resetModules` gymnastics and would silently ignore an env change on a long-lived
+   process. Per-call cost is one string read; the tests pin the per-call behavior.
+2. **#20 resolved as an audit, not a build** (scope-change, honest-premise). All 8
+   listed functions already carried JSDoc after intervening refactors; the assigned
+   Opus agent correctly refused to invent work and said so. Shipped the adjacent real
+   gap instead (README currency + harness config hygiene, 9c34fee).
+3. **Item 6 (test-artifact debris) resolved as crash-orphan cleanup** (scope-change,
+   same honest-premise shape). The debris traced to interrupted runs (usage-limit
+   kills), not to tests missing cleanup — every current test has afterEach unlink
+   discipline. Deleted the orphans; no code change warranted.
+4. **DEF-RR-04 stretch item became the night's largest work item** (scope-change,
+   upward). Budgeted as "only if the night allows"; ran three find-fix-rehammer
+   layers: (L1) busy_timeout set after lock-taking pragmas — reordered; (L2) legacy
+   v2–v10 migrations predate the house race rules — full retrofit (IMMEDIATE +
+   in-transaction version re-check + duplicate-tolerant ALTERs + INSERT OR IGNORE
+   version seeding with authoritative re-read); (L3) delete→WAL journal-mode
+   conversion bypasses the busy handler (SQLITE_BUSY immediate, ~13%/run residual) —
+   bounded 20×100ms retry. 48 consecutive races clean after L3. Three prior
+   trace-based review lenses had cleared all three — the empirical harness earned
+   its cost in one night.
+5. **Sweep QA corrected a build-time premise the head agent had propagated**
+   (behavioral-change, from review). The #81 harness was built on opus-81's claim
+   that the SDK strips undeclared structuredContent keys; qa-sweep-ta's HIGH said
+   false, and an SDK source read + empirical InMemoryTransport probe CONFIRMED the
+   TA (validateToolOutput throws-on-failure but forwards the original result
+   unmodified). Cases (a)/(c) were re-anchored on the tools/list-advertised
+   outputSchema (a7ef977); the false claim was also scrubbed from CLAUDE.md and the
+   test header now documents the verified behavior. Note the propagation path: the
+   head agent verified opus-81's TESTS passed but not its stated MECHANISM — agent
+   claims about runtime behavior need the same one-probe check as my own.
+6. **Transient Opus dispatch failure** (other). One opus-race dispatch died on a
+   "temporarily unavailable" classifier error; retried after a delay, succeeded.
+   No work lost.
+
+## Appendix: Deferments originated in this sweep
+
+- **DEF-SW-01** — Found by: qa-sweep-ta (MEDIUM). Commit: a7ef977 (decision).
+  Defer target: indefinite (next race-harness touch). Severity: MEDIUM.
+  What: the race suite covers only fresh-DB starts; racing two instances over an
+  EXISTING v10/v14 DB through 10→17 (the Issue-#78 deployment shape) is untested.
+  Why deferred: the fresh-DB race traverses the same v2–v17 chain including every
+  retrofit mechanism; the marginal interleaving differs but the mechanisms under
+  test are identical, and seeding a mid-version fixture into the child-process
+  harness is real plumbing. Fix direction: third race case seeding a v10 DB
+  (reuse migration-validation's fixture builders), then two children.
+  Obsolescence: any migration-chain rewrite that drops the legacy blocks.
+- **DEF-SW-02** — Found by: qa-sweep-ta (LOW-MEDIUM, residual half). Commit: a7ef977.
+  Defer target: indefinite. Severity: LOW.
+  What: the WAL-retry loop's error-classification branch (non-"database is locked"
+  rethrow; 20-attempt cap) has no deterministic pin — only the ~13-20%/run
+  probabilistic race coverage. The busy_timeout=5000 half WAS pinned (a7ef977).
+  Why deferred: a deterministic pin needs fault injection into better-sqlite3's
+  pragma call; disproportionate for a bounded loop whose failure mode is loud.
+  Fix direction: injectable pragma wrapper or a mock-Database seam, if the loop
+  ever grows. Obsolescence: better-sqlite3 routing journal-mode conversion
+  through the busy handler (upstream change).
