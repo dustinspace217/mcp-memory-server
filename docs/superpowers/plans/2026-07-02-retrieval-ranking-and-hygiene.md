@@ -29,11 +29,11 @@ Blocked: nothing.
 |---|---|---|---|
 | DEF-RR-01 | MED | as_of_valid query filtering | OPEN by design (record-only valid time; build on demonstrated query need) |
 | DEF-RR-03 | LOW | access_count as eviction signal | OPEN indefinite (comment-only note at the v12 migration) |
-| DEF-RR-04 | LOW | Two-connection migration race test | OPEN indefinite (child-process harness; IMMEDIATE fix verified by trace ×3 lenses) |
 
 ### Resolved
 | ID | Resolution |
 |---|---|
+| DEF-RR-04 | **RESOLVED 2026-07-04** (commit f95bcc9, overnight sweep): the child-process race harness was built — and vindicated the deferment's own caution about trace-only verification: three review lenses had cleared the chain by trace, yet the harness found THREE real production-reachable races on its first runs (busy_timeout ordering, legacy v2–v10 migration race intolerance, delete→WAL conversion bypassing the busy handler). All fixed; 48 consecutive races clean. |
 | DEF-RR-02 | **CLOSED as NO-GO** (2026-07-02 blind panel): rerank-on won 3/18 against rerank-off (12 outright losses, 2 judge-ties, 1 structural tie) — the graph-aware fusion HURT blind-judged relevance, not merely failed to help. Default stays `false` permanently under the current fusion weights; the param remains available for experimentation. Any future re-attempt needs a redesigned fusion (weights/seeding), a fresh panel, and should treat 3/18 as the baseline to beat. Panel: 18 standing queries (phase2_prep set), 3 blinded judges, sides seeded-random, keys sequestered. |
 
 ## Phase G RESULTS + gate outcomes (2026-07-02 afternoon — both gates run on Dustin's go)
@@ -187,7 +187,7 @@ strict order; harness Phase D touches only `~/.claude/hooks/` prompt files.
 | DEF-RR-01 | MED | `as_of_valid` query filtering on valid-time fields | when a real query need appears | open (by design, spec §8.3) |
 | DEF-RR-02 | MED | Flip `rerank` default after blind gate | Phase E gate | open |
 | DEF-RR-03 | LOW | `access_count` as eviction-tier signal | indefinite | open (comment-only note) |
-| DEF-RR-04 | LOW | Two-connection migration race test (child-process harness) | indefinite | open (Phase A QA #9) |
+| DEF-RR-04 | LOW | Two-connection migration race test (child-process harness) | indefinite | RESOLVED 2026-07-04 (f95bcc9 — harness found + fixed 3 real races; see final register) |
 
 ---
 
