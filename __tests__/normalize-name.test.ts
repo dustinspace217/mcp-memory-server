@@ -65,6 +65,64 @@ describe('normalizeEntityName', () => {
     });
   });
 
+  describe('Unicode Format (Cf) character stripping (Issue #59)', () => {
+    // Format (Cf) characters render as nothing but are distinct code points.
+    // Text pasted from the web, Slack, or PDFs routinely carries a stray one,
+    // so 'foo\u200Bbar' and 'foobar' would otherwise become separate identity
+    // keys that look identical -- invisible duplicate entities. The normalizer
+    // strips the whole Cf category to collapse those back to one key.
+    //
+    // These tests use \u escape sequences rather than literal invisible
+    // characters ON PURPOSE: a literal zero-width char in the source would be
+    // unreviewable and an editor could silently strip it -- exactly the class
+    // of bug under test.
+    it('strips zero-width space (U+200B)', () => {
+      expect(normalizeEntityName('foo\u200Bbar')).toBe('foobar');
+    });
+
+    it('strips zero-width non-joiner (U+200C)', () => {
+      expect(normalizeEntityName('foo\u200Cbar')).toBe('foobar');
+    });
+
+    it('strips zero-width joiner (U+200D)', () => {
+      expect(normalizeEntityName('foo\u200Dbar')).toBe('foobar');
+    });
+
+    it('strips BOM / zero-width no-break space (U+FEFF)', () => {
+      expect(normalizeEntityName('foo\uFEFFbar')).toBe('foobar');
+    });
+
+    it('strips soft hyphen (U+00AD)', () => {
+      expect(normalizeEntityName('foo\u00ADbar')).toBe('foobar');
+    });
+
+    it('strips word joiner (U+2060)', () => {
+      expect(normalizeEntityName('foo\u2060bar')).toBe('foobar');
+    });
+
+    it('strips a mix of Cf characters and separators in one pass', () => {
+      // The Cf strip runs before the separator strip, so both are removed
+      // regardless of how they interleave.
+      expect(normalizeEntityName('Dustin\u200B-\uFEFFSpace')).toBe('dustinspace');
+    });
+
+    it('throws when a name is entirely Cf characters', () => {
+      // U+200B is NOT ECMAScript whitespace, so it survives String.trim() and
+      // reaches the Cf strip non-empty; it empties there, and the existing
+      // "no content after normalization" guard rejects it (no new check needed).
+      expect(() => normalizeEntityName('\u200B\uFEFF')).toThrow();
+    });
+
+    it('still strips char(31) (C0) -- the traversal-delimiter guarantee is unregressed', () => {
+      // The Cf strip is ADDITIVE: the separator class still removes the whole
+      // C0 control range, so char(31) (the getConnectedContext path delimiter)
+      // can never enter a normalized name. Pinned so a future refactor of the
+      // strip steps can't silently drop the C0 guarantee.
+      expect(normalizeEntityName('A\x1FB')).toBe('ab');
+      expect(() => normalizeEntityName('\x1F\x01')).toThrow();
+    });
+  });
+
   describe('whitespace trimming', () => {
     it('trims leading and trailing whitespace', () => {
       expect(normalizeEntityName('  foo  ')).toBe('foo');

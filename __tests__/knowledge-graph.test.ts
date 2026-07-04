@@ -3923,7 +3923,8 @@ describe('SqliteStore-specific', () => {
 			// v14 added valid_from/valid_until (bi-temporal valid time) to observations + relations.
 			// v15 added vec_config (single-row embedding-model identity guard).
 			// v16 added summary (nullable) to observations for the two-tier L1 index (§13).
-			expect(row!.version).toBe(16);
+			// v17 recomputed normalized_name to strip Unicode Format (Cf) chars (Issue #59).
+			expect(row!.version).toBe(17);
 		});
 	});
 
@@ -5147,6 +5148,31 @@ describe('SqliteStore-specific', () => {
 			expect(result.skipped).toHaveLength(1);
 			// First write wins on display form.
 			expect(result.created[0].name).toBe(precomposed);
+		});
+
+		it('zero-width Cf characters collapse to the same identity (Issue #59)', async () => {
+			// 'Widget\u200BFactory' (a stray zero-width space, as pasted from the
+			// web) and 'WidgetFactory' render identically. Before #59 they became
+			// two entities; now the Cf strip collapses them to one identity key,
+			// so the second create is reported as a skipped duplicate and any
+			// clean-name lookup resolves the original. The \u200B escape is used
+			// rather than a literal invisible char so the source stays reviewable.
+			const result = await store.createEntities([
+				{ name: 'Widget\u200BFactory', entityType: 'component', observations: ['first'] },
+				{ name: 'WidgetFactory', entityType: 'component', observations: ['second'] },
+			]);
+
+			// The second collapses onto the first — one created, one skipped.
+			expect(result.created).toHaveLength(1);
+			expect(result.created[0].name).toBe('Widget\u200BFactory');
+			expect(result.skipped).toHaveLength(1);
+			expect(result.skipped[0].existingName).toBe('Widget\u200BFactory');
+
+			// A clean-name lookup finds the single entity (the observation from
+			// the skipped duplicate is dropped — first write wins on identity).
+			const graph = await store.openNodes(['WidgetFactory']);
+			expect(graph.entities).toHaveLength(1);
+			expect(graph.entities[0].observations.map(o => o.content)).toEqual(['first']);
 		});
 	});
 

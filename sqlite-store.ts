@@ -258,6 +258,14 @@ export class SqliteStore implements GraphStore {
     //       (Layer 1 entity name normalization — collapses surface variants under one identity)
     //   9 = added tombstoned_at + last_accessed_at for eviction (§12)
     //  10 = added source_instance to observations for multi-machine tracking
+    //  11 = added obs_fts FTS5 index over observation content + sync triggers
+    //  12 = added access_count to entities (retrieval strengthening)
+    //  13 = normalized drifted relation-type spellings (explicit reviewed map)
+    //  14 = added valid_from/valid_until (bi-temporal valid time) to observations + relations
+    //  15 = added vec_config (single-row embedding-model identity guard)
+    //  16 = added summary (nullable) to observations for the two-tier L1 index (§13)
+    //  17 = recomputed normalized_name to strip Unicode Format (Cf) chars,
+    //       collapsing invisible zero-width duplicate entities (Issue #59)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_version (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1003,6 +1011,121 @@ export class SqliteStore implements GraphStore {
         this.db.prepare('UPDATE schema_version SET version = 16').run();
       }).immediate();
       currentVersion = 16;
+    }
+
+    if (currentVersion < 17) {
+      // Migration 16 → 17: strip Unicode Format (Cf) characters from stored
+      // identity keys (Issue #59).
+      //
+      // Before this, normalizeEntityName did not strip the Cf category, so an
+      // entity name carrying an invisible zero-width character ('foo​bar',
+      // as routinely pasted from the web / Slack / PDFs) produced a
+      // normalized_name that RETAINED the char — a distinct identity key that
+      // renders identically to the clean name. Result: silent duplicate
+      // entities. normalizeEntityName now strips \p{Cf}; this migration brings
+      // existing stored keys into line with the new rule.
+      //
+      // Live-deployment note: a 2026-07-04 probe of the origin corpus found
+      // ZERO Cf characters and ZERO would-be collisions, so this migration is a
+      // verified no-op there. It exists to correct arbitrary data and is tested
+      // for the non-no-op case (migration-validation.test.ts).
+      //
+      // Two rewrites, both computed in JS (SQLite has no \p{Cf} regex):
+      //   1. entities.normalized_name — recomputed from the DISPLAY name via
+      //      normalizeEntityName(name), so it picks up the new Cf strip (and is
+      //      otherwise idempotent). UPDATE only rows whose key actually changed.
+      //   2. relations.from_entity / to_entity — these store normalized KEYS,
+      //      not display names, so recomputation = applying just the Cf strip
+      //      to the stored key. That yields exactly the same value as the
+      //      entity recompute (the two normalizers differ ONLY in Cf handling by
+      //      this version), so endpoints keep resolving to their entity.
+      //
+      // Collision guard (v7→v8 precedent): if two ACTIVE rows recompute to the
+      // same key, the server refuses to start rather than silently merge two
+      // entities. The error names both display forms and the colliding key so
+      // the operator can rename/soft-delete one and retry. Superseded rows are
+      // recomputed too (for read consistency) but excluded from the collision
+      // check — the partial unique index only constrains active rows.
+      //
+      // withForeignKeysDisabled wrapper (same as v7→v8, and for the same reason):
+      // rewriting relations.from_entity / to_entity trips "foreign key mismatch"
+      // when the relations table still carries an inline REFERENCES entities(name)
+      // clause. That clause is created by the fresh-DB base schema and dropped by
+      // the v6→v7 rebuild, but a database can reach a later version with the stale
+      // FK still attached (the v6→v7 comment documents the historical paths), and
+      // entities.name has only a PARTIAL unique index — not a valid FK target — so
+      // ANY write to relations under foreign_keys=ON raises the mismatch. Empirically
+      // confirmed on the fresh-DB init path (an earlier "no wrapper needed" version
+      // of this migration failed there). Turning FKs off for the rewrite is safe:
+      // both sides (entity keys and relation endpoints) get the SAME Cf strip, so no
+      // endpoint is orphaned. The pragma toggles OUTSIDE the transaction (SQLite
+      // ignores it mid-transaction), so the IMMEDIATE transaction lives inside fn.
+      const stripCf = (s: string): string => s.replace(/\p{Cf}/gu, '');
+      this.withForeignKeysDisabled(() => {
+      this.db.transaction(() => {
+        // In-transaction version re-check: a racing instance that already ran
+        // v17 leaves version at 17, so this one skips the recompute entirely
+        // (house migration rule since v11 — see the v11 comment for the
+        // SQLITE_BUSY_SNAPSHOT rationale on racing instances).
+        const v = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+        if (v >= 17) return;
+
+        // Recompute keys for every row up front (active + superseded).
+        const allEntities = this.db.prepare(
+          `SELECT id, name, normalized_name, superseded_at FROM entities`
+        ).all() as { id: number; name: string; normalized_name: string; superseded_at: string }[];
+
+        // Collision check on ACTIVE rows BEFORE any write: group active rows by
+        // their recomputed key and flag any key that more than one row maps to.
+        const activeByKey = new Map<string, string[]>();
+        for (const row of allEntities) {
+          if (row.superseded_at !== '') continue;
+          // normalizeEntityName throws on a name that strips to empty (e.g. an
+          // all-Cf name). That aborts the transaction with a clean error rather
+          // than writing a meaningless key — an all-Cf entity has no resolvable
+          // identity, so failing loudly is correct.
+          const key = normalizeEntityName(row.name);
+          const bucket = activeByKey.get(key);
+          if (bucket) bucket.push(row.name);
+          else activeByKey.set(key, [row.name]);
+        }
+        const collisions = [...activeByKey.entries()].filter(([, names]) => names.length > 1);
+        if (collisions.length > 0) {
+          const lines = collisions.map(([key, names]) =>
+            `  - [${names.map(n => `"${n}"`).join(', ')}] all normalize to "${key}"`
+          );
+          throw new Error(
+            `v16→v17 migration aborted: ${collisions.length} entity name collision(s) detected after Cf stripping.\n` +
+            `Resolve manually before retrying (rename or soft-delete one of each pair).\n` +
+            lines.join('\n')
+          );
+        }
+
+        // Rewrite entity keys that changed. Every row (active + superseded) is
+        // recomputed from its DISPLAY name via normalizeEntityName, which now
+        // strips Cf; the collision-checked active keys were already computed
+        // above, but recomputing is cheap and keeps one code path.
+        const updateEntity = this.db.prepare(`UPDATE entities SET normalized_name = ? WHERE id = ?`);
+        for (const row of allEntities) {
+          const key = normalizeEntityName(row.name);
+          if (key !== row.normalized_name) updateEntity.run(key, row.id);
+        }
+
+        // Rewrite relation endpoints that changed (strip Cf from the stored key).
+        const allRelations = this.db.prepare(
+          `SELECT id, from_entity, to_entity FROM relations`
+        ).all() as { id: number; from_entity: string; to_entity: string }[];
+        const updateRelation = this.db.prepare(`UPDATE relations SET from_entity = ?, to_entity = ? WHERE id = ?`);
+        for (const rel of allRelations) {
+          const from = stripCf(rel.from_entity);
+          const to = stripCf(rel.to_entity);
+          if (from !== rel.from_entity || to !== rel.to_entity) updateRelation.run(from, to, rel.id);
+        }
+
+        this.db.prepare('UPDATE schema_version SET version = 17').run();
+      }).immediate();
+      });
+      currentVersion = 17;
     }
 
     // === Indexes (idempotent, run on every startup) ===

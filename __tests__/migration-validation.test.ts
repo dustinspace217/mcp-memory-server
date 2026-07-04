@@ -1357,4 +1357,194 @@ describe('Migration safety validation', () => {
     db2.close();
     await sqliteStore.close();
   });
+
+  it('should migrate v16 → v17: strip zero-width Cf chars from normalized_name + rewrite relation endpoints', async () => {
+    // Builds a v10 database (migrations run sequentially through 11..17, the
+    // same run-the-chain approach as the v12→v13 test above) seeded with a
+    // pre-#59 invisible-dupe hazard: an entity whose DISPLAY name carries a
+    // zero-width space and whose stored normalized_name RETAINS it (the old
+    // normalizer did not strip the Cf category). A relation references that
+    // entity by its stale key. The v17 migration must:
+    //   - recompute normalized_name so the Cf char is gone
+    //   - rewrite the relation endpoint to the cleaned key so it still resolves
+    //   - leave a clean-name lookup ('ZebraProject') finding the one entity
+    //
+    // The \u200B escape is used instead of a literal invisible char so the
+    // fixture stays reviewable (a literal one is exactly the #59 hazard).
+    const staleKey = 'zebra\u200Bproject';   // old-normalizer output: ZWSP survived
+    const cleanKey = 'zebraproject';          // v17-normalizer output: ZWSP stripped
+
+    const id = Date.now();
+    dbPath = path.join(testDir, `test-v16-to-v17-${id}.db`);
+    jsonlPath = path.join(testDir, `nonexistent-${id}.jsonl`); // not used, just for cleanup
+
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+
+    db.prepare(`CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL)`).run();
+    db.prepare(`INSERT INTO schema_version (id, version) VALUES (1, 10)`).run();
+    db.prepare(`CREATE TABLE entities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      project TEXT,
+      updated_at TEXT NOT NULL DEFAULT '0000-00-00T00:00:00.000Z',
+      created_at TEXT NOT NULL DEFAULT '0000-00-00T00:00:00.000Z',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      normalized_name TEXT NOT NULL DEFAULT '',
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      last_accessed_at TEXT NOT NULL DEFAULT ''
+    )`).run();
+    db.prepare(`CREATE TABLE observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      superseded_at TEXT NOT NULL DEFAULT '',
+      importance REAL NOT NULL DEFAULT 3.0,
+      context_layer TEXT,
+      memory_type TEXT,
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      source_instance TEXT NOT NULL DEFAULT 'unknown',
+      UNIQUE(entity_id, content, superseded_at)
+    )`).run();
+    db.prepare(`CREATE TABLE relations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_entity TEXT NOT NULL,
+      to_entity TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT '',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      UNIQUE(from_entity, to_entity, relation_type, superseded_at)
+    )`).run();
+
+    const ts = '2026-07-04T12:00:00.000Z';
+    // The Cf-carrying entity, stored with the stale (ZWSP-retaining) key.
+    db.prepare(`INSERT INTO entities (name, entity_type, updated_at, created_at, normalized_name) VALUES (?, ?, ?, ?, ?)`).run(
+      'Zebra\u200BProject', 'project', ts, ts, staleKey
+    );
+    // A clean second entity to be the relation's other endpoint.
+    db.prepare(`INSERT INTO entities (name, entity_type, updated_at, created_at, normalized_name) VALUES (?, ?, ?, ?, ?)`).run(
+      'target', 'concept', ts, ts, 'target'
+    );
+    const zebraId = (db.prepare(`SELECT id FROM entities WHERE name = ?`).get('Zebra\u200BProject') as { id: number }).id;
+    db.prepare(`INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)`).run(zebraId, 'zebra obs', ts);
+    // Relation stored with the STALE endpoint key (what the old store wrote).
+    db.prepare(`INSERT INTO relations (from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)`).run(
+      staleKey, 'target', 'references', ts
+    );
+    db.close();
+
+    const sqliteStore = new SqliteStore(dbPath);
+    await sqliteStore.init();
+
+    const db2 = new Database(dbPath, { readonly: true });
+    const version = (db2.prepare(`SELECT version FROM schema_version`).get() as { version: number }).version;
+    expect(version).toBeGreaterThanOrEqual(17);
+
+    // normalized_name no longer carries the Cf char.
+    const zebraRow = db2.prepare(`SELECT normalized_name FROM entities WHERE name = ?`).get('Zebra\u200BProject') as { normalized_name: string };
+    expect(zebraRow.normalized_name).toBe(cleanKey);
+    expect(zebraRow.normalized_name).not.toContain('\u200B');
+
+    // The relation endpoint was rewritten to the cleaned key.
+    const rel = db2.prepare(`SELECT from_entity, to_entity FROM relations`).get() as { from_entity: string; to_entity: string };
+    expect(rel.from_entity).toBe(cleanKey);
+    expect(rel.to_entity).toBe('target');
+    db2.close();
+
+    // A clean-name lookup (no zero-width char) now resolves the entity, and
+    // the relation comes back in display form via the COALESCE translation.
+    const graph = await sqliteStore.openNodes(['ZebraProject', 'target']);
+    const names = graph.entities.map(e => e.name).sort();
+    expect(names).toEqual(['Zebra\u200BProject', 'target']);
+    expect(graph.relations).toHaveLength(1);
+    expect(graph.relations[0].from).toBe('Zebra\u200BProject');
+    expect(graph.relations[0].to).toBe('target');
+
+    await sqliteStore.close();
+  });
+
+  it('should abort v16 → v17 migration when two active entities collide after Cf stripping', async () => {
+    // Two ACTIVE entities that are distinct under the OLD normalizer (their
+    // stored keys differ only by a zero-width space) but collapse to the SAME
+    // key once v17 strips Cf. The migration must abort with a structured error
+    // naming both display forms and the colliding key — the server refuses to
+    // start on ambiguous data rather than silently merging (v7→v8 precedent).
+    const id = Date.now();
+    dbPath = path.join(testDir, `test-v16-to-v17-collision-${id}.db`);
+    jsonlPath = path.join(testDir, `nonexistent-${id}.jsonl`); // not used, just for cleanup
+
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+
+    db.prepare(`CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL)`).run();
+    db.prepare(`INSERT INTO schema_version (id, version) VALUES (1, 10)`).run();
+    db.prepare(`CREATE TABLE entities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      project TEXT,
+      updated_at TEXT NOT NULL DEFAULT '0000-00-00T00:00:00.000Z',
+      created_at TEXT NOT NULL DEFAULT '0000-00-00T00:00:00.000Z',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      normalized_name TEXT NOT NULL DEFAULT '',
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      last_accessed_at TEXT NOT NULL DEFAULT ''
+    )`).run();
+    db.prepare(`CREATE TABLE observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      superseded_at TEXT NOT NULL DEFAULT '',
+      importance REAL NOT NULL DEFAULT 3.0,
+      context_layer TEXT,
+      memory_type TEXT,
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      source_instance TEXT NOT NULL DEFAULT 'unknown',
+      UNIQUE(entity_id, content, superseded_at)
+    )`).run();
+    db.prepare(`CREATE TABLE relations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_entity TEXT NOT NULL,
+      to_entity TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT '',
+      superseded_at TEXT NOT NULL DEFAULT '',
+      tombstoned_at TEXT NOT NULL DEFAULT '',
+      UNIQUE(from_entity, to_entity, relation_type, superseded_at)
+    )`).run();
+
+    const ts = '2026-07-04T12:00:00.000Z';
+    // Both active; stale keys 'zebra' and 'zebra\u200B' are distinct under the
+    // old partial unique index but both strip to 'zebra' under v17.
+    db.prepare(`INSERT INTO entities (name, entity_type, updated_at, created_at, normalized_name) VALUES (?, ?, ?, ?, ?)`).run(
+      'zebra', 'concept', ts, ts, 'zebra'
+    );
+    db.prepare(`INSERT INTO entities (name, entity_type, updated_at, created_at, normalized_name) VALUES (?, ?, ?, ?, ?)`).run(
+      'Zebra\u200B', 'concept', ts, ts, 'zebra\u200B'
+    );
+    db.close();
+
+    const sqliteStore = new SqliteStore(dbPath);
+    await expect(sqliteStore.init()).rejects.toThrow(/collision/i);
+    // Error names both display forms and the key they collapse to.
+    await expect(sqliteStore.init()).rejects.toThrow(/zebra/i);
+
+    // v17 rolled back: schema_version did NOT advance to 17 and the stale
+    // (distinct) normalized_names are untouched. Migrations 11..16 legitimately
+    // ran and committed, so the version sits at 16.
+    const db3 = new Database(dbPath, { readonly: true });
+    const version = (db3.prepare(`SELECT version FROM schema_version`).get() as { version: number }).version;
+    expect(version).toBe(16);
+    const keys = db3.prepare(`SELECT normalized_name FROM entities ORDER BY id`).all() as { normalized_name: string }[];
+    expect(keys.map(k => k.normalized_name)).toEqual(['zebra', 'zebra\u200B']);
+    db3.close();
+
+    try { await sqliteStore.close(); } catch { /* ignore */ }
+  });
 });
