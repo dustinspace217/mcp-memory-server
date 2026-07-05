@@ -6,12 +6,17 @@
 > lacks entirely; (2) item #4 of the 2026-06-05 plan (provenance), approved 2026-06-04
 > and discovered this morning to have silently never shipped.
 
-## Status (updated 2026-07-05, ~04:45 PDT)
-Phase: 1 of 3 (Architect scope audit running; plan drafted pending its verdict)
-Done: design decided (below); Architect dispatched with the verbatim template
-Next: verdict → adjust if needed → Opus builder (decided spec) → head verification
-  (diff read + both pools + live-probe of trigger firing) → slim QA pair → Discussion
-  → v1.7.0 bump
+## Status (updated 2026-07-05, ~15:00 PDT)
+Phase: COMPLETE — v1.7.0 shipped (0f6e7ee implementation, fbe9bd6 QA round + bump)
+Done: both features live on main; Architect SHIP (verify tool cut → DEF-PM-02 per
+  Dustin); QA Discussion #92 (both verdicts SHIP, zero code defects; three TA
+  coverage MEDIUMs closed by BUILT fixtures — none exposed a latent bug this time,
+  because the #91-style round-trip guard was already in the diff). 557 tests / 18
+  files, both pools green. DEPLOY STAGED: MEMORY_TRIGGER_THRESHOLD=0.84
+  (percentile-held granite recalibration, this morning's run) added to the live
+  registration env — next natural server restart brings up v1.7.0 + v18 + gate.
+Next: Dustin to approve the proposed Session Protocol line (workspace CLAUDE.md)
+  so sessions actually CALL check_prospective_triggers; nothing else open.
 Blocked: nothing
 
 ## Feature 1 — Prospective memory (schema v18, part A)
@@ -94,4 +99,26 @@ contract; real firing test in Pool 2 vector-integration), harness declaration pi
 the new tools' schemas.
 
 ## Deviation log
-(appended at close)
+
+1. **verify tool cut mid-plan** (scope-change, Architect FLAG → Dustin ruling):
+   documented in Feature 2 above; DEF-PM-02.
+2. **Builder's degrade-flag clarification** (behavioral-clarification, accepted):
+   checkProspectiveTriggers reports vectorSearchEnabled:false whenever the CALL
+   can't run vector matching (model loading/failed, not just configured-off) —
+   the honest reading of the single-flag degrade shape; matches the Pool 1 test.
+3. **QA round: three check-side coverage MEDIUMs** (fix, from review): the scope
+   clause, threshold param, and vec_triggers guard-clear each had zero firing
+   coverage. All three fixtures BUILT (fbe9bd6, the #91 rule) with positive
+   controls; unlike #91, none exposed a latent defect — the source_ref round-trip
+   guard #91 taught us to demand was already in the implementation diff.
+4. **Accepted-deferred, named home** (other): the fire transaction's DEFERRED
+   read-then-write shape (CR minor) is pre-existing across every mutation method;
+   both reviewers concur its failure mode is a safe throw and that the DEF-RR-04
+   child-process harness is the only substrate that could ever pin it. Not a
+   register entry — recorded here as the named home if multi-checker contention
+   ever appears in practice.
+5. **Trigger-threshold recalibration ran at deploy-prep, not in the build**
+   (planned): percentile-held mapping (MiniLM 0.50 ≈ p97-99 of query↔top-k
+   cosines → granite ≈0.84) from scripts/recalibrate-thresholds.py distributions
+   on a backup-DB copy; 0.84 written to the live registration env by the head
+   agent. Builder never touched live config (per spec).
