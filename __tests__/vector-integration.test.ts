@@ -413,6 +413,13 @@ describe('Vector search integration', () => {
       await store1.createEntities([
         { name: 'GuardAnchor', entityType: 'test', observations: ['anchor observation for the vec guard'] },
       ]);
+      // A REAL pending trigger to anchor a fake vec_triggers row — same
+      // anti-vacuity logic as GuardAnchor above: the startup orphan cleanup
+      // deletes vec rows for non-pending ids even without the guard, so only
+      // a row anchored to a genuine pending trigger proves the guard's
+      // vec_triggers DELETE ran (v1.7.0 QA finding: this clear was untested).
+      const guardTrigger = await store1.setProspectiveTrigger(
+        'guard-test trigger condition', 'guard-test payload');
       store1.shutdown();
       await store1.close();
 
@@ -425,11 +432,15 @@ describe('Vector search integration', () => {
         const obsId = (db.prepare(`SELECT id FROM observations WHERE content = ?`)
           .get('anchor observation for the vec guard') as { id: number }).id;
         db.prepare(`DELETE FROM vec_observations`).run(); // drop any sweep-written rows for determinism
+        db.prepare(`DELETE FROM vec_triggers`).run();     // same, for the trigger index
         const fake = new Float32Array(384).fill(0.5);
         db.prepare(`INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)`)
           .run(Buffer.from(fake.buffer), String(obsId));
+        db.prepare(`INSERT INTO vec_triggers (embedding, trigger_id) VALUES (?, ?)`)
+          .run(Buffer.from(fake.buffer), String(guardTrigger.id));
         db.prepare(`UPDATE vec_config SET model_name = 'fake/old-model' WHERE id = 1`).run();
         expect((db.prepare('SELECT count(*) AS n FROM vec_observations').get() as { n: number }).n).toBe(1);
+        expect((db.prepare('SELECT count(*) AS n FROM vec_triggers').get() as { n: number }).n).toBe(1);
       } finally {
         db.close();
       }
@@ -455,6 +466,16 @@ describe('Vector search integration', () => {
         const rows = check.prepare('SELECT embedding FROM vec_observations').all() as { embedding: Buffer }[];
         expect(rows.length).toBeLessThanOrEqual(1);
         for (const r of rows) {
+          const vec = new Float32Array(r.embedding.buffer, r.embedding.byteOffset, 4);
+          expect(vec[0]).not.toBeCloseTo(0.5, 6);
+        }
+        // vec_triggers: same race-proof shape — the stale 0.5-fill fake must be
+        // gone; a row may exist only if the trigger sweep re-embedded (never a
+        // constant fill). The trigger is still PENDING, so nothing but the
+        // guard's DELETE explains the fake's absence.
+        const trigRows = check.prepare('SELECT embedding FROM vec_triggers').all() as { embedding: Buffer }[];
+        expect(trigRows.length).toBeLessThanOrEqual(1);
+        for (const r of trigRows) {
           const vec = new Float32Array(r.embedding.buffer, r.embedding.byteOffset, 4);
           expect(vec[0]).not.toBeCloseTo(0.5, 6);
         }
@@ -524,5 +545,65 @@ describe('Vector search integration', () => {
     expect(pending.map(x => x.id)).not.toContain(t.id);
     const all = await store.listProspectiveTriggers('astro-trigger-proj', true);
     expect(all.find(x => x.id === t.id)!.firedAt).not.toBe('');
+  });
+
+  it('check-side project scoping: a scoped check never fires another project\'s trigger, global still fires', async () => {
+    // v1.7.0 QA finding (test-analyzer MEDIUM): list-scoping was pinned but the
+    // CHECK's scope clause had zero firing coverage — deleting it (firing
+    // proj-b's semantically-close trigger from a proj-a check) passed every
+    // test. This binds both halves of the advisory-scope contract at the FIRE
+    // level: other-project excluded even when semantically close; global
+    // (project NULL) included.
+    const otherProj = await store.setProspectiveTrigger(
+      'when resuming work on the spectrograph focus motor',
+      'other-project payload that must NOT fire',
+      'scope-proj-b',
+    );
+    const globalTrig = await store.setProspectiveTrigger(
+      'when resuming work on the spectrograph focus motor',
+      'global payload that SHOULD fire',
+      // no project → global (NULL), visible to every scoped check
+    );
+    await new Promise(resolve => setTimeout(resolve, 2500)); // fire-and-forget embeds
+
+    // Near-identical context (this test pins SCOPING, not paraphrase quality —
+    // the main firing test owns that; identical wording guarantees the cosine
+    // clears the default gate so the positive control can't flake), checked
+    // from a DIFFERENT project than otherProj's.
+    const res = await store.checkProspectiveTriggers(
+      'resuming work on the spectrograph focus motor', 'scope-proj-a');
+    expect(res.vectorSearchEnabled).toBe(true);
+    const firedIds = res.fired.map(f => f.id);
+    expect(firedIds).not.toContain(otherProj.id); // cross-project fire = scope clause reverted
+    expect(firedIds).toContain(globalTrig.id);    // positive control: global fires, so the
+                                                  // exclusion above can't pass vacuously
+  });
+
+  it('threshold override param gates firing (0.99 blocks what the default fires)', async () => {
+    // v1.7.0 QA finding (test-analyzer MEDIUM): the threshold param had only a
+    // Zod-bounds mirror test — a revert hardcoding the gate to TRIGGER_THRESHOLD
+    // and ignoring the param was invisible. Same trigger, same close context:
+    // an impossibly-high override must NOT fire it; the default then does.
+    const t = await store.setProspectiveTrigger(
+      'when the user next tunes the mount\'s periodic error correction',
+      'threshold-test payload',
+      'thresh-proj',
+    );
+    await new Promise(resolve => setTimeout(resolve, 2500));
+
+    // Near-identical context (pins the THRESHOLD param, not paraphrase quality;
+    // identical wording guarantees the default-gate fire so the 0.99 block
+    // can't pass for the wrong reason).
+    const ctx = 'the user next tunes the mount\'s periodic error correction';
+    // 0.99 exceeds any real MiniLM query<->passage cosine — must not fire, and
+    // must not consume the one-shot.
+    const blocked = await store.checkProspectiveTriggers(ctx, 'thresh-proj', 0.99);
+    expect(blocked.vectorSearchEnabled).toBe(true);
+    expect(blocked.fired.map(f => f.id)).not.toContain(t.id);
+
+    // Default threshold: fires — proving the 0.99 result above came from the
+    // OVERRIDE being honored, not from the pair simply being dissimilar.
+    const fired = await store.checkProspectiveTriggers(ctx, 'thresh-proj');
+    expect(fired.fired.map(f => f.id)).toContain(t.id);
   });
 });

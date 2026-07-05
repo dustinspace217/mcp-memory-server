@@ -322,7 +322,7 @@ const PaginatedOutputSchema = {
 
 const server = new McpServer({
   name: "memory-server",
-  version: "1.6.0",
+  version: "1.7.0",
 });
 
 /**
