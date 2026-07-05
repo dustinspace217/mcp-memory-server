@@ -3478,7 +3478,8 @@ describe('SqliteStore-specific', () => {
 			// v15 added vec_config (single-row embedding-model identity guard).
 			// v16 added summary (nullable) to observations for the two-tier L1 index (§13).
 			// v17 recomputed normalized_name to strip Unicode Format (Cf) chars (Issue #59).
-			expect(row!.version).toBe(17);
+			// v18 added prospective_triggers + source_ref on observations (v1.7.0).
+			expect(row!.version).toBe(18);
 		});
 	});
 
@@ -3557,6 +3558,106 @@ describe('SqliteStore-specific', () => {
 			const superseded = timeline.observations.find(o => o.status === 'superseded')!;
 			expect(active.sourceInstance).toBe('rig-b');      // current writer
 			expect(superseded.sourceInstance).toBe('rig-a');  // original writer preserved
+		});
+	});
+
+	describe('sourceRef provenance (v1.7.0)', () => {
+		it('round-trips a sourceRef through createEntities to readGraph/openNodes', async () => {
+			await store.createEntities(
+				[{ name: 'Traced', entityType: 'thing', observations: ['came from a session'] }],
+				undefined,
+				'session:abc123',
+			);
+			const graph = await store.readGraph();
+			const traced = graph.entities.find(e => e.name === 'Traced')!;
+			expect(traced.observations[0].sourceRef).toBe('session:abc123');
+
+			const opened = await store.openNodes(['Traced']);
+			expect(opened.entities[0].observations[0].sourceRef).toBe('session:abc123');
+		});
+
+		it('round-trips a sourceRef through addObservations', async () => {
+			await store.createEntities([{ name: 'Adder', entityType: 'thing', observations: [] }]);
+			await store.addObservations([{ entityName: 'Adder', contents: ['a provenance-tagged fact'] }], 'url:https://example.com');
+			const graph = await store.readGraph();
+			const adder = graph.entities.find(e => e.name === 'Adder')!;
+			expect(adder.observations[0].sourceRef).toBe('url:https://example.com');
+		});
+
+		it("omits sourceRef entirely when unset (absent, not '')", async () => {
+			await store.createEntities([{ name: 'Plain', entityType: 'thing', observations: ['no provenance'] }]);
+			const graph = await store.readGraph();
+			const plain = graph.entities.find(e => e.name === 'Plain')!;
+			// Key-absence, not empty string — matches the valid-time convention.
+			expect('sourceRef' in plain.observations[0]).toBe(false);
+
+			const timeline = await store.entityTimeline('Plain');
+			expect('sourceRef' in timeline.observations[0]).toBe(false);
+		});
+
+		it('surfaces sourceRef on a supersede replacement via entity_timeline', async () => {
+			await store.createEntities([{ name: 'Rev', entityType: 'thing', observations: ['v1'] }]);
+			await store.supersedeObservations([{ entityName: 'Rev', oldContent: 'v1', newContent: 'v2' }], 'session:rev-2');
+			const timeline = await store.entityTimeline('Rev');
+			const active = timeline.observations.find(o => o.status === 'active')!;
+			expect(active.sourceRef).toBe('session:rev-2');
+			// The superseded row had no sourceRef → still absent.
+			const superseded = timeline.observations.find(o => o.status === 'superseded')!;
+			expect('sourceRef' in superseded).toBe(false);
+		});
+	});
+
+	// Pool 1 (vectors OFF): the DEGRADED-path contract is the tested behavior here.
+	// checkProspectiveTriggers must NOT substring-fall-back and must NOT mark
+	// anything fired without a vector match — real firing is exercised in Pool 2
+	// (vector-integration.test.ts). Everything except the semantic match is tested.
+	describe('prospective triggers — degraded path (v1.7.0)', () => {
+		it('stores a pending trigger that list surfaces, and check degrades without firing', async () => {
+			const t = await store.setProspectiveTrigger('when the astro gallery deploy comes up', 'remember to regenerate DZI tiles', 'dustin-space');
+			expect(t.id).toBeGreaterThan(0);
+			expect(t.firedAt).toBe('');
+
+			// Pending-only list shows it.
+			const pending = await store.listProspectiveTriggers('dustin-space');
+			expect(pending.map(x => x.id)).toContain(t.id);
+
+			// Vectors off → degraded, empty, and DID NOT fire.
+			const res = await store.checkProspectiveTriggers('working on the astro gallery deploy now', 'dustin-space');
+			expect(res).toEqual({ fired: [], vectorSearchEnabled: false });
+
+			// Trigger is still pending (not marked fired by the degraded check).
+			const stillPending = await store.listProspectiveTriggers('dustin-space');
+			expect(stillPending.find(x => x.id === t.id)!.firedAt).toBe('');
+		});
+
+		it('scopes list to project + global', async () => {
+			const g = await store.setProspectiveTrigger('a global condition', 'global payload');            // global
+			const p = await store.setProspectiveTrigger('a project condition', 'project payload', 'proj-a'); // scoped
+			await store.setProspectiveTrigger('another project', 'other payload', 'proj-b');                 // different project
+
+			const scoped = await store.listProspectiveTriggers('proj-a');
+			const ids = scoped.map(x => x.id);
+			expect(ids).toContain(g.id);   // global is visible everywhere
+			expect(ids).toContain(p.id);   // its own project
+			expect(scoped.some(x => x.project === 'proj-b')).toBe(false); // other project excluded
+		});
+
+		it('hard-deletes idempotently, including unknown ids', async () => {
+			const t = await store.setProspectiveTrigger('condition', 'payload');
+			const deleted = await store.deleteProspectiveTriggers([t.id, 999999]);
+			expect(deleted).toBe(1); // only the real one counted
+			// Gone from both pending and includeFired history (hard delete, no soft-retire).
+			const all = await store.listProspectiveTriggers(undefined, true);
+			expect(all.some(x => x.id === t.id)).toBe(false);
+			// Re-deleting is a no-op (idempotent).
+			expect(await store.deleteProspectiveTriggers([t.id])).toBe(0);
+		});
+
+		it('includeFired defaults to pending-only', async () => {
+			const t = await store.setProspectiveTrigger('c', 'p');
+			expect((await store.listProspectiveTriggers()).some(x => x.id === t.id)).toBe(true);
+			// Nothing has fired (degraded), so includeFired:true is a superset here.
+			expect((await store.listProspectiveTriggers(undefined, true)).some(x => x.id === t.id)).toBe(true);
 		});
 	});
 

@@ -336,4 +336,28 @@ describe('in-process McpServer harness (Issue #81)', () => {
 		expect('rerankApplied' in outProps).toBe(false);
 		expect('precedents' in outProps).toBe(true);
 	});
+
+	// (g) prospective-memory tools are advertised (v1.7.0)
+	// ------------------------------------------------------------------
+	// The four new tools must appear in tools/list, and
+	// check_prospective_triggers must DECLARE vectorSearchEnabled in its
+	// advertised outputSchema — that flag is the caller's only signal that an
+	// empty `fired` came from a degraded run rather than "no matches", so it has
+	// to be part of the discovered contract (the SDK does not add undeclared keys
+	// for the client, so an undeclared flag would be invisible at discovery).
+	it('(g) advertises the four prospective-memory tools with their output contracts', async () => {
+		const tools = await client.listTools();
+		const names = tools.tools.map((t) => t.name);
+		for (const n of ['set_prospective_trigger', 'check_prospective_triggers', 'list_prospective_triggers', 'delete_prospective_triggers']) {
+			expect(names).toContain(n);
+		}
+		const check = tools.tools.find((t) => t.name === 'check_prospective_triggers');
+		const checkOut = (check!.outputSchema as { properties?: Record<string, unknown> })?.properties ?? {};
+		expect('vectorSearchEnabled' in checkOut).toBe(true);
+		expect('fired' in checkOut).toBe(true);
+		// set_prospective_trigger advertises the trigger output object.
+		const set = tools.tools.find((t) => t.name === 'set_prospective_trigger');
+		const setOut = (set!.outputSchema as { properties?: Record<string, unknown> })?.properties ?? {};
+		expect('trigger' in setOut).toBe(true);
+	});
 });

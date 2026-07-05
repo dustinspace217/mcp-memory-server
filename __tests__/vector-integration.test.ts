@@ -485,4 +485,44 @@ describe('Vector search integration', () => {
     expect(names).toContain('scoped-telescope');       // in-project semantic match
     expect(names).not.toContain('other-proj-telescope'); // out-of-project excluded
   });
+
+  it('prospective trigger fires on semantically-close context, is one-shot, and ignores distant context', async () => {
+    // End-to-end firing path (v1.7.0): set a trigger, then check with context
+    // that MEANS the same thing (zero token overlap with the condition) — it
+    // should fire, return the payload + score, and mark itself fired. A second
+    // identical check must NOT re-fire (one-shot). Semantically-distant context
+    // must not fire it.
+    const t = await store.setProspectiveTrigger(
+      'when the user next works on telescope autoguider calibration',
+      'remember: the guidescope needs a fresh dark library before the run',
+      'astro-trigger-proj',
+    );
+    // setProspectiveTrigger embeds fire-and-forget; wait for the vec row to land.
+    await new Promise(resolve => setTimeout(resolve, 2500));
+
+    // Distant context first — must NOT fire (and must not consume the one-shot).
+    const distant = await store.checkProspectiveTriggers('planning tomorrow\'s grocery shopping list', 'astro-trigger-proj');
+    expect(distant.vectorSearchEnabled).toBe(true);
+    expect(distant.fired.map(f => f.id)).not.toContain(t.id);
+
+    // Close context — different words, same meaning → fires.
+    const close = await store.checkProspectiveTriggers('setting up the autoguider and calibrating the guide camera tonight', 'astro-trigger-proj');
+    expect(close.vectorSearchEnabled).toBe(true);
+    const firedIds = close.fired.map(f => f.id);
+    expect(firedIds).toContain(t.id);
+    const firedTrigger = close.fired.find(f => f.id === t.id)!;
+    expect(firedTrigger.payload).toBe('remember: the guidescope needs a fresh dark library before the run');
+    expect(firedTrigger.firedAt).not.toBe('');
+    expect(firedTrigger.similarity).toBeGreaterThan(0); // raw cosine, display-rounded
+
+    // One-shot: the same close context must NOT re-fire it.
+    const again = await store.checkProspectiveTriggers('setting up the autoguider and calibrating the guide camera tonight', 'astro-trigger-proj');
+    expect(again.fired.map(f => f.id)).not.toContain(t.id);
+
+    // The fired trigger is gone from the pending list but visible with includeFired.
+    const pending = await store.listProspectiveTriggers('astro-trigger-proj');
+    expect(pending.map(x => x.id)).not.toContain(t.id);
+    const all = await store.listProspectiveTriggers('astro-trigger-proj', true);
+    expect(all.find(x => x.id === t.id)!.firedAt).not.toBe('');
+  });
 });

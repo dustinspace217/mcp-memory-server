@@ -20,7 +20,7 @@ import { normalizeEntityName } from './normalize-name.js';
 // Cosine gates are model-geometry-coupled and env-overridable (see embedding.ts);
 // the tool schemas quote/default from the resolved values so the advertised
 // numbers can never drift from the enforced ones.
-import { SIMILAR_THRESHOLD, DUPLICATE_THRESHOLD, PRECEDENT_FLOOR } from './embedding.js';
+import { SIMILAR_THRESHOLD, DUPLICATE_THRESHOLD, PRECEDENT_FLOOR, TRIGGER_THRESHOLD } from './embedding.js';
 
 // --- Store configuration ---
 // Determines which backend to use and where to store data.
@@ -125,6 +125,9 @@ const ObservationSchema = z.object({
   // here claimed stripping; see mcp-server-harness.test.ts's header.)
   validFrom: z.string().optional().describe("VALID-TIME start (set via set_observation_metadata) — present only when set"),
   validUntil: z.string().optional().describe("VALID-TIME end — present only when set"),
+  // Provenance (v18) — declared so it's part of the tools/list-advertised
+  // contract (the SDK does not strip undeclared keys; verified 2026-07-04).
+  sourceRef: z.string().optional().describe("PROVENANCE: where this observation came from (session id, transcript path, URL) — present only when set"),
 });
 
 /**
@@ -242,6 +245,14 @@ const ProjectIdSchema = z.string().trim().min(1).max(500)
   .describe("Project scope for filtering. Omit for global/unscoped.")
   .optional();
 
+// Provenance pointer (v1.7.0) accepted by the write tools. Stored verbatim on
+// every observation the call creates; record-only (no query filtering). ≤200
+// chars — long enough for a session id, transcript path, or URL, short enough
+// that it can't become a second content field.
+const SourceRefInputSchema = z.string().min(1).max(200)
+  .describe("Optional provenance: where these observations came from (session id, transcript path, URL, doc ref). Stored verbatim, surfaced in reads/entity_timeline.")
+  .optional();
+
 // Canonical memory-type vocabulary. `memory_type` is free-form at the schema level (TEXT, no CHECK
 // constraint — any string writes fine), so this list is ONLY a read-time hint: when a memoryType
 // filter returns nothing AND the value isn't in this list, the tool appends a "did you mean one of
@@ -341,15 +352,16 @@ server.registerTool(
     inputSchema: {
       entities: z.array(EntityInputSchema).max(100),
       projectId: ProjectIdSchema,
+      sourceRef: SourceRefInputSchema,
     },
     outputSchema: {
       created: z.array(EntityOutputSchema),
       skipped: z.array(SkippedEntitySchema),
     }
   },
-  async ({ entities, projectId }) => {
+  async ({ entities, projectId, sourceRef }) => {
     // normalizeProjectId lowercases and trims; undefined = global scope
-    const result = await store.createEntities(entities, normalizeProjectId(projectId));
+    const result = await store.createEntities(entities, normalizeProjectId(projectId), sourceRef);
 
     // Build a human-readable summary before the JSON payload (#31).
     // When all entities are skipped (name collisions), the caller needs
@@ -404,7 +416,8 @@ server.registerTool(
           .describe("Parallel array of context layers matching contents. 'L0' = always loaded, 'L1' = session start, null = on-demand (L2). Omit for default null."),
         memoryTypes: z.array(z.string().min(1).max(50).nullable()).max(100).optional()
           .describe("Parallel array of memory type tags matching contents. Recommended: 'decision','preference','fact','problem','milestone','emotional'. null = unclassified. Omit for default null."),
-      })).max(100)
+      })).max(100),
+      sourceRef: SourceRefInputSchema,
     },
     outputSchema: {
       results: z.array(z.object({
@@ -417,8 +430,8 @@ server.registerTool(
       }))
     }
   },
-  async ({ observations }) => {
-    const result = await store.addObservations(observations);
+  async ({ observations, sourceRef }) => {
+    const result = await store.addObservations(observations, sourceRef);
     // Alert callers when similar observations were detected
     let responseText = JSON.stringify(result, null, 2);
     const hasSimilar = result.some(r => r.similarExisting && r.similarExisting.length > 0);
@@ -503,11 +516,12 @@ server.registerTool(
         oldContent: z.string().min(1).max(5000).describe("The exact text of the active observation to retire"),
         newContent: z.string().min(1).max(5000).describe("The replacement observation text"),
       })).max(100),
+      sourceRef: SourceRefInputSchema,
     },
     outputSchema: { success: z.boolean(), message: z.string() }
   },
-  async ({ supersessions }) => {
-    await store.supersedeObservations(supersessions);
+  async ({ supersessions, sourceRef }) => {
+    await store.supersedeObservations(supersessions, sourceRef);
     return {
       content: [{ type: "text" as const, text: "Observations superseded successfully" }],
       structuredContent: { success: true, message: "Observations superseded successfully" }
@@ -747,6 +761,8 @@ server.registerTool(
         // (the SDK does not strip undeclared keys; verified 2026-07-04).
         validFrom: z.string().optional(),
         validUntil: z.string().optional(),
+        // Provenance (v18) — same advertised-contract rationale.
+        sourceRef: z.string().optional(),
       })),
       relations: z.array(z.object({
         from: z.string(),
@@ -1007,6 +1023,106 @@ server.registerTool(
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       structuredContent: result as unknown as Record<string, unknown>,
+    };
+  }
+);
+
+// --- Prospective memory tools (v1.7.0) ---
+// Output shape for a stored trigger. firedAt '' = pending, ISO = fired (one-shot).
+const ProspectiveTriggerOutputSchema = z.object({
+  id: z.number(),
+  triggerText: z.string(),
+  payload: z.string(),
+  project: z.string().nullable(),
+  createdAt: z.string(),
+  firedAt: z.string().describe("'' = pending, ISO 8601 UTC = fired (one-shot)"),
+});
+// A fired trigger additionally carries its cosine similarity to the checked context.
+const FiredTriggerOutputSchema = ProspectiveTriggerOutputSchema.extend({
+  similarity: z.number().describe("Cosine similarity of the trigger condition to the checked context (rounded, 3dp)"),
+});
+
+server.registerTool(
+  "set_prospective_trigger",
+  {
+    title: "Set Prospective Trigger",
+    description: "Store a \"when situation X arises, remember Y\" trigger — the one CONDITION-FIRED recall path (every other memory surface is retrospective search-on-demand). triggerText is the condition matched SEMANTICALLY against future context; payload is what to surface when it fires. One-shot: firing retires the trigger. Pair with check_prospective_triggers at session start / on project switch. Requires vector search (the match is semantic).",
+    inputSchema: {
+      triggerText: z.string().min(1).max(1000).describe("The CONDITION to watch for, phrased as the situation it should match (e.g. 'when the user next works on the astro gallery deploy')"),
+      payload: z.string().min(1).max(5000).describe("What to surface when the condition fires (the reminder/instruction/context)"),
+      projectId: ProjectIdSchema,
+    },
+    outputSchema: { trigger: ProspectiveTriggerOutputSchema },
+  },
+  async ({ triggerText, payload, projectId }) => {
+    const trigger = await store.setProspectiveTrigger(triggerText, payload, normalizeProjectId(projectId));
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(trigger, null, 2) }],
+      structuredContent: { trigger },
+    };
+  }
+);
+
+server.registerTool(
+  "check_prospective_triggers",
+  {
+    title: "Check Prospective Triggers",
+    description: `Fire any prospective triggers whose condition semantically matches the current context. Embeds contextText once and fires every PENDING in-scope trigger with cosine >= threshold (default ${TRIGGER_THRESHOLD}), returning each with its payload and score; firing is one-shot (a fired trigger won't fire again). CALL THIS at session start and on project switch, passing the current project + a one-line description of what you're about to do as contextText. If vectorSearchEnabled is false the model/vectors are unavailable and nothing was checked (no substring fallback).`,
+    inputSchema: {
+      contextText: z.string().min(1).max(5000).describe("The current situation to match triggers against (e.g. a one-line description of the task at hand)"),
+      projectId: ProjectIdSchema,
+      threshold: z.number().min(0).max(1).optional().describe(`Cosine floor to fire (default ${TRIGGER_THRESHOLD}). Higher = stricter matching.`),
+    },
+    outputSchema: {
+      fired: z.array(FiredTriggerOutputSchema),
+      vectorSearchEnabled: z.boolean().describe("false = model/vectors unavailable; nothing was checked (empty fired does NOT mean 'no matches')"),
+    },
+  },
+  async ({ contextText, projectId, threshold }) => {
+    const result = await store.checkProspectiveTriggers(contextText, normalizeProjectId(projectId), threshold);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      structuredContent: { ...result },
+    };
+  }
+);
+
+server.registerTool(
+  "list_prospective_triggers",
+  {
+    title: "List Prospective Triggers",
+    description: "List prospective triggers for management. Pending only by default; set includeFired to see fired ones too. Scoped to the given project + global when projectId is set.",
+    inputSchema: {
+      projectId: ProjectIdSchema,
+      includeFired: z.boolean().optional().default(false).describe("Include already-fired triggers (default false — pending only)"),
+    },
+    outputSchema: { triggers: z.array(ProspectiveTriggerOutputSchema) },
+  },
+  async ({ projectId, includeFired }) => {
+    const triggers = await store.listProspectiveTriggers(normalizeProjectId(projectId), includeFired);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(triggers, null, 2) }],
+      structuredContent: { triggers },
+    };
+  }
+);
+
+server.registerTool(
+  "delete_prospective_triggers",
+  {
+    title: "Delete Prospective Triggers",
+    description: "HARD-delete prospective triggers by id (removes them and their vectors permanently). This is a DELIBERATE exception to the preservation lifecycle used everywhere else in this server (delete_observations soft-retires; eviction tombstones): a trigger is ephemeral INTENT, not knowledge, so there is no history worth keeping. Idempotent — unknown ids are silently ignored.",
+    inputSchema: {
+      ids: z.array(z.number().int()).min(1).max(100).describe("Trigger ids to delete"),
+    },
+    outputSchema: { deleted: z.number().describe("Number of triggers actually deleted"), requested: z.number() },
+  },
+  async ({ ids }) => {
+    const deleted = await store.deleteProspectiveTriggers(ids);
+    const message = `Deleted ${deleted} of ${ids.length} trigger(s).`;
+    return {
+      content: [{ type: "text" as const, text: message }],
+      structuredContent: { deleted, requested: ids.length },
     };
   }
 );

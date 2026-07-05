@@ -1306,6 +1306,20 @@ describe('Migration safety validation', () => {
     const preexistingSummary = db2.prepare('SELECT summary FROM observations LIMIT 1').get() as { summary: string | null };
     expect(preexistingSummary.summary).toBeNull();
 
+    // Verify: v18 also ran — prospective_triggers table exists and observations
+    // gained source_ref with the '' (unset) sentinel on pre-existing rows.
+    expect(version).toBeGreaterThanOrEqual(18);
+    const tables = db2.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as { name: string }[];
+    expect(tables.map(t => t.name)).toContain('prospective_triggers');
+    const trigCols = db2.prepare('PRAGMA table_info(prospective_triggers)').all() as { name: string }[];
+    expect(trigCols.map(c => c.name)).toEqual(
+      expect.arrayContaining(['id', 'trigger_text', 'payload', 'project', 'created_at', 'fired_at']),
+    );
+    const obsColsV18 = db2.prepare('PRAGMA table_info(observations)').all() as { name: string }[];
+    expect(obsColsV18.map(c => c.name)).toContain('source_ref');
+    const preexistingSourceRef = db2.prepare('SELECT source_ref FROM observations LIMIT 1').get() as { source_ref: string };
+    expect(preexistingSourceRef.source_ref).toBe('');
+
     db2.close();
     await sqliteStore.close();
   });

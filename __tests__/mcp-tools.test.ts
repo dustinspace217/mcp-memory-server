@@ -684,6 +684,59 @@ describe('MCP Tool Handler Integration', () => {
 				expect(result.data.asOf).toBeUndefined();
 			}
 		});
+
+		// ----- provenance sourceRef (v1.7.0) -----
+		it('accepts a ≤200-char sourceRef, omission, and rejects overlong/empty', () => {
+			// Mirrors SourceRefInputSchema: .min(1).max(200).optional().
+			const S = z.object({ sourceRef: z.string().min(1).max(200).optional() });
+			expect(S.safeParse({ sourceRef: 'session:abc123' }).success).toBe(true);
+			expect(S.safeParse({}).success).toBe(true);
+			expect(S.safeParse({ sourceRef: '' }).success).toBe(false);
+			expect(S.safeParse({ sourceRef: 'x'.repeat(201) }).success).toBe(false);
+		});
+
+		// ----- prospective-trigger tool schemas (v1.7.0) -----
+		it('set_prospective_trigger enforces triggerText ≤1000 and payload ≤5000', () => {
+			const S = z.object({
+				triggerText: z.string().min(1).max(1000),
+				payload: z.string().min(1).max(5000),
+				projectId: z.string().trim().min(1).max(500).optional(),
+			});
+			expect(S.safeParse({ triggerText: 'when X', payload: 'do Y' }).success).toBe(true);
+			expect(S.safeParse({ triggerText: '', payload: 'do Y' }).success).toBe(false);
+			expect(S.safeParse({ triggerText: 'x'.repeat(1001), payload: 'y' }).success).toBe(false);
+			expect(S.safeParse({ triggerText: 'when X', payload: 'y'.repeat(5001) }).success).toBe(false);
+		});
+
+		it('check_prospective_triggers bounds contextText ≤5000 and threshold in [0,1]', () => {
+			const S = z.object({
+				contextText: z.string().min(1).max(5000),
+				threshold: z.number().min(0).max(1).optional(),
+			});
+			expect(S.safeParse({ contextText: 'working on deploy' }).success).toBe(true);
+			expect(S.safeParse({ contextText: 'x', threshold: 0.6 }).success).toBe(true);
+			expect(S.safeParse({ contextText: '' }).success).toBe(false);
+			expect(S.safeParse({ contextText: 'x', threshold: 1.5 }).success).toBe(false);
+			expect(S.safeParse({ contextText: 'x', threshold: -0.1 }).success).toBe(false);
+		});
+
+		it('delete_prospective_triggers requires 1..100 integer ids', () => {
+			const S = z.object({ ids: z.array(z.number().int()).min(1).max(100) });
+			expect(S.safeParse({ ids: [1, 2, 3] }).success).toBe(true);
+			expect(S.safeParse({ ids: [] }).success).toBe(false);
+			expect(S.safeParse({ ids: [1.5] }).success).toBe(false);
+			expect(S.safeParse({ ids: Array.from({ length: 101 }, (_, i) => i) }).success).toBe(false);
+		});
+
+		it('list_prospective_triggers includeFired is an optional boolean', () => {
+			const S = z.object({
+				projectId: z.string().trim().min(1).max(500).optional(),
+				includeFired: z.boolean().optional(),
+			});
+			expect(S.safeParse({}).success).toBe(true);
+			expect(S.safeParse({ includeFired: true }).success).toBe(true);
+			expect(S.safeParse({ includeFired: 'yes' }).success).toBe(false);
+		});
 	});
 
 	// ----------------------------------------------------------

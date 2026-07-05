@@ -78,18 +78,19 @@ Add to your MCP server configuration:
 | `MEMORY_SIMILAR_THRESHOLD` | `0.85` | Cosine gate for the `add_observations` similarity warning. Model-geometry-coupled — recalibrate when changing models |
 | `MEMORY_DUPLICATE_THRESHOLD` | `0.80` | Cosine gate for `check_duplicates` |
 | `MEMORY_PRECEDENT_FLOOR` | `0.25` | Minimum cosine for `find_precedents` results |
+| `MEMORY_TRIGGER_THRESHOLD` | `0.50` | Cosine gate for `check_prospective_triggers` firing. Model-geometry-coupled — recalibrate when changing models |
 
 ## Tools
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
-| `create_entities` | Create new entities in the knowledge graph | `entities[]`, `projectId?` |
+| `create_entities` | Create new entities in the knowledge graph | `entities[]`, `projectId?`, `sourceRef?` |
 | `create_relations` | Create directed relations between entities | `relations[]` (from, to, relationType) |
-| `add_observations` | Add observations to existing entities. Returns `similarExisting` when new observations are semantically close to existing ones | `observations[]` (entityName, contents[], importances?[], contextLayers?[], memoryTypes?[]) |
+| `add_observations` | Add observations to existing entities. Returns `similarExisting` when new observations are semantically close to existing ones | `observations[]` (entityName, contents[], importances?[], contextLayers?[], memoryTypes?[]), `sourceRef?` |
 | `delete_entities` | Soft-delete entities (preserves history for `as_of` and `entity_timeline`) | `entityNames[]` |
 | `delete_observations` | Delete specific observations from entities | `deletions[]` (entityName, contents[]) |
 | `delete_relations` | Delete relations between entities | `relations[]` (from, to, relationType) |
-| `supersede_observations` | Atomically retire old observations and insert replacements. Preserves history | `supersessions[]` (entityName, oldContent, newContent) |
+| `supersede_observations` | Atomically retire old observations and insert replacements. Preserves history | `supersessions[]` (entityName, oldContent, newContent), `sourceRef?` |
 | `invalidate_relations` | Mark relations as no longer active. Preserves history. Idempotent | `relations[]` (from, to, relationType) |
 | `set_observation_metadata` | Update importance, context layer, memory type, valid-time, and/or summary on existing observations in-place | `updates[]` (entityName, content, importance?, contextLayer?, memoryType?, validFrom?, validUntil?, summary?) |
 | `read_graph` | Read the knowledge graph (paginated, sorted by most recently updated) | `projectId?`, `asOf?`, `cursor?`, `limit?` |
@@ -102,6 +103,10 @@ Add to your MCP server configuration:
 | `entity_timeline` | Full change history for an entity (active + superseded + tombstoned items) | `entityName`, `projectId?` |
 | `get_context_layers` | Returns L0/L1 observations sorted by importance with token budgets (two-tier L1: featured text + breadcrumb index) | `projectId?`, `layers?` |
 | `get_summary` | Session-start briefing: top observations, recent entities, aggregate stats | `projectId?`, `excludeContextLayers?`, `limit?`, `memoryType?` |
+| `set_prospective_trigger` | Store a "when situation X arises, remember Y" trigger, matched semantically against future context (one-shot) | `triggerText`, `payload`, `projectId?` |
+| `check_prospective_triggers` | Fire any pending triggers whose condition semantically matches the current context. Call at session start / on project switch | `contextText`, `projectId?`, `threshold?` |
+| `list_prospective_triggers` | List triggers (pending only by default) for management | `projectId?`, `includeFired?` |
+| `delete_prospective_triggers` | Hard-delete triggers by id (deliberate exception to the preservation lifecycle — triggers are ephemeral intent). Idempotent | `ids[]` |
 
 ## Data Model
 
@@ -158,7 +163,7 @@ See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation and the full 
 ## Development
 
 ```bash
-npm test           # run tests (723 non-vector tests across 16 files, plus the opt-in vector-integration suite)
+npm test           # run tests (539 non-vector tests across 17 files, plus the opt-in 16-test vector-integration suite)
 npm run test:watch # run tests in watch mode
 npm run build      # compile TypeScript
 npm run watch      # compile in watch mode

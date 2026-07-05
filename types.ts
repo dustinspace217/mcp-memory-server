@@ -35,6 +35,12 @@ export interface Observation {
    *  getContextLayers when building L1Index breadcrumbs; absent/null = the
    *  first-100-chars auto-fallback. Set via set_observation_metadata. */
   summary?: string | null;
+  /** PROVENANCE (v1.7.0, ≤200 chars): WHERE this observation came from — a
+   *  session id, transcript path, URL, or doc reference. Caller-supplied,
+   *  stored verbatim, record-only (no query filtering). '' sentinel in storage
+   *  = unset → field ABSENT in output (same optional-field convention as
+   *  valid-time). Set on create_entities / add_observations / supersede_observations. */
+  sourceRef?: string;
 }
 
 /**
@@ -101,6 +107,8 @@ export interface TimelineObservation {
    *  say when the DB learned/retired the fact; these say when it was true. */
   validFrom?: string;
   validUntil?: string;
+  /** Provenance (v1.7.0) — present only when set ('' sentinel = absent). */
+  sourceRef?: string;
 }
 
 /** Relation entry in an entity timeline — includes invalidated relations. */
@@ -204,6 +212,34 @@ export interface FindPrecedentsResult {
    *  fused) — so the caller can distinguish "reranked order" from "pure cosine
    *  order", and empty results read uniformly. */
   rerankApplied?: boolean;
+}
+
+/** PROSPECTIVE MEMORY (v1.7.0) — a stored "when situation X arises, remember Y"
+ *  intent. The brain's prospective memory has no analog in the retrospective
+ *  (search-on-demand) surfaces; this is the only condition-fired recall path.
+ *  One-shot: firing stamps firedAt and retires the trigger from matching. */
+export interface ProspectiveTrigger {
+  id: number;
+  triggerText: string;   // the CONDITION to match context against (semantically)
+  payload: string;       // what to surface when the condition fires
+  project: string | null; // null = global (visible to all project scopes)
+  createdAt: string;      // ISO 8601 UTC
+  firedAt: string;        // '' = pending, ISO 8601 UTC = fired (one-shot)
+}
+
+/** A trigger returned by checkProspectiveTriggers — a ProspectiveTrigger that
+ *  matched the current context, plus its raw-cosine similarity (rounded for
+ *  display, like precedents). At return time its firedAt is already stamped. */
+export interface FiredTrigger extends ProspectiveTrigger {
+  similarity: number;   // cosine of triggerText vs. the checked context, 0..1
+}
+
+/** Result of checkProspectiveTriggers. Degrades to { fired: [], vectorSearchEnabled:
+ *  false } when the model/vec table is unavailable — NO fallback matching (same
+ *  honesty rule as findPrecedents: an empty result never hides a degraded run). */
+export interface CheckProspectiveTriggersResult {
+  fired: FiredTrigger[];
+  vectorSearchEnabled: boolean;
 }
 
 /** Pagination parameters for readGraph and searchNodes.
@@ -499,8 +535,10 @@ export interface GraphStore {
    *  and reports them as skipped with their owning project for collision feedback.
    *  @param entities - Array of EntityInput objects. Observations can be plain strings
    *                    (auto-timestamped) or Observation objects.
-   *  @param projectId - Optional project scope. Omit or pass undefined for global scope. */
-  createEntities(entities: EntityInput[], projectId?: string): Promise<Readonly<CreateEntitiesResult>>;
+   *  @param projectId - Optional project scope. Omit or pass undefined for global scope.
+   *  @param sourceRef - Optional provenance pointer (v1.7.0) stamped on every seeded
+   *                     observation (≤200 chars; where the fact came from). */
+  createEntities(entities: EntityInput[], projectId?: string, sourceRef?: string): Promise<Readonly<CreateEntitiesResult>>;
   /** Creates new relations between existing entities. Deduplicates by composite key
    *  [from, to, relationType]. In SQLite, FK constraints enforce both endpoints exist.
    *  @param relations - Array of RelationInput (3-field). Temporal fields are system-assigned.
@@ -509,8 +547,10 @@ export interface GraphStore {
   /** Adds observations to existing entities. Deduplicates by content string.
    *  Throws if any entityName does not match an existing entity.
    *  @param observations - Array of { entityName, contents: string[] }
+   *  @param sourceRef - Optional provenance pointer (v1.7.0) stamped on every added
+   *                     observation in this call (≤200 chars).
    *  @returns Per-entity results with added observations and optional similarExisting warnings */
-  addObservations(observations: AddObservationInput[]): Promise<Readonly<AddObservationResult[]>>;
+  addObservations(observations: AddObservationInput[], sourceRef?: string): Promise<Readonly<AddObservationResult[]>>;
   /** Deletes entities by name and cascade-deletes their observations and relations.
    *  Idempotent — silently ignores names that don't match any entity. */
   deleteEntities(entityNames: string[]): Promise<void>;
@@ -522,8 +562,9 @@ export interface GraphStore {
   deleteRelations(relations: RelationInput[]): Promise<void>;
   /** Atomically retires old observations and inserts replacements in a single transaction.
    *  @param supersessions - Array of { entityName, oldContent, newContent }
+   *  @param sourceRef - Optional provenance pointer (v1.7.0) stamped on each replacement row.
    *  @throws Error if entity or active observation not found */
-  supersedeObservations(supersessions: SupersedeInput[]): Promise<void>;
+  supersedeObservations(supersessions: SupersedeInput[], sourceRef?: string): Promise<void>;
   /** Invalidates relations by setting superseded_at to current timestamp.
    * Idempotent — ignores already-invalidated relations.
    * Returns the number of relations actually invalidated (0 if all were already inactive). */
@@ -601,6 +642,32 @@ export interface GraphStore {
    *  @param candidates - Array of { entityName, content } to check
    *  @returns Per-candidate matches plus a modelReady flag */
   checkDuplicates(candidates: CheckDuplicateInput[]): Promise<CheckDuplicatesResponse>;
+
+  // --- Prospective memory (v1.7.0) ---
+
+  /** Stores a "when situation X arises, remember Y" trigger and embeds its
+   *  triggerText for later semantic matching. Fire-and-forget embedding (the
+   *  background sweep catches it if the model isn't ready yet).
+   *  @param triggerText - the CONDITION (matched semantically against context)
+   *  @param payload - what to surface when the condition fires
+   *  @param project - optional scope (null/omitted = global) */
+  setProspectiveTrigger(triggerText: string, payload: string, project?: string): Promise<Readonly<ProspectiveTrigger>>;
+  /** Embeds contextText once and fires every PENDING in-scope trigger whose
+   *  triggerText clears `threshold` (raw cosine). Firing is atomic (stamps
+   *  firedAt, drops the vec row). Degrades to { fired: [], vectorSearchEnabled:
+   *  false } — never falls back to substring matching.
+   *  @param contextText - the current situation to match triggers against
+   *  @param project - optional scope (project + global; advisory)
+   *  @param threshold - cosine floor to fire (default = resolved MEMORY_TRIGGER_THRESHOLD) */
+  checkProspectiveTriggers(contextText: string, project?: string, threshold?: number): Promise<Readonly<CheckProspectiveTriggersResult>>;
+  /** Lists triggers for management. Pending only by default; includeFired shows
+   *  the full history. Scoped to project + global when project is given. */
+  listProspectiveTriggers(project?: string, includeFired?: boolean): Promise<Readonly<ProspectiveTrigger[]>>;
+  /** HARD-deletes triggers by id (and their vec rows). Idempotent — unknown ids
+   *  are silently ignored. Triggers are ephemeral intent, not knowledge, so the
+   *  preservation lifecycle deliberately does NOT apply (no soft-delete here).
+   *  @returns the number of triggers actually deleted */
+  deleteProspectiveTriggers(ids: number[]): Promise<number>;
 }
 
 /** Resolves which Claude Code instance is writing, from MEMORY_INSTANCE_NAME.
@@ -620,13 +687,19 @@ export function resolveSourceInstance(): string {
  * @param importance - 1.0-5.0 importance score (default 3.0 = medium)
  * @param contextLayer - 'L0', 'L1', or null (default null = L2, on-demand)
  * @param memoryType - Free-form type tag (default null = unclassified)
+ * @param sourceRef - Provenance pointer (v1.7.0); '' (default) = unset, so the
+ *   sourceRef field is omitted entirely — matching the absent-when-empty output
+ *   convention (a stored '' would surface as a meaningless empty string).
  * @returns An Observation object with all fields populated
  */
 export function createObservation(
   content: string,
   importance: number = 3.0,
   contextLayer: string | null = null,
-  memoryType: string | null = null
+  memoryType: string | null = null,
+  sourceRef: string = ''
 ): Observation {
-  return { content, createdAt: new Date().toISOString(), importance, contextLayer, memoryType, sourceInstance: resolveSourceInstance() };
+  const obs: Observation = { content, createdAt: new Date().toISOString(), importance, contextLayer, memoryType, sourceInstance: resolveSourceInstance() };
+  if (sourceRef) obs.sourceRef = sourceRef;
+  return obs;
 }

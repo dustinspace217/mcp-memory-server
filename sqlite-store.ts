@@ -5,7 +5,7 @@
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { promises as fs } from 'fs';
-import { EmbeddingPipeline, EMBEDDING_DIM, EMBED_MODEL, DEFAULT_EMBED_MODEL, SIMILAR_THRESHOLD, DUPLICATE_THRESHOLD, PRECEDENT_FLOOR, type VectorState } from './embedding.js';
+import { EmbeddingPipeline, EMBEDDING_DIM, EMBED_MODEL, DEFAULT_EMBED_MODEL, SIMILAR_THRESHOLD, DUPLICATE_THRESHOLD, PRECEDENT_FLOOR, TRIGGER_THRESHOLD, type VectorState } from './embedding.js';
 import { buildL1Index, indexCharCost, L1_FEATURED_CHAR_BUDGET, type UnfeaturedL1 } from './context-layers.js';
 import {
   createObservation,
@@ -47,6 +47,9 @@ import {
   type FindPrecedentsResult,
   type FindPrecedentsOptions,
   type SearchOrderBy,
+  type ProspectiveTrigger,
+  type FiredTrigger,
+  type CheckProspectiveTriggersResult,
 } from './types.js';
 import { fuseRanks, toFtsQuery, activationScore } from './rank-fusion.js';
 import { readJsonlGraph } from './jsonl-reader.js';
@@ -282,6 +285,10 @@ export class SqliteStore implements GraphStore {
     //  16 = added summary (nullable) to observations for the two-tier L1 index (§13)
     //  17 = recomputed normalized_name to strip Unicode Format (Cf) chars,
     //       collapsing invisible zero-width duplicate entities (Issue #59)
+    //  18 = prospective_triggers table (condition-fired recall) + source_ref
+    //       column on observations (provenance close-out) — v1.7.0
+    //       (vec_triggers is created in the vector-setup block, not here — see
+    //        that block; it depends on the optional sqlite-vec extension)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_version (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1242,6 +1249,48 @@ export class SqliteStore implements GraphStore {
       currentVersion = 17;
     }
 
+    if (currentVersion < 18) {
+      // Migration 17 → 18: prospective memory + provenance (v1.7.0).
+      //   Part A: prospective_triggers table — stored "when situation X arises,
+      //           remember Y" intents, matched semantically against context.
+      //   Part B: observations.source_ref — provenance pointer (where a fact
+      //           came from). '' sentinel = unset (house style), so nothing to
+      //           backfill; DEFAULT '' handles pre-v18 rows.
+      //
+      // The vec_triggers virtual table is DELIBERATELY NOT created here: like
+      // vec_observations it lives in the vector-search-setup block below because
+      // it depends on the optional, env-gated sqlite-vec extension loading — a
+      // versioned migration must succeed on a build with no vector support.
+      //
+      // House race discipline (since v11): IMMEDIATE transaction + in-transaction
+      // version re-check (a racing instance that already ran v18 skips the work)
+      // + duplicate-column-tolerant ALTER (Issue #78 pattern). CREATE TABLE IF
+      // NOT EXISTS is naturally idempotent, so no extra guard there.
+      this.db.transaction(() => {
+        const v = (this.db.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
+        if (v >= 18) return;
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS prospective_triggers (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            trigger_text TEXT NOT NULL,
+            payload      TEXT NOT NULL,
+            project      TEXT,
+            created_at   TEXT NOT NULL,
+            fired_at     TEXT NOT NULL DEFAULT ''
+          );
+        `);
+        try {
+          this.db.prepare(`ALTER TABLE observations ADD COLUMN source_ref TEXT NOT NULL DEFAULT ''`).run();
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!msg.includes('duplicate column name')) throw err;
+          // Another process already added this column — safe to continue.
+        }
+        this.db.prepare('UPDATE schema_version SET version = 18').run();
+      }).immediate();
+      currentVersion = 18;
+    }
+
     // === Indexes (idempotent, run on every startup) ===
     // idx_relations_to_entity: the UNIQUE composite index on relations has from_entity
     // as leftmost prefix, so from_entity IN (...) can use it. But to_entity IN (...)
@@ -1364,6 +1413,19 @@ export class SqliteStore implements GraphStore {
           );
         `);
 
+        // Prospective-trigger vectors (v1.7.0), created ALONGSIDE vec_observations
+        // (same vec0 pattern, +trigger_id aux column) so both vector tables share
+        // one lifecycle: same optional-extension gate, same model-switch guard,
+        // same startup orphan sweep. Only PENDING triggers ever have a vec row —
+        // firing/deleting a trigger drops its row, so KNN here searches exactly the
+        // set that can still fire. The shared vecTableExists flag covers both.
+        this.db.exec(`
+          CREATE VIRTUAL TABLE IF NOT EXISTS vec_triggers USING vec0(
+            embedding float[${EMBEDDING_DIM}],
+            +trigger_id TEXT NOT NULL
+          );
+        `);
+
         this.vecTableExists = true;
 
         // Embedding-model identity guard (v15/Phase G1): if the configured
@@ -1381,8 +1443,12 @@ export class SqliteStore implements GraphStore {
         this.db.transaction(() => {
           const vecCfg = this.db.prepare('SELECT model_name FROM vec_config WHERE id = 1').get() as { model_name: string } | undefined;
           if (vecCfg && vecCfg.model_name !== EMBED_MODEL) {
-            console.error(`Embedding model changed (${vecCfg.model_name} -> ${EMBED_MODEL}): clearing vec_observations for a full re-embed by the background sweep`);
+            console.error(`Embedding model changed (${vecCfg.model_name} -> ${EMBED_MODEL}): clearing vec_observations + vec_triggers for a full re-embed by the background sweep`);
             this.db.prepare('DELETE FROM vec_observations').run();
+            // A mixed-model TRIGGER index is the same silent-drift hazard the
+            // guard exists for (cosines across models are meaningless) — clear it
+            // too; the sweep re-embeds pending triggers with the new model.
+            this.db.prepare('DELETE FROM vec_triggers').run();
             this.db.prepare('UPDATE vec_config SET model_name = ? WHERE id = 1').run(EMBED_MODEL);
           }
         }).immediate();
@@ -1405,6 +1471,27 @@ export class SqliteStore implements GraphStore {
             )
           `);
           console.error(`Vector search: cleaned up ${staleCount} stale/orphaned embeddings`);
+        }
+
+        // Trigger-vector consistency: vec_triggers should hold exactly the
+        // PENDING triggers (fired_at = ''). Anything else is stale — a trigger
+        // hard-deleted or fired while the server was down, or a crash between
+        // marking fired_at and dropping the vec row. Same NOT IN predicate shape
+        // as the observation cleanup above.
+        const staleTriggerCount = (this.db.prepare(`
+          SELECT COUNT(*) AS cnt FROM vec_triggers
+          WHERE CAST(trigger_id AS INTEGER) NOT IN (
+            SELECT id FROM prospective_triggers WHERE fired_at = ''
+          )
+        `).get() as { cnt: number }).cnt;
+
+        if (staleTriggerCount > 0) {
+          this.db.exec(`
+            DELETE FROM vec_triggers WHERE CAST(trigger_id AS INTEGER) NOT IN (
+              SELECT id FROM prospective_triggers WHERE fired_at = ''
+            )
+          `);
+          console.error(`Vector search: cleaned up ${staleTriggerCount} stale/orphaned trigger embeddings`);
         }
 
         // Start loading the embedding model in the background.
@@ -1741,6 +1828,55 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
+   * vec_triggers analogue of syncEmbedding — keeps a prospective trigger's
+   * embedding in sync. Never throws (best-effort, mirrors syncEmbedding).
+   * 'upsert' embeds trigger_text as a PASSAGE (stored side) and inserts;
+   * 'delete' removes the row (used on fire and on hard-delete). Not awaited on
+   * the write paths, so the MCP response returns immediately.
+   *
+   * @param triggerId - the prospective_triggers.id to sync
+   * @param triggerText - the trigger condition text (only used for 'upsert')
+   * @param action - 'upsert' to embed+insert, 'delete' to remove
+   */
+  private async syncTriggerEmbedding(
+    triggerId: number,
+    triggerText: string,
+    action: 'upsert' | 'delete'
+  ): Promise<void> {
+    if (!this.vecTableExists) return;
+
+    if (action === 'delete') {
+      try {
+        this.db.prepare('DELETE FROM vec_triggers WHERE trigger_id = ?').run(String(triggerId));
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`syncTriggerEmbedding delete failed for trigger ${triggerId}: ${msg}`);
+      }
+      return;
+    }
+
+    if (this.embeddingPipeline.state.status !== 'ready') return;
+
+    // 'passage' kind: the trigger condition is stored-side text; the context
+    // checked against it is the 'query' side (see checkProspectiveTriggers).
+    const embedding = await this.embeddingPipeline.embed(triggerText, 'passage');
+    if (!embedding) return;
+
+    try {
+      this.db.prepare('DELETE FROM vec_triggers WHERE trigger_id = ?').run(String(triggerId));
+      this.db.prepare(
+        'INSERT INTO vec_triggers (embedding, trigger_id) VALUES (?, ?)'
+      ).run(
+        Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+        String(triggerId)
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`syncTriggerEmbedding upsert failed for trigger ${triggerId}: ${msg}`);
+    }
+  }
+
+  /**
    * Finds all active observations without embeddings and generates them.
    * Runs in batches of 100 with event loop yields between batches
    * so the server stays responsive to MCP requests during the sweep.
@@ -1813,6 +1949,75 @@ export class SqliteStore implements GraphStore {
     if (totalEmbedded > 0) {
       console.error(`Vector search: embedded ${totalEmbedded} observations during sweep`);
     }
+
+    // Second pass: embed any pending prospective triggers still missing a vec
+    // row (created while the model was loading, or left over after a model
+    // switch cleared vec_triggers). Same fault-tolerance shape as above.
+    await this.runTriggerEmbeddingSweep();
+  }
+
+  /**
+   * Embeds pending prospective triggers (fired_at = '') that are missing from
+   * vec_triggers. Runs after the observation sweep, once the model is ready.
+   * Triggers are few, so no batching loop is needed beyond one bounded query.
+   */
+  private async runTriggerEmbeddingSweep(): Promise<void> {
+    if (!this.vecTableExists || this.embeddingPipeline.state.status !== 'ready') return;
+    if (!this.db || this.shuttingDown) return;
+
+    const BATCH_SIZE = 100;
+    let totalEmbedded = 0;
+
+    // Bounded loop over batches — cap iterations so a pathological state (rows
+    // that never embed) can't spin forever (Power-of-Ten rule 2). At 100/batch,
+    // 1000 iterations covers 100k pending triggers, far beyond any real corpus.
+    for (let iter = 0; iter < 1000; iter++) {
+      if (!this.db || this.shuttingDown) break;
+
+      const batch = this.db.prepare(`
+        SELECT t.id, t.trigger_text FROM prospective_triggers t
+        LEFT JOIN vec_triggers v ON CAST(v.trigger_id AS INTEGER) = t.id
+        WHERE v.trigger_id IS NULL AND t.fired_at = ''
+        ORDER BY t.id
+        LIMIT ?
+      `).all(BATCH_SIZE) as { id: number; trigger_text: string }[];
+
+      if (batch.length === 0) break;
+
+      // embedBatch embeds each trigger_text as a passage (default kind).
+      const results = await this.embeddingPipeline.embedBatch(
+        batch.map(t => ({ id: t.id, content: t.trigger_text }))
+      );
+
+      if (results.length > 0 && this.db) {
+        const del = this.db.prepare('DELETE FROM vec_triggers WHERE trigger_id = ?');
+        const insert = this.db.prepare('INSERT INTO vec_triggers (embedding, trigger_id) VALUES (?, ?)');
+        try {
+          const txn = this.db.transaction(() => {
+            for (const { id, embedding } of results) {
+              del.run(String(id));
+              insert.run(
+                Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+                String(id)
+              );
+            }
+          });
+          txn();
+          totalEmbedded += results.length;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Trigger embedding sweep batch insert failed: ${msg}`);
+          break;
+        }
+      }
+
+      await new Promise(resolve => setImmediate(resolve));
+      if (this.embeddingPipeline.state.status !== 'ready') break;
+    }
+
+    if (totalEmbedded > 0) {
+      console.error(`Vector search: embedded ${totalEmbedded} prospective triggers during sweep`);
+    }
   }
 
   /**
@@ -1825,10 +2030,14 @@ export class SqliteStore implements GraphStore {
    * @param projectId - Optional project name; normalized to lowercase/trimmed. Omit for global.
    * @returns CreateEntitiesResult with created entities and skipped duplicates
    */
-  async createEntities(entities: EntityInput[], projectId?: string): Promise<CreateEntitiesResult> {
+  async createEntities(entities: EntityInput[], projectId?: string, sourceRef?: string): Promise<CreateEntitiesResult> {
     // projectId arrives pre-normalized from normalizeProjectId() in index.ts.
     // Convert undefined (global scope) to null for the SQLite column value.
     const normalizedProject = projectId ?? null;
+    // Provenance pointer (v1.7.0), applied to every observation seeded in this
+    // call. '' = unset (the caller omitted it) → the source_ref column keeps its
+    // DEFAULT '' and the field is omitted from output.
+    const sref = sourceRef ?? '';
 
     // Capture the current time once for all entities in this batch (consistent timestamps)
     const now = new Date().toISOString();
@@ -1854,10 +2063,10 @@ export class SqliteStore implements GraphStore {
     const getExistingForSkip = this.db.prepare(
       `SELECT name AS existing_name, project FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
-    // INSERT includes observation metadata columns + source_instance (schema v6/v10).
-    // Defaults (3.0, NULL, NULL) match the column defaults.
+    // INSERT includes observation metadata columns + source_instance (v6/v10) +
+    // source_ref (v18 provenance). Defaults (3.0, NULL, NULL, '') match the column defaults.
     const insertObs = this.db.prepare(
-      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance, source_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
     );
 
     // Which Claude Code instance is writing (MEMORY_INSTANCE_NAME, e.g. "fedora",
@@ -1907,13 +2116,19 @@ export class SqliteStore implements GraphStore {
         const observations: Observation[] = [];
 
         for (const obs of e.observations) {
-          // createObservation() now accepts importance/contextLayer/memoryType params,
+          // createObservation() now accepts importance/contextLayer/memoryType/sourceRef,
           // but EntityInput observations are plain strings or Observation objects --
-          // strings get defaults via createObservation(obs), objects pass through as-is
-          const o = typeof obs === 'string' ? createObservation(obs) : obs;
-          const obsInfo = insertObs.run(row.id, o.content, o.createdAt, o.importance, o.contextLayer, o.memoryType, sourceInstance);
+          // strings get defaults via createObservation(obs, ..., sref), objects pass
+          // through as-is (their own sourceRef, if any, wins over the call-level sref).
+          const o = typeof obs === 'string' ? createObservation(obs, 3.0, null, null, sref) : obs;
+          // For a plain string, createObservation already baked sref into o.sourceRef
+          // (when sref is non-empty); an object input carries its own. Either way
+          // o.sourceRef is the source of truth here; '' when unset.
+          const obsSourceRef = o.sourceRef ?? '';
+          const obsInfo = insertObs.run(row.id, o.content, o.createdAt, o.importance, o.contextLayer, o.memoryType, sourceInstance, obsSourceRef);
           if (obsInfo.changes > 0) {
-            observations.push({ ...o, sourceInstance });
+            // Reflect the stored provenance in the returned Observation (absent when '').
+            observations.push({ ...o, sourceInstance, ...(obsSourceRef ? { sourceRef: obsSourceRef } : {}) });
           }
         }
 
@@ -2082,7 +2297,7 @@ export class SqliteStore implements GraphStore {
    * @returns Per-entity results with only the observations actually added
    * @throws Error if any entityName doesn't match an existing entity
    */
-  async addObservations(observations: AddObservationInput[]): Promise<AddObservationResult[]> {
+  async addObservations(observations: AddObservationInput[], sourceRef?: string): Promise<AddObservationResult[]> {
     // Lookup goes through normalized_name (post-v8 identity key) so callers can
     // pass any surface variant of the name. Filter superseded_at = '' so soft-deleted
     // entities are treated as nonexistent — matching hard-delete semantics: the entity
@@ -2090,9 +2305,11 @@ export class SqliteStore implements GraphStore {
     const findEntity = this.db.prepare(
       `SELECT id FROM entities WHERE normalized_name = ? AND superseded_at = ''`
     );
-    // INSERT includes metadata columns + source_instance (schema v6/v10)
+    // Provenance pointer (v1.7.0) stamped on every observation added in this call.
+    const sref = sourceRef ?? '';
+    // INSERT includes metadata columns + source_instance (v6/v10) + source_ref (v18)
     const insertObs = this.db.prepare(
-      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance, source_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
     );
     // Prepared statement to bump updated_at and last_accessed_at when observations
     // are added to an entity — writes are the strongest access signal.
@@ -2126,8 +2343,8 @@ export class SqliteStore implements GraphStore {
           const importance = o.importances?.[i] ?? 3.0;
           const contextLayer = o.contextLayers?.[i] ?? null;
           const memoryType = o.memoryTypes?.[i] ?? null;
-          const obs: Observation = { content, createdAt: now, importance, contextLayer, memoryType, sourceInstance };
-          const info = insertObs.run(row.id, content, now, importance, contextLayer, memoryType, sourceInstance);
+          const obs: Observation = { content, createdAt: now, importance, contextLayer, memoryType, sourceInstance, ...(sref ? { sourceRef: sref } : {}) };
+          const info = insertObs.run(row.id, content, now, importance, contextLayer, memoryType, sourceInstance, sref);
           if (info.changes > 0) {
             addedObservations.push(obs);
           }
@@ -2422,7 +2639,11 @@ export class SqliteStore implements GraphStore {
    * @param supersessions - Array of { entityName, oldContent, newContent }
    * @throws Error if any entity is not found or oldContent doesn't match an active observation
    */
-  async supersedeObservations(supersessions: SupersedeInput[]): Promise<void> {
+  async supersedeObservations(supersessions: SupersedeInput[], sourceRef?: string): Promise<void> {
+    // Provenance pointer (v1.7.0) for the replacement rows. Unlike valid-time,
+    // provenance is caller-supplied fresh for the new claim (not carried forward
+    // from the superseded row — the replacement is a new authorship event).
+    const sref = sourceRef ?? '';
     // Prepared statement to find an active entity by normalized identity key.
     // Soft-deleted entities are excluded — supersession on a logically-removed
     // entity throws "not found" (matching pre-soft-delete semantics for missing entities).
@@ -2448,7 +2669,7 @@ export class SqliteStore implements GraphStore {
     // lie (the superseded row keeps its own window in the timeline; set the
     // replacement's via set_observation_metadata when it genuinely applies).
     const insertObs = this.db.prepare(
-      `INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance, source_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
     // Bump entity's updated_at and last_accessed_at — writes are the strongest access signal.
     const updateTimestamp = this.db.prepare(
@@ -2496,7 +2717,7 @@ export class SqliteStore implements GraphStore {
         // Insert the replacement — carry forward importance, context_layer, and memory_type
         // from the old observation so metadata survives content updates.
         // INSERT OR IGNORE: if newContent already exists as an active observation, skip.
-        insertObs.run(entityRow.id, s.newContent, now, obsRow.importance, obsRow.context_layer, obsRow.memory_type, sourceInstance);
+        insertObs.run(entityRow.id, s.newContent, now, obsRow.importance, obsRow.context_layer, obsRow.memory_type, sourceInstance, sref);
 
         // Bump updated_at and last_accessed_at so the entity surfaces in recency-ordered queries
         updateTimestamp.run(now, now, entityRow.id);
@@ -2664,12 +2885,12 @@ export class SqliteStore implements GraphStore {
       const obsRows = this.db.prepare(`
         SELECT o.entity_id AS entityId, o.content, o.created_at AS createdAt,
                o.importance, o.context_layer, o.memory_type, o.source_instance,
-               o.valid_from, o.valid_until
+               o.valid_from, o.valid_until, o.source_ref
         FROM observations o
         WHERE o.entity_id IN (${placeholders}) AND ${obsFilter.clause}
       `).all(...chunk, ...obsFilter.params) as { entityId: number; content: string; createdAt: string;
         importance: number; context_layer: string | null; memory_type: string | null; source_instance: string;
-        valid_from: string; valid_until: string }[];
+        valid_from: string; valid_until: string; source_ref: string }[];
 
       for (const o of obsRows) {
         if (!obsMap.has(o.entityId)) obsMap.set(o.entityId, []);
@@ -2684,6 +2905,8 @@ export class SqliteStore implements GraphStore {
           // matching the optional-field conventions elsewhere in the API.
           ...(o.valid_from ? { validFrom: o.valid_from } : {}),
           ...(o.valid_until ? { validUntil: o.valid_until } : {}),
+          // Provenance (v18): same absent-when-'' convention as valid time.
+          ...(o.source_ref ? { sourceRef: o.source_ref } : {}),
         });
       }
     }
@@ -4240,10 +4463,10 @@ export class SqliteStore implements GraphStore {
     // name, sorted chronologically. Unlike buildEntities() which filters
     // superseded_at = '', this returns everything for the timeline view.
     const obsRows = this.db.prepare(`
-      SELECT content, created_at, superseded_at, tombstoned_at, source_instance, valid_from, valid_until
+      SELECT content, created_at, superseded_at, tombstoned_at, source_instance, valid_from, valid_until, source_ref
       FROM observations WHERE entity_id IN (${idPlaceholders})
       ORDER BY created_at ASC
-    `).all(...allEntityIds) as { content: string; created_at: string; superseded_at: string; tombstoned_at: string; source_instance: string; valid_from: string; valid_until: string }[];
+    `).all(...allEntityIds) as { content: string; created_at: string; superseded_at: string; tombstoned_at: string; source_instance: string; valid_from: string; valid_until: string; source_ref: string }[];
 
     // Map DB rows to TimelineObservation with computed status field.
     // Three states: active (superseded_at=''), tombstoned (tombstoned_at!='', content stripped
@@ -4260,6 +4483,8 @@ export class SqliteStore implements GraphStore {
       // valid time diverge visibly — surface when set ('' sentinel = absent).
       ...(o.valid_from ? { validFrom: o.valid_from } : {}),
       ...(o.valid_until ? { validUntil: o.valid_until } : {}),
+      // Provenance (v18): surface when set.
+      ...(o.source_ref ? { sourceRef: o.source_ref } : {}),
     }));
 
     // Fetch ALL relations (active AND superseded) involving this entity.
@@ -4796,5 +5021,166 @@ export class SqliteStore implements GraphStore {
     }));
 
     return { results, modelReady: true, errorCount };
+  }
+
+  // ─── Prospective memory (v1.7.0) ────────────────────────────────────────────
+
+  /**
+   * Stores a "when situation X arises, remember Y" trigger and fire-and-forget
+   * embeds its trigger_text into vec_triggers. If the model isn't ready yet the
+   * embedding is skipped here and the background sweep picks it up later.
+   *
+   * @param triggerText - the CONDITION to match context against
+   * @param payload - what to surface when the condition fires
+   * @param project - optional scope (pre-normalized by the caller); null = global
+   * @returns the stored trigger (firedAt '' = pending)
+   */
+  async setProspectiveTrigger(triggerText: string, payload: string, project?: string): Promise<ProspectiveTrigger> {
+    const normalizedProject = project ?? null;
+    const now = new Date().toISOString();
+    const info = this.db.prepare(
+      'INSERT INTO prospective_triggers (trigger_text, payload, project, created_at) VALUES (?, ?, ?, ?)'
+    ).run(triggerText, payload, normalizedProject, now);
+    const id = Number(info.lastInsertRowid);
+
+    // Fire-and-forget embedding — never awaited (returns immediately), never
+    // throws (internal try-catch). Sweep covers it if the model isn't ready.
+    this.syncTriggerEmbedding(id, triggerText, 'upsert');
+
+    return { id, triggerText, payload, project: normalizedProject, createdAt: now, firedAt: '' };
+  }
+
+  /**
+   * Embeds contextText ONCE (query side) and fires every PENDING in-scope
+   * trigger whose trigger_text clears `threshold` (RAW cosine, like precedents).
+   * Firing is one atomic transaction: stamp fired_at + drop the vec row so the
+   * trigger can't re-fire. Degrades to { fired: [], vectorSearchEnabled: false }
+   * when the model/vec table is unavailable — never substring-matches as a
+   * fallback (same honesty rule as findPrecedents: an empty result must not hide
+   * a degraded run).
+   *
+   * @param contextText - the current situation to match triggers against
+   * @param project - optional scope (project + global; advisory). undefined = all pending.
+   * @param threshold - cosine floor to fire (default = resolved MEMORY_TRIGGER_THRESHOLD)
+   */
+  async checkProspectiveTriggers(contextText: string, project?: string, threshold: number = TRIGGER_THRESHOLD): Promise<CheckProspectiveTriggersResult> {
+    // vectorSearchEnabled reports whether THIS call could actually run vector
+    // matching. Off, or model still loading/failed → false + empty, so the
+    // caller can't mistake "no matches" for "check couldn't run."
+    const canRun = this.vecTableExists && this.embeddingPipeline.state.status === 'ready';
+    if (!canRun) return { fired: [], vectorSearchEnabled: false };
+
+    const embedding = await this.embeddingPipeline.embed(contextText, 'query');
+    if (!embedding) return { fired: [], vectorSearchEnabled: false };
+
+    // KNN over pending trigger vectors. vec_triggers holds ONLY pending triggers
+    // (fired/deleted rows are dropped), so this naturally searches the fireable
+    // set; scope + threshold are applied below. k=50 over-fetches — triggers are
+    // few and we filter by project/threshold afterward. k is interpolated (not
+    // bound) matching sqlite-vec's MATCH ... k = N syntax used elsewhere.
+    const knnRows = this.db.prepare(`
+      SELECT v.trigger_id, v.distance FROM vec_triggers v
+      WHERE v.embedding MATCH ? AND k = 50
+    `).all(
+      Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+    ) as { trigger_id: string; distance: number }[];
+
+    const normalizedProject = project ?? null;
+    // Scope clause: when a project is given, match it OR global (project IS NULL)
+    // — advisory, exactly like findPrecedents. undefined = no filter (all pending).
+    const scopeClause = normalizedProject ? ` AND (project = ? OR project IS NULL)` : '';
+    const findPending = this.db.prepare(
+      `SELECT id, trigger_text, payload, project, created_at
+       FROM prospective_triggers WHERE id = ? AND fired_at = ''${scopeClause}`
+    );
+    const markFired = this.db.prepare(`UPDATE prospective_triggers SET fired_at = ? WHERE id = ? AND fired_at = ''`);
+    const dropVec = this.db.prepare(`DELETE FROM vec_triggers WHERE trigger_id = ?`);
+
+    const fired: FiredTrigger[] = [];
+    const now = new Date().toISOString();
+    // One transaction for the whole fire set — either all matched triggers are
+    // marked+dropped or none are (a mid-loop DB error rolls back the batch).
+    const fireTxn = this.db.transaction(() => {
+      for (const knn of knnRows) {
+        // L2 distance on unit vectors → cosine (same conversion as dedup/precedents).
+        const similarity = 1 - (knn.distance * knn.distance) / 2;
+        if (similarity < threshold) continue;   // gate on RAW cosine
+        const id = parseInt(knn.trigger_id, 10);
+        const row = (normalizedProject
+          ? findPending.get(id, normalizedProject)
+          : findPending.get(id)) as
+          { id: number; trigger_text: string; payload: string; project: string | null; created_at: string } | undefined;
+        if (!row) continue;   // already fired, out of scope, or gone
+        const res = markFired.run(now, id);
+        if (res.changes === 0) continue;   // lost a race to another checker — skip
+        dropVec.run(String(id));
+        fired.push({
+          id: row.id,
+          triggerText: row.trigger_text,
+          payload: row.payload,
+          project: row.project,
+          createdAt: row.created_at,
+          firedAt: now,
+          // Rounded for display only — the gate above used the raw value.
+          similarity: Math.round(similarity * 1000) / 1000,
+        });
+      }
+    });
+    fireTxn();
+
+    return { fired, vectorSearchEnabled: true };
+  }
+
+  /**
+   * Lists prospective triggers for management. Pending only by default;
+   * includeFired returns the full history. Scoped to project + global when a
+   * project is given (advisory), all triggers otherwise.
+   */
+  async listProspectiveTriggers(project?: string, includeFired: boolean = false): Promise<ProspectiveTrigger[]> {
+    const normalizedProject = project ?? null;
+    const clauses: string[] = [];
+    const params: string[] = [];
+    if (normalizedProject) { clauses.push('(project = ? OR project IS NULL)'); params.push(normalizedProject); }
+    if (!includeFired) { clauses.push(`fired_at = ''`); }
+    const where = clauses.length ? 'WHERE ' + clauses.join(' AND ') : '';
+    const rows = this.db.prepare(
+      `SELECT id, trigger_text, payload, project, created_at, fired_at
+       FROM prospective_triggers ${where} ORDER BY id ASC`
+    ).all(...params) as {
+      id: number; trigger_text: string; payload: string; project: string | null; created_at: string; fired_at: string;
+    }[];
+    return rows.map(r => ({
+      id: r.id, triggerText: r.trigger_text, payload: r.payload,
+      project: r.project, createdAt: r.created_at, firedAt: r.fired_at,
+    }));
+  }
+
+  /**
+   * HARD-deletes triggers by id and removes their vec_triggers rows. This is a
+   * DELIBERATE exception to the preservation lifecycle (delete_observations
+   * soft-retires, eviction tombstones): a prospective trigger is ephemeral
+   * INTENT, not knowledge — once it's obsolete there is no history worth keeping,
+   * so a real DELETE is correct. Idempotent: unknown ids contribute 0 to the count.
+   *
+   * @param ids - trigger ids to delete
+   * @returns the number of trigger rows actually deleted
+   */
+  async deleteProspectiveTriggers(ids: number[]): Promise<number> {
+    if (ids.length === 0) return 0;
+    const delTrigger = this.db.prepare('DELETE FROM prospective_triggers WHERE id = ?');
+    // Only prepare the vec delete when the table exists (vectors off → no table).
+    const delVec = this.vecTableExists ? this.db.prepare('DELETE FROM vec_triggers WHERE trigger_id = ?') : null;
+    let deleted = 0;
+    const txn = this.db.transaction(() => {
+      for (const id of ids) {
+        const res = delTrigger.run(id);
+        deleted += res.changes;
+        // Drop the vec row unconditionally (idempotent even if the trigger was
+        // already gone or already fired — keeps vec_triggers consistent).
+        if (delVec) delVec.run(String(id));
+      }
+    });
+    txn();
+    return deleted;
   }
 }

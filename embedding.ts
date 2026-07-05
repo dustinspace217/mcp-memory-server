@@ -95,6 +95,13 @@ function thresholdFromEnv(envName: string, fallback: number): number {
 export const SIMILAR_THRESHOLD = thresholdFromEnv('MEMORY_SIMILAR_THRESHOLD', 0.85);   // addObservations similarExisting warning
 export const DUPLICATE_THRESHOLD = thresholdFromEnv('MEMORY_DUPLICATE_THRESHOLD', 0.80); // check_duplicates advisory match
 export const PRECEDENT_FLOOR = thresholdFromEnv('MEMORY_PRECEDENT_FLOOR', 0.25);      // find_precedents minSimilarity default
+// check_prospective_triggers firing gate (v1.7.0). Default 0.50 sits between the
+// precedent floor (0.25 — loose recall) and the similar warning (0.85 — near-dup):
+// firing a trigger INTERRUPTS with a payload, so the bar must be well above
+// precedent-recall looseness but below near-duplicate strictness. Same
+// model-geometry coupling as its three siblings — a granite deployment needs a
+// percentile-recalibrated value set at deploy, not baked here.
+export const TRIGGER_THRESHOLD = thresholdFromEnv('MEMORY_TRIGGER_THRESHOLD', 0.50);  // check_prospective_triggers firing gate
 
 /** Maximum consecutive pipeline failures before transitioning to 'failed' state.
  * After this many failures, the pipeline stops attempting inference until restart. */

@@ -127,7 +127,7 @@ async function assertUsableDb(dbPath: string, results: ChildResult[]): Promise<v
 	const conn = new Database(dbPath, { readonly: true });
 	try {
 		const version = (conn.prepare('SELECT version FROM schema_version').get() as { version: number }).version;
-		expect(version, `schema_version wrong after race\n${preamble}`).toBe(17);
+		expect(version, `schema_version wrong after race\n${preamble}`).toBe(18);
 
 		// integrity_check returns a single 'ok' row on a healthy DB, or one row per
 		// problem otherwise. A race that corrupted a page or an index shows here.
