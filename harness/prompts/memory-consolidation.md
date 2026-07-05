@@ -88,6 +88,25 @@ derived from stay fully protected and untouched (Pass F reads them, never writes
 - **Relation verbs are NOT subject to any of this:** upgrading a generic `relates_to` edge to a precise causal verb (`CAUSED_BY` / `PRECEDENT_FOR` / `SUPERSEDES`) where the observation content explicitly states the causality is encouraged and history-preserving — `invalidate_relations` the generic edge, `create_relations` the precise one. Same conservatism as edge creation: only where the content states it, never inferred.
 - Verify `importance` is deliberately set (not default 3.0 for observations that should be 4-5). Correct with `set_observation_metadata` if needed. (Experiential obs follow the STORE table — `emotional`/`narrative` = 3, `relational` = 4 — these are intentional, not defaults to bump.)
 - Verify `contextLayer` is appropriate: L0 for critical always-loaded rules, L1 for active status/decisions/procedures, null for on-demand detail
+- **L1 scoping lint (added 2026-07-05 — the audit that found 137 dangling L1 observations):**
+  the SessionStart hook loads L1 with an EXACT `entities.project` match (no global
+  fallback), so L1 on a project-NULL entity auto-loads NOWHERE. Each run:
+  (1) **L1-on-global entities** — query read-only for active L1 observations whose
+  entity has `project IS NULL`; demote each to L2 via `set_observation_metadata`
+  (`contextLayer: null`). This is a LAYER change, not a retype — protected types
+  keep their memoryType untouched. If the content is genuinely every-session
+  material, propose L0 in your summary instead of demoting silently.
+  (2) **Project values with no matching workspace directory** — compare distinct
+  `entities.project` values against `ls ~/Claude` (lowercased). WATCH ONLY, never
+  auto-fix: a missing directory may be a project conceived before its dir exists
+  (Dustin's explicit carve-out, 2026-07-05 — saving must never be blocked or
+  reverted for this). Report the value + entity names; flag as stale only if the
+  same value has appeared in ≥2 consecutive run summaries with no dir appearing.
+  (3) **Continuity threads** — every entity with entityType `continuity-thread`
+  (or a near-miss casing like `ContinuityThread`) must have a NON-NULL project and
+  the exact lowercase type, or the loader never finds it. Entity project/type
+  cannot be changed via MCP tools — report violations for in-session repair,
+  don't attempt a fix here.
 
 ### Pass E: Orphan linking (graph hygiene)
 - Find **orphans** (entities with NO active relation — no row in `relations` where the entity is an active from/to endpoint). **Detect them from the authoritative SQLite store or `get_connected_context`, NEVER from `read_graph`'s relation list** — that list is INCOMPLETE (the 2026-06-08 run found it returned only 174 of 429 active relations, omitting most hub `contains`/`contains_file` edges), so trusting it invents false orphans: that run created 36 bogus `part_of` edges off the bad list, caught the error via hub inspection, and had to invalidate all 36 (net-zero, but wasted work + soft-deleted churn). In the DB an active relation is a `relations` row with `superseded_at='' AND tombstoned_at=''`; an orphan is an entity whose (normalized) name appears as neither `from_entity` nor `to_entity` in any active row. Run `.schema` first to confirm column names, then query read-only (`sqlite3 -readonly ~/.claude/memory.db`). For each TRUE orphan, link to an obvious hub using cheap structural signals, in order: (1) **name prefix** matches an existing hub (`dustin-space-*`→`dustin-space`, `fedora-*`→`Fedora`, `mele-*`→`dustinspace-mele`, etc.); (2) the entity's **`project` field** names a project that exists as a hub entity; (3) **entity type implies containment** (`SourceFile`/`ConfigFile`/`FileGroup`/`ProcedureLibrary`/`PlannedFeature`/`ContentRevision`… belong to a project or system).

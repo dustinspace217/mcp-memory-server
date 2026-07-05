@@ -668,6 +668,10 @@ def build_summary(flags, stats, project_name):
 		stats_parts.append(f"sentinel_excluded={stats['sentinel_excluded']}")
 	if stats.get("unparseable_timestamps"):
 		stats_parts.append(f"unparseable_timestamps={stats['unparseable_timestamps']}")
+	# L1 danglers (2026-07-05): shown only when nonzero — zero is the healthy
+	# steady state and doesn't need a line of context every session.
+	if stats.get("l1_danglers"):
+		stats_parts.append(f"l1_danglers={stats['l1_danglers']} (L1 obs on global entities never auto-load — see write policy)")
 	if stats.get("errors"):
 		stats_parts.append(f"errors={stats['errors']}")
 	stats_line = (
@@ -849,6 +853,23 @@ def _main_inner():
 		# OperationalError("no such column") deep inside find_stale_entities.
 		verify_schema(conn)
 		flags, stats = find_stale_entities(conn, project_name)
+		# L1-dangler counter (added 2026-07-05, from the L1 scoping audit that
+		# found 137 silently-unloadable L1 observations). The SessionStart hook
+		# loads L1 by EXACT entities.project match with no global fallback, so
+		# an active L1 observation on a project-NULL entity auto-loads nowhere.
+		# One cheap COUNT keeps that drift visible on every session start
+		# instead of waiting for the next manual audit. Best-effort: a schema
+		# surprise here must never break the freshness envelope.
+		try:
+			stats["l1_danglers"] = conn.execute("""
+				SELECT COUNT(*) FROM observations o
+				JOIN entities e ON o.entity_id = e.id
+				WHERE o.context_layer = 'L1' AND e.project IS NULL
+				  AND (o.superseded_at IS NULL OR o.superseded_at = '')
+				  AND (e.superseded_at IS NULL OR e.superseded_at = '')
+			""").fetchone()[0]
+		except sqlite3.Error:
+			pass  # counter is advisory; freshness flags are the payload
 	finally:
 		conn.close()
 
