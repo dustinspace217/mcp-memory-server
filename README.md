@@ -24,6 +24,10 @@ This project is derived from [`@modelcontextprotocol/server-memory`](https://git
 - **Cursor-based pagination** — sorted by most-recently-updated, stable under concurrent use
 - **Project scoping** — optional `projectId` parameter isolates entities by project
 - **Auto-migration** — an existing JSONL file is upgraded to SQLite automatically on first run (the JSONL backend itself was retired in v1.6.0)
+- **Knowledge Graph Visualization** — visual representation of the memory structure, both vectored in 3D space for relational visualization, and graphed in 2D space for readability
+
+<img width="2926" height="1755" alt="Screenshot_20260731_132326" src="https://github.com/user-attachments/assets/54f0fc4e-0014-4969-9e0e-13f05eb16741" />
+
 
 ## Installation
 
