@@ -1,0 +1,10 @@
+# Generated pages embed the FULL CONTENT of your memory database (every entity,
+# observation, and relation) directly in the HTML. They are private by nature —
+# never commit or publish a generated snapshot.
+index.html
+index-3d.html
+
+# Optional fine-tuned-model workspace (models, eval data, vector caches) — local only.
+concept_embeddings/
+
+__pycache__/
