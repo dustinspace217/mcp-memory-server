@@ -24,7 +24,7 @@ This project is derived from [`@modelcontextprotocol/server-memory`](https://git
 - **Cursor-based pagination** — sorted by most-recently-updated, stable under concurrent use
 - **Project scoping** — optional `projectId` parameter isolates entities by project
 - **Auto-migration** — an existing JSONL file is upgraded to SQLite automatically on first run (the JSONL backend itself was retired in v1.6.0)
-- **Knowledge Graph Visualization** — visual representation of the memory structure, both vectored in 3D space for relational visualization, and graphed in 2D space for readability
+- **Knowledge Graph Visualization** — a companion viewer renders the memory two ways: a 2D node-link graph of entities and their relations, and a 3D view that places each entity at its embedding coordinate, so semantic neighbors sit near each other in space
 
 <img width="2926" height="1755" alt="Screenshot_20260731_132821-1" src="https://github.com/user-attachments/assets/8251e9a8-884f-45cc-80cb-95a27971e824" />
 <img width="3830" height="1846" alt="Screenshot_20260731_132934" src="https://github.com/user-attachments/assets/271bb158-fd1e-4c55-8b90-69a591b76669" />
@@ -169,7 +169,7 @@ See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation and the full 
 ## Development
 
 ```bash
-npm test           # run tests (539 non-vector tests across 17 files, plus the opt-in 16-test vector-integration suite)
+npm test           # run tests (539 non-vector tests across 17 files, plus the opt-in 18-test vector-integration suite)
 npm run test:watch # run tests in watch mode
 npm run build      # compile TypeScript
 npm run watch      # compile in watch mode
