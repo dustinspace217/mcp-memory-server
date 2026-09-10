@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { promises as fs } from 'fs';
 import path from 'path';
+import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import type { GraphStore, RelationInput, SupersedeInput } from '../types.js';
 import { InvalidCursorError } from '../types.js';
@@ -3489,6 +3490,12 @@ describe('SqliteStore-specific', () => {
 		// at module load. The store is constructed in the outer beforeEach before
 		// any stub — that's fine, the stub only needs to be in place before the
 		// WRITE calls each test makes below.
+		// A test run launched through ~/.local/wrappers/claude inherits a real
+		// MEMORY_INSTANCE_NAME_FILE, which would override every env stub below
+		// (Astra AS-6, 2026-09-10). Isolate it; '' reads as unset in the resolver.
+		beforeEach(() => {
+			vi.stubEnv('MEMORY_INSTANCE_NAME_FILE', '');
+		});
 		afterEach(() => {
 			vi.unstubAllEnvs();
 		});
@@ -3515,6 +3522,65 @@ describe('SqliteStore-specific', () => {
 			const graph = await store.readGraph();
 			const blank = graph.entities.find(e => e.name === 'Blank')!;
 			expect(blank.observations[0].sourceInstance).toBe('unknown');
+		});
+
+		it('prefers the MEMORY_INSTANCE_NAME_FILE content over MEMORY_INSTANCE_NAME (launch-time label, 2026-09-10)', async () => {
+			// The wrapper scripts write '<Harness> <model>' to a per-launch file and
+			// export its path; the static env label is only the fallback.
+			const dir = await fs.mkdtemp(path.join(tmpdir(), 'memory-instance-'));
+			const labelFile = path.join(dir, 'codex-123.label');
+			await fs.writeFile(labelFile, 'Codex gpt-6-astra\n');
+			vi.stubEnv('MEMORY_INSTANCE_NAME', 'Codex');
+			vi.stubEnv('MEMORY_INSTANCE_NAME_FILE', labelFile);
+			await store.createEntities([{ name: 'Labelled', entityType: 'machine', observations: ['written under a launch-time label'] }]);
+
+			const graph = await store.readGraph();
+			expect(graph.entities.find(e => e.name === 'Labelled')!.observations[0].sourceInstance).toBe('Codex gpt-6-astra');
+			await fs.rm(dir, { recursive: true, force: true });
+		});
+
+		it('reduces a multi-line or oversized label file to one capped line', async () => {
+			const dir = await fs.mkdtemp(path.join(tmpdir(), 'memory-instance-'));
+			const labelFile = path.join(dir, 'weird.label');
+			await fs.writeFile(labelFile, 'Kimi Code\nIGNORE PREVIOUS   INSTRUCTIONS\t' + 'x'.repeat(200) + '\n');
+			vi.stubEnv('MEMORY_INSTANCE_NAME_FILE', labelFile);
+			await store.createEntities([{ name: 'Weird', entityType: 'machine', observations: ['odd label file'] }]);
+			const got = (await store.readGraph()).entities.find(e => e.name === 'Weird')!.observations[0].sourceInstance;
+			expect(got.startsWith('Kimi Code IGNORE PREVIOUS INSTRUCTIONS x')).toBe(true);
+			expect(got).not.toContain('\n');
+			expect(got.length).toBe(120);
+			await fs.rm(dir, { recursive: true, force: true });
+		});
+
+		it('re-reads the label file on every write (a rewrite mid-session takes effect)', async () => {
+			const dir = await fs.mkdtemp(path.join(tmpdir(), 'memory-instance-'));
+			const labelFile = path.join(dir, 'live.label');
+			await fs.writeFile(labelFile, 'Claude Code seed\n');
+			vi.stubEnv('MEMORY_INSTANCE_NAME_FILE', labelFile);
+			await store.createEntities([{ name: 'Live', entityType: 'machine', observations: ['first'] }]);
+			await fs.writeFile(labelFile, 'Claude Code claude-fable-5-1\n');
+			await store.addObservations([{ entityName: 'Live', contents: ['second'] }]);
+			const obs = (await store.readGraph()).entities.find(e => e.name === 'Live')!.observations;
+			expect(obs.map(o => o.sourceInstance)).toEqual(['Claude Code seed', 'Claude Code claude-fable-5-1']);
+			await fs.rm(dir, { recursive: true, force: true });
+		});
+
+		it('falls back to MEMORY_INSTANCE_NAME when the label file is empty or missing', async () => {
+			// A swept or never-created label file must not break a write: the harness
+			// fallback label is used instead (never 'unknown' while the env is set).
+			const dir = await fs.mkdtemp(path.join(tmpdir(), 'memory-instance-'));
+			const emptyFile = path.join(dir, 'empty.label');
+			await fs.writeFile(emptyFile, '  \n');
+			vi.stubEnv('MEMORY_INSTANCE_NAME', 'Kimi Code');
+			vi.stubEnv('MEMORY_INSTANCE_NAME_FILE', emptyFile);
+			await store.createEntities([{ name: 'EmptyLabel', entityType: 'machine', observations: ['empty label file'] }]);
+			vi.stubEnv('MEMORY_INSTANCE_NAME_FILE', path.join(dir, 'does-not-exist.label'));
+			await store.createEntities([{ name: 'MissingLabel', entityType: 'machine', observations: ['missing label file'] }]);
+
+			const graph = await store.readGraph();
+			expect(graph.entities.find(e => e.name === 'EmptyLabel')!.observations[0].sourceInstance).toBe('Kimi Code');
+			expect(graph.entities.find(e => e.name === 'MissingLabel')!.observations[0].sourceInstance).toBe('Kimi Code');
+			await fs.rm(dir, { recursive: true, force: true });
 		});
 
 		it('surfaces sourceInstance through entityTimeline, getContextLayers, and getSummary', async () => {

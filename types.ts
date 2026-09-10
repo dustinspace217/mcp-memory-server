@@ -2,6 +2,11 @@
 // SqliteStore (the sole live backend since v1.6.0) and the jsonl-reader migration
 // parser both depend on these types.
 
+// Only used by resolveSourceInstance() below: a synchronous read of the tiny
+// per-launch label file. Sync on purpose — the resolver is called from inside
+// write paths that are not async at that point, and the file is ~40 bytes.
+import { readFileSync } from 'node:fs';
+
 /**
  * A single piece of knowledge attached to an entity.
  * Each observation carries a creation timestamp for staleness detection.
@@ -23,7 +28,7 @@ export interface Observation {
   importance: number;           // 1.0-5.0, default 3.0
   contextLayer: string | null;  // null = L2 (on-demand), 'L0' = always loaded, 'L1' = session start
   memoryType: string | null;    // null = unclassified
-  sourceInstance: string;        // which Claude instance created this observation (from MEMORY_INSTANCE_NAME env var)
+  sourceInstance: string;        // who wrote this observation: '<Harness> <model>' from the launch-time label file, else MEMORY_INSTANCE_NAME (see resolveSourceInstance)
   /** VALID TIME (v14, bi-temporal-lite — Phase F): when the fact was true IN THE
    *  WORLD, distinct from createdAt/supersededAt (when the DATABASE learned or
    *  retired it). Caller-supplied ISO 8601 UTC; absent = unspecified. Set via
@@ -670,12 +675,38 @@ export interface GraphStore {
   deleteProspectiveTriggers(ids: number[]): Promise<number>;
 }
 
-/** Resolves which Claude Code instance is writing, from MEMORY_INSTANCE_NAME.
+/** Resolves which harness (and, since 2026-09-10, which model) is writing.
+ *  Precedence: the content of the file named by MEMORY_INSTANCE_NAME_FILE,
+ *  then MEMORY_INSTANCE_NAME, then 'unknown'.
+ *
+ *  Why a file and not just the env: every harness registers this server with a
+ *  STATIC env block, so a per-launch value (the model chosen by -m/--model or a
+ *  config default) can only reach the server through the environment the
+ *  harness inherits from its launcher — a thin wrapper exports the FILE path —
+ *  and only a file can be rewritten after launch (a SessionStart hook refining
+ *  the model; later, a per-write stamp) — a parent's env cannot.
+ *
  *  Single definition for all three consumers (Issue #80 — they had drifted
  *  into three independent copies). Read PER CALL (not cached at module load)
- *  so tests can stub the env without resetModules; trimmed so a
- *  whitespace-only value can't masquerade as a real instance name. */
+ *  so the label can change under a running server and so tests can stub the
+ *  env without resetModules; trimmed so a whitespace-only value can't
+ *  masquerade as a real instance name. A missing, unreadable, or empty label
+ *  file falls through to the env label: a memory write must never fail
+ *  because a label file was swept or never created. */
 export function resolveSourceInstance(): string {
+  const labelFile = (process.env.MEMORY_INSTANCE_NAME_FILE ?? '').trim();
+  if (labelFile) {
+    try {
+      // One line, inner whitespace collapsed, at most 120 chars: the label is
+      // rendered verbatim into loaded context headers, so a newline smuggled
+      // through a model argument must not become a second line there.
+      const fromFile = readFileSync(labelFile, 'utf8').split(/\s+/).filter(Boolean).join(' ').slice(0, 120);
+      if (fromFile) return fromFile;
+    } catch {
+      // Deliberately ignored: the file is optional; the static env label below
+      // is the documented fallback (Power-of-Ten rule 7: an intentional ignore).
+    }
+  }
   return (process.env.MEMORY_INSTANCE_NAME ?? '').trim() || 'unknown';
 }
 
