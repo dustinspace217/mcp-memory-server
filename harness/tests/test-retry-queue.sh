@@ -133,8 +133,23 @@ mkdir -p "$HOME/.claude/hooks" "$HOME/Claude" "$SANDBOX/bin"
 cp "$HOOKS/pre-compact-agent.sh" "$HOOKS/sessionend-save.sh" \
    "$HOOKS/memory-queue-lib.sh" "$HOOKS/precompact-prompt.md" \
    "$HOOKS/sessionend-prompt.md" "$HOME/.claude/hooks/"
-printf '#!/bin/bash\nexit 1\n' > "$SANDBOX/bin/claude"
-chmod +x "$SANDBOX/bin/claude"
+# Every stub records what the queue looked like at the moment claude ran: job dir
+# names plus their meta. This is the only honest pin of the write-ahead ORDER
+# (a mutant that stages the job AFTER the live run keeps every log line in place;
+# QA 2026-10-05, TA-1/TA-2). SESSIONEND_LOCK keeps the harness off the REAL save
+# lock so a test never blocks a live save or vice versa (TA-4).
+export SESSIONEND_LOCK="$SANDBOX/save.lock"
+SNAP="$SANDBOX/snap.txt"
+# The stub ALWAYS drains stdin first (real claude reads its prompt from stdin): a stub
+# that exits early leaves `sed` writing into a closed pipe, and under pipefail the
+# producer's pipeline reports 141 (SIGPIPE) instead of the stub's exit code — seen as a
+# load-dependent flake in the yield cell before this line existed.
+snapshot_stub() { # snapshot_stub EXIT-CODE [EXTRA-LINE]
+    printf '#!/bin/bash\ncat >> "%s/replay-stdin.txt"\n{ echo "== run $(date +%%s) ==" ; ls "$MQ_ROOT/jobs"; cat "$MQ_ROOT"/jobs/*/meta 2>/dev/null; } >> "%s"\n%s\nexit %s\n' \
+        "$SANDBOX" "$SNAP" "${2:-:}" "$1" > "$SANDBOX/bin/claude"
+    chmod +x "$SANDBOX/bin/claude"
+}
+snapshot_stub 1
 export PATH="$SANDBOX/bin:$PATH"
 unset CLAUDE_LIFECYCLE_AGENT || true
 
@@ -158,6 +173,7 @@ grep -q "@@EXCERPT@@" "$PJOB/prompt.txt" 2>/dev/null; check "precompact: prompt 
 [ "$(cat "$PJOB/cwd" 2>/dev/null)" = "$HOME/Claude" ]; check "precompact: cwd payload recorded" $?
 [ -x "$PJOB/job.sh" ]; check "precompact: job.sh is executable" $?
 grep -q "^ATTEMPTS=0$" "$PJOB/meta" 2>/dev/null; check "precompact: meta initialized" $?
+[ "$(sed -n 's/^NEXT_AFTER=//p' "$PJOB/meta")" -le "$(date +%s)" ]; check "precompact: enqueue-on-failure job is due now (TA-6)" $?
 
 # ── Producer: sessionend-save.sh enqueue-on-failure ──────────────────────
 bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess2" "$TRANSCRIPT" "$HOME/Claude"
@@ -175,14 +191,22 @@ grep -q "@@EXCERPT@@" "$SJOB/prompt.txt" 2>/dev/null; check "sessionend: prompt 
 # 1800 s delay; a FAILED attempt must pull it forward so the next tick runs it.
 grep -q "^NEXT_AFTER=0$" "$SJOB/meta" 2>/dev/null; check "sessionend: failed save makes the write-ahead job due now" $?
 grep -q "SessionEndSave | STAGED:" "$HOME/.claude/hooks/hook-execution.log" 2>/dev/null; check "sessionend: STAGED line logged before the live save" $?
+grep -q "SessionEndSave | START: helper running" "$HOME/.claude/hooks/hook-execution.log" 2>/dev/null; check "sessionend: START line logged first (SLA-3)" $?
+# Order pin (TA-1): the stub's snapshot must show a sessionend-save job at claude-run time,
+# and (TA-2) its NEXT_AFTER must carry the re-armed delay (> now+500 with the 600 s default).
+grep -q "sessionend-save" "$SNAP" 2>/dev/null; check "writeahead: job existed when claude ran (failure path, TA-1)" $?
+SNAP_NA=$(grep -h "^NEXT_AFTER=" "$SNAP" | tail -1 | cut -d= -f2)
+[ -n "$SNAP_NA" ] && [ "$SNAP_NA" -gt $(( $(date +%s) + 500 )) ]; check "writeahead: delay in force at claude-run time (TA-2)" $?
+grep -q "REPLAY NOTE" "$SJOB/prompt.txt" 2>/dev/null; check "writeahead: replay prompt carries the [replay] marker (SFH-5)" $?
+grep -q "flock -n" "$SJOB/job.sh" 2>/dev/null; check "writeahead: job.sh yields to a live save (flock -n)" $?
 
 # ── E2E replay: worker resolves the token to the MOVED job's excerpt ─────
 # Swap the shim for a capturing success stub and run the real worker over the
 # two producer jobs. Pins the whole chain: enqueue → move → job.sh run-time
 # substitution → claude stdin references a path that actually exists.
-printf '#!/bin/bash\ncat >> "%s/replay-stdin.txt"\nexit 0\n' "$SANDBOX" > "$SANDBOX/bin/claude"
-chmod +x "$SANDBOX/bin/claude"
+snapshot_stub 0 "cat >> \"$SANDBOX/replay-stdin.txt\""
 bash "$WORKER"
+[ -f "$MQ_ROOT/last-save/tsess2" ]; check "replay: successful replay records the excerpt hash (SFH-4)" $?
 grep -q -- "$SJOB/excerpt.jsonl" "$SANDBOX/replay-stdin.txt" 2>/dev/null; check "replay: sessionend prompt resolves to the moved excerpt path" $?
 grep -q -- "$PJOB/excerpt.jsonl" "$SANDBOX/replay-stdin.txt" 2>/dev/null; check "replay: precompact prompt resolves to the moved excerpt path" $?
 [ ! -d "$SJOB" ] && [ ! -d "$PJOB" ]; check "replay: successful jobs dequeued" $?
@@ -190,12 +214,114 @@ grep -q -- "$PJOB/excerpt.jsonl" "$SANDBOX/replay-stdin.txt" 2>/dev/null; check 
 # ── Write-ahead success path: live save wins → replay job cancelled ──────
 # Still on the success stub. The helper must stage a job, run the save, and
 # remove the job again, leaving nothing for the worker to replay twice.
+SNAP_BEFORE=$(grep -c "^== run" "$SNAP")
 bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess3" "$TRANSCRIPT" "$HOME/Claude"
-if ls "$MQ_ROOT/jobs/"*sessionend-save* >/dev/null 2>&1; then false; else true; fi
-check "writeahead: successful save cancels its replay job" $?
-grep -q "SessionEndSave | OK: save completed" "$HOME/.claude/hooks/hook-execution.log" 2>/dev/null; check "writeahead: success logged" $?
-# The stub received the LIVE prompt (excerpt path under /tmp), not the queued one.
+HLOG="$HOME/.claude/hooks/hook-execution.log"
+# TA-3: assert on THIS session's queue id, not on an empty directory.
+QID3=$(grep "session=tsess3" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
+[ -n "$QID3" ] && [ ! -d "$MQ_ROOT/jobs/$QID3" ]; check "writeahead: successful save cancels ITS replay job (TA-3)" $?
+grep -q "session=tsess3" <<< "$(grep "SessionEndSave | OK: save completed; replay job cancelled (queue=$QID3)" "$HLOG")"; check "writeahead: OK line names the cancelled job (SLA-2)" $?
+if grep "session=tsess3" "$HLOG" | grep -q -E "QUEUED|WARN"; then false; else true; fi
+check "writeahead: no QUEUED/WARN for a clean success (TA-3)" $?
 grep -q "transcript-excerpt-tsess3.jsonl" "$SANDBOX/replay-stdin.txt" 2>/dev/null; check "writeahead: live save ran with the live excerpt" $?
+[ "$(grep -c "^== run" "$SNAP")" -eq $(( SNAP_BEFORE + 1 )) ] && tail -n +"$(grep -n "^== run" "$SNAP" | tail -1 | cut -d: -f1)" "$SNAP" | grep -q "$QID3"
+check "writeahead: job existed when claude ran (success path, TA-1)" $?
+[ "$(cat "$MQ_ROOT/last-save/tsess3" 2>/dev/null)" = "$(sha256sum <(tail -300 "$TRANSCRIPT") | cut -d' ' -f1)" ]; check "writeahead: live success records the excerpt hash (SFH-4)" $?
+
+# ── Hash-skip: an unchanged excerpt is not re-saved; a changed one is ────
+SNAP_BEFORE=$(grep -c "^== run" "$SNAP")
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess3" "$TRANSCRIPT" "$HOME/Claude"
+grep -q "session=tsess3" <<< "$(grep "SessionEndSave | SKIP: excerpt unchanged" "$HLOG")"; check "hash-skip: unchanged excerpt logs SKIP (SFH-4)" $?
+[ "$(grep -c "^== run" "$SNAP")" -eq "$SNAP_BEFORE" ]; check "hash-skip: unchanged excerpt runs no claude and stages no job" $?
+if ls "$MQ_ROOT/jobs/"*sessionend-save* >/dev/null 2>&1; then false; else true; fi
+check "hash-skip: no job left behind by the skip" $?
+echo '{"line":13}' >> "$TRANSCRIPT"
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess3" "$TRANSCRIPT" "$HOME/Claude"
+[ "$(grep -c "^== run" "$SNAP")" -eq $(( SNAP_BEFORE + 1 )) ]; check "hash-skip: changed excerpt saves again" $?
+
+# ── Lib absent: write-ahead disabled LOUDLY (SFH-1) ──────────────────────
+mv "$HOME/.claude/hooks/memory-queue-lib.sh" "$SANDBOX/lib-aside.sh"
+snapshot_stub 1
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess4" "$TRANSCRIPT" "$HOME/Claude"
+grep "session=tsess4" "$HLOG" | grep -q "WARN: queue lib missing"; check "lib-absent: WARN that write-ahead is disabled (SFH-1)" $?
+grep "session=tsess4" "$HLOG" | grep -q "WARN: save failed and no replay job was staged"; check "lib-absent: failed save says the tail is lost" $?
+if ls "$MQ_ROOT/jobs/"*sessionend-save* >/dev/null 2>&1; then false; else true; fi
+check "lib-absent: nothing enqueued" $?
+mv "$SANDBOX/lib-aside.sh" "$HOME/.claude/hooks/memory-queue-lib.sh"
+
+# ── Kill cell (a): helper killed while waiting for the lock (the incident) ──
+# Pre-hold the sandbox lock, launch the helper, wait (bounded) for STAGED, SIGKILL it,
+# release the lock. The job must be on disk, carrying its delay, with no outcome line;
+# then a make_due + worker tick must replay it from the moved excerpt (TA-4a).
+exec 7>"$SESSIONEND_LOCK"; flock 7
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess5" "$TRANSCRIPT" "$HOME/Claude" &
+HPID=$!
+for _ in $(seq 1 40); do grep "session=tsess5" "$HLOG" 2>/dev/null | grep -q STAGED && break; sleep 0.25; done
+kill -9 "$HPID" 2>/dev/null; wait "$HPID" 2>/dev/null
+flock -u 7
+QID5=$(grep "session=tsess5" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
+[ -n "$QID5" ] && [ -d "$MQ_ROOT/jobs/$QID5" ]; check "kill-a: job survives a SIGKILL during the lock wait" $?
+[ "$(sed -n 's/^NEXT_AFTER=//p' "$MQ_ROOT/jobs/$QID5/meta")" -gt $(( $(date +%s) + 500 )) ]; check "kill-a: killed helper's job keeps its staging delay" $?
+if grep "session=tsess5" "$HLOG" | grep -q -E "OK:|FAIL:|QUEUED:"; then false; else true; fi
+check "kill-a: no outcome line (the silent shape the queue now covers)" $?
+snapshot_stub 0 "cat >> \"$SANDBOX/replay-stdin.txt\""
+mq_make_due "$MQ_ROOT/jobs/$QID5"
+bash "$WORKER"
+grep -q -- "$MQ_ROOT/jobs/$QID5/excerpt.jsonl" "$SANDBOX/replay-stdin.txt"; check "kill-a: worker replays the killed save from the moved excerpt" $?
+[ ! -d "$MQ_ROOT/jobs/$QID5" ]; check "kill-a: replayed job dequeued" $?
+
+# ── Kill cell (c): helper dies between claude exit 0 and mq_cancel (TA-4c) ──
+# The stub kills its grandparent (the helper; its parent is `timeout`) and exits 0.
+# The helper runs its claude pipeline in a SUBSHELL (echo | timeout claude), so the
+# stub's grandparent is that subshell, not the helper. Walk up and SIGKILL every
+# ancestor that is the helper script (subshell and helper alike) so the helper dies
+# before mq_cancel, which is the window under test.
+snapshot_stub 0 'p=$PPID; while [ "$p" -gt 1 ]; do tr "\\0" " " < /proc/$p/cmdline 2>/dev/null | grep -q sessionend-save.sh && kill -9 $p; p=$(ps -o ppid= -p $p 2>/dev/null | tr -d " "); [ -n "$p" ] || break; done'
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess6" "$TRANSCRIPT" "$HOME/Claude" 2>/dev/null
+QID6=$(grep "session=tsess6" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
+[ -n "$QID6" ] && [ -d "$MQ_ROOT/jobs/$QID6" ]; check "kill-c: job survives a kill after claude exit, before cancel (accepted duplicate window)" $?
+if grep "session=tsess6" "$HLOG" | grep -q "OK:"; then false; else true; fi
+check "kill-c: no OK line when the helper died before logging" $?
+rm -rf "$MQ_ROOT/jobs/$QID6"
+
+# ── Skip-if-gone: the worker consumed the job while the helper waited ────
+snapshot_stub 0
+SNAP_BEFORE=$(grep -c "^== run" "$SNAP")
+exec 7>"$SESSIONEND_LOCK"; flock 7
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess7" "$TRANSCRIPT" "$HOME/Claude" &
+HPID=$!
+for _ in $(seq 1 40); do grep "session=tsess7" "$HLOG" 2>/dev/null | grep -q STAGED && break; sleep 0.25; done
+QID7=$(grep "session=tsess7" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
+rm -rf "$MQ_ROOT/jobs/$QID7"          # simulate: worker replayed and dequeued it
+flock -u 7; wait "$HPID" 2>/dev/null
+grep "session=tsess7" "$HLOG" | grep -q "SKIP: replay job already consumed"; check "skip-if-gone: live save skipped when the replay already ran (CR-1/SLA-1)" $?
+[ "$(grep -c "^== run" "$SNAP")" -eq "$SNAP_BEFORE" ]; check "skip-if-gone: no live claude run" $?
+
+# ── Yield: a due replay job does not run beside a live save (flock -n in job.sh) ──
+snapshot_stub 1
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess8" "$TRANSCRIPT" "$HOME/Claude"   # fails -> job due now
+QID8=$(grep "session=tsess8" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
+exec 7>"$SESSIONEND_LOCK"; flock 7
+snapshot_stub 0
+bash "$WORKER"
+flock -u 7
+[ -d "$MQ_ROOT/jobs/$QID8" ] && grep -q "attempt 1 failed (rc=75)" "$MQ_LOGFILE"; check "yield: replay exits 75 and stays queued while a live save holds the lock" $?
+sed -i 's/^NEXT_AFTER=.*/NEXT_AFTER=0/' "$MQ_ROOT/jobs/$QID8/meta"
+bash "$WORKER"
+[ ! -d "$MQ_ROOT/jobs/$QID8" ]; check "yield: replay runs once the lock is free" $?
+
+# ── Re-arm: delay measured from the lock, not from staging (CR-1/SLA-1) ──
+# Hold the lock 3 s with a 1 s delay: without the re-arm the snapshot would show a
+# NEXT_AFTER already in the past when claude ran.
+export SESSIONEND_WRITEAHEAD_DELAY=1
+snapshot_stub 0
+exec 7>"$SESSIONEND_LOCK"; flock 7
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess9" "$TRANSCRIPT" "$HOME/Claude" &
+HPID=$!
+sleep 3; T_RELEASE=$(date +%s); flock -u 7; wait "$HPID" 2>/dev/null
+SNAP_NA=$(grep -h "^NEXT_AFTER=" "$SNAP" | tail -1 | cut -d= -f2)
+[ -n "$SNAP_NA" ] && [ "$SNAP_NA" -ge "$T_RELEASE" ]; check "re-arm: NEXT_AFTER re-stamped after the lock was acquired" $?
+unset SESSIONEND_WRITEAHEAD_DELAY
 
 # ── Lib: initial delay + cancel + make_due ───────────────────────────────
 STAGE=$(mq_new_staging "t-delay"); printf '#!/bin/bash\nexit 0\n' > "$STAGE/job.sh"
@@ -205,12 +331,32 @@ NA=$(sed -n 's/^NEXT_AFTER=//p' "$DJOB/meta"); NOW=$(date +%s)
 [ "$NA" -gt $(( NOW + 1700 )) ] && [ "$NA" -le $(( NOW + 1800 )) ]; check "lib: initial delay sets NEXT_AFTER ~1800 s ahead" $?
 bash "$WORKER"
 [ -d "$DJOB" ]; check "lib: delayed job is skipped by the worker (not due)" $?
+mq_defer "$DJOB" 300
+NA=$(sed -n 's/^NEXT_AFTER=//p' "$DJOB/meta"); NOW=$(date +%s)
+[ "$NA" -gt $(( NOW + 290 )) ] && [ "$NA" -le $(( NOW + 300 )) ]; check "lib: mq_defer re-stamps NEXT_AFTER from now" $?
 mq_make_due "$DJOB"
 grep -q "^NEXT_AFTER=0$" "$DJOB/meta"; check "lib: mq_make_due pulls the job forward" $?
+mq_job_present "$DJOB"; check "lib: mq_job_present sees a live job" $?
+# rm failure must be REPORTED (CR-3): make the jobs dir read-only so rm -rf fails.
+chmod a-w "$MQ_ROOT/jobs"
+if mq_cancel "$DJOB"; then false; else true; fi
+check "lib: mq_cancel returns nonzero when the job could not be removed (CR-3)" $?
+chmod u+w "$MQ_ROOT/jobs"
 mq_cancel "$DJOB"
 [ ! -d "$DJOB" ]; check "lib: mq_cancel removes the job" $?
 mq_cancel "$DJOB"; check "lib: mq_cancel is idempotent on a missing dir" $?
 mq_cancel ""; check "lib: mq_cancel tolerates an empty path" $?
+if mq_make_due "$DJOB"; then false; else true; fi
+check "lib: mq_make_due reports a consumed job (CR-3)" $?
+if mq_job_present "$DJOB"; then false; else true; fi
+check "lib: mq_job_present is false for a consumed job" $?
+STAGE=$(mq_new_staging "t-empty"); : > "$STAGE/job.sh"
+if mq_enqueue "$STAGE" 30; then false; else true; fi
+check "lib: mq_enqueue refuses an EMPTY job.sh (SFH-6)" $?
+STAGE=$(mq_new_staging "t-lastjob"); printf '#!/bin/bash\nexit 0\n' > "$STAGE/job.sh"
+mq_enqueue "$STAGE" 30 && [ -d "$MQ_LAST_JOB" ] && [ "$MQ_LAST_JOB" = "$MQ_ROOT/jobs/$(basename "$STAGE")" ]
+check "lib: mq_enqueue exposes the published path in MQ_LAST_JOB (CR-4)" $?
+rm -rf "$MQ_LAST_JOB"
 
 echo "---"
 echo "RESULT: $PASS passed, $FAIL failed"

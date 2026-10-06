@@ -10,6 +10,14 @@
 # empirically verified (2026-06-10) to survive a process-group SIGTERM, so this
 # detached worker completes the save regardless of teardown.
 #
+# LIMIT (verified 2026-10-05): setsid leaves the dying process GROUP, not the
+# session scope's CGROUP. At logout/shutdown systemd stops session-N.scope with
+# KillMode=control-group: SIGTERM+SIGHUP to every process in it at once, SIGKILL
+# 45 s later (TimeoutStopUSec). A helper alive at that sweep dies on the SIGTERM;
+# one forked after the sweep's last pass lives until the SIGKILL. Either way the
+# save does not survive a shutdown, which is why the replay job below is
+# persisted BEFORE anything slow happens.
+#
 # Logs its OWN outcome to hook-execution.log under the SessionEndSave source —
 # the parent hook returns before the save finishes, so it can no longer report
 # the result. A FAIL here is therefore a REAL save failure (worth the
@@ -27,6 +35,23 @@ mkdir -p /tmp/claude
 log() {
     echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') | SessionEndSave | $1 (session=${SESSION_ID})" >> "$LOGFILE"
 }
+
+# First line of evidence that the helper ran at all: a helper killed before it
+# can stage its replay job would otherwise leave only the launcher's OK line
+# (QA 2026-10-05, SLA-3). The pid lets the launcher's line and this one be paired.
+log "START: helper running (pid $$)"
+
+# TEST SEAMS (env-overridable, defaults are production). Documented here because
+# Power-of-Ten rule 8 counts every env-driven path:
+#  SESSIONEND_LOCK — the serialization lock file. The harness points it into its
+#    sandbox so a test never blocks a real save, or vice versa (QA 2026-10-05, TA-4).
+#  SESSIONEND_WRITEAHEAD_DELAY — seconds before the replay job becomes due. The
+#    delay is RE-ARMED right after the lock is acquired (see below), so it only
+#    has to outlast one live attempt (<= 310 s); 600 s is ~2x that and lets a
+#    shutdown-killed save replay at the first worker tick 10 min after staging,
+#    i.e. 5-25 min after the next boot (timer: OnBootSec=5min, OnUnitActiveSec=20min).
+LOCK_PATH="${SESSIONEND_LOCK:-/tmp/claude/sessionend-save.lock}"
+WRITEAHEAD_DELAY="${SESSIONEND_WRITEAHEAD_DELAY:-600}"
 
 PROMPT_TEMPLATE="$HOME/.claude/hooks/sessionend-prompt.md"
 if [ ! -f "$PROMPT_TEMPLATE" ]; then
@@ -60,54 +85,93 @@ PROMPT=$(sed \
 # lock and then runs claude -p for 30-120 s was killed every time (42 launches,
 # 1 outcome logged, 0 narratives), and because it died before the old
 # enqueue-on-failure block, nothing was queued either. A shutdown-detection
-# gate was rejected: the kill races the hook at sub-second scale. Persisting
-# the job first costs a mkdir+cp (milliseconds) and makes the save durable
-# regardless of how fast the kill arrives; memory-retry.timer replays it
-# ~5 min after the next boot. The 1800 s initial delay keeps the worker from
-# running the job while the live attempt is still queued behind the lock (a
-# 14-session shutdown burst serializes to ~15 min) — on success the job is
-# cancelled, on failure it is pulled forward to the next tick.
+# gate was rejected: the scope stop lands in the same second as the hook, so
+# detection could miss while a persisted job cannot. Staging costs a mkdir+cp
+# (milliseconds). The job becomes due WRITEAHEAD_DELAY after it is RE-ARMED
+# below (right after the lock), so a long lock wait cannot make it due while
+# the live attempt is still pending (QA 2026-10-05, four seats). A helper
+# killed before the re-arm leaves the job due WRITEAHEAD_DELAY after staging,
+# and memory-retry.timer replays it at its next tick after that.
 JOBDIR=""
 QUEUE_LIB="$HOME/.claude/hooks/memory-queue-lib.sh"
 if [ -f "$QUEUE_LIB" ]; then
     # shellcheck disable=SC1090
     source "$QUEUE_LIB"
+
+    # Unchanged excerpt = nothing new to narrate. Sessions kept alive across
+    # reboots by the resume protocol end at EVERY shutdown, and an idle tab's
+    # last-300-lines excerpt is identical night after night; without this check
+    # each night re-saved the same tail as a fresh narrative (QA 2026-10-05,
+    # SFH-4). The hash of the last COMPLETED save is kept per session id under
+    # the queue root (written by the live path below and by job.sh on replay;
+    # pruned after 30 days by the worker).
+    EXCERPT_HASH=$(sha256sum "$EXCERPT" | cut -d' ' -f1)
+    HASH_FILE="$MQ_ROOT/last-save/${SESSION_ID}"
+    if [ -f "$HASH_FILE" ] && [ "$(cat "$HASH_FILE" 2>/dev/null)" = "$EXCERPT_HASH" ]; then
+        log "SKIP: excerpt unchanged since this session's last completed save — nothing new to narrate"
+        rm -f "$EXCERPT"
+        exit 0
+    fi
+
     STAGE=$(mq_new_staging "sessionend-save")
-    if cp "$EXCERPT" "$STAGE/excerpt.jsonl" 2>/dev/null; then
+    if cp "$EXCERPT" "$STAGE/excerpt.jsonl"; then
         # @@EXCERPT@@ is resolved by job.sh at RUN time — mq_enqueue moves the
         # job dir, so a staging path baked here would dangle (bug caught by the
         # harness test, 2026-07-02). The SESSION_ID sed is a harmless no-op kept
         # for symmetry with the precompact enqueue: sessionend-prompt.md has no
-        # {{SESSION_ID}} placeholder.
-        sed \
-            -e "s|{{TRANSCRIPT_PATH}}|@@EXCERPT@@|g" \
-            -e "s|{{CWD}}|${CWD}|g" \
-            -e "s|{{SESSION_ID}}|${SESSION_ID}-retry|g" \
-            "$PROMPT_TEMPLATE" > "$STAGE/prompt.txt"
-        echo "$CWD" > "$STAGE/cwd"
-        cat > "$STAGE/job.sh" <<'JOBEOF'
+        # {{SESSION_ID}} placeholder. The appended REPLAY NOTE makes a replayed
+        # narrative distinguishable from the live one it may duplicate
+        # (QA 2026-10-05, SFH-5).
+        {
+            sed \
+                -e "s|{{TRANSCRIPT_PATH}}|@@EXCERPT@@|g" \
+                -e "s|{{CWD}}|${CWD}|g" \
+                -e "s|{{SESSION_ID}}|${SESSION_ID}-retry|g" \
+                "$PROMPT_TEMPLATE"
+            printf '\n\nREPLAY NOTE: this is a REPLAY of the session-end save (the live attempt did not complete, e.g. the machine shut down). Prefix the session narrative with "[replay] " so it can be told apart from a live narrative of the same session.\n'
+        } > "$STAGE/prompt.txt" || log "WARN: prompt.txt write failed (rc=$?) — replay may be unusable"
+        echo "$CWD" > "$STAGE/cwd" || log "WARN: cwd write failed (rc=$?)"
+        # Values baked at staging time (the worker runs job.sh without this
+        # helper's environment): the lock path, so the replay yields to a live
+        # save instead of running beside it; the hash store path and the
+        # excerpt hash, so a successful replay records the save like the live
+        # path does.
+        cat > "$STAGE/job.sh" <<JOBEOF
 #!/bin/bash
 # Replays a SessionEnd memory save whose live attempt did not complete
 # (killed by a shutdown, usage limit, timeout, ...).
 set -uo pipefail
-DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$(cat "$DIR/cwd" 2>/dev/null)" 2>/dev/null || cd "$HOME/Claude" || exit 1
-sed "s|@@EXCERPT@@|$DIR/excerpt.jsonl|g" "$DIR/prompt.txt" | \
-CLAUDE_LIFECYCLE_AGENT=1 claude -p \
-    --permission-mode bypassPermissions \
-    --model sonnet \
-    --no-session-persistence \
-    --output-format text
+DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+# Yield, never wait: if a live session-end save holds the lock, exit nonzero and
+# let the worker retry later (a blocking wait would stall the single-flight
+# worker behind a whole burst; QA 2026-10-05, CR-1/SLA-1).
+exec 8>"${LOCK_PATH}"
+if ! flock -n 8; then
+    echo "live session-end save holds the lock; yielding"
+    exit 75
+fi
+cd "\$(cat "\$DIR/cwd" 2>/dev/null)" 2>/dev/null || cd "\$HOME/Claude" || exit 1
+sed "s|@@EXCERPT@@|\$DIR/excerpt.jsonl|g" "\$DIR/prompt.txt" | \\
+CLAUDE_LIFECYCLE_AGENT=1 claude -p \\
+    --permission-mode bypassPermissions \\
+    --model sonnet \\
+    --no-session-persistence \\
+    --output-format text || exit \$?
+mkdir -p "${MQ_ROOT}/last-save" && echo "${EXCERPT_HASH}" > "${MQ_ROOT}/last-save/${SESSION_ID}"
 JOBEOF
-        if mq_enqueue "$STAGE" 420 1800; then
-            JOBDIR="$MQ_ROOT/jobs/$(basename "$STAGE")"
-            log "STAGED: replay job persisted before the live save (queue=$(basename "$STAGE"))"
+        if mq_enqueue "$STAGE" 420 "$WRITEAHEAD_DELAY"; then
+            JOBDIR="$MQ_LAST_JOB"
+            log "STAGED: replay job persisted before the live save (queue=$(basename "$JOBDIR"))"
         else
-            log "WARN: write-ahead enqueue failed — a killed save will not be retried"
+            log "WARN: write-ahead enqueue failed (rc=$?) — a killed save will not be retried"
         fi
     else
-        log "WARN: could not persist excerpt — a killed save will not be retried"
+        log "WARN: could not persist excerpt (cp rc=$?) — a killed save will not be retried"
     fi
+else
+    # Without the lib the helper is exactly the pre-2026-10-05 code: a shutdown
+    # kill would leave no trace. Say so (QA 2026-10-05, SFH-1).
+    log "WARN: queue lib missing at $QUEUE_LIB — write-ahead disabled, a killed save will not be retried"
 fi
 
 # Serialize concurrent detached saves so back-to-back session-ends don't stack
@@ -115,8 +179,22 @@ fi
 # tail is unique data and skipping loses exactly what this save exists to
 # capture. Detached, so waiting for the lock costs nothing (and the replay job
 # above is already on disk if the wait is cut short by a shutdown).
-exec 9>"/tmp/claude/sessionend-save.lock"
+exec 9>"$LOCK_PATH"
 flock 9
+
+# Past the lock. Two things before the live run (QA 2026-10-05, CR-1/SLA-1):
+# (1) if the worker already replayed this save while we waited, the job dir is
+#     gone — running the live save now would write a duplicate, so skip it;
+# (2) otherwise re-arm the delay from NOW, so it only has to outlast this one
+#     attempt (bounded at 310 s) rather than the whole lock wait.
+if [ -n "$JOBDIR" ]; then
+    if ! mq_job_present "$JOBDIR"; then
+        log "SKIP: replay job already consumed by the worker while waiting for the lock — live save skipped to avoid a duplicate (queue=$(basename "$JOBDIR"))"
+        rm -f "$EXCERPT"
+        exit 0
+    fi
+    mq_defer "$JOBDIR" "$WRITEAHEAD_DELAY" || log "WARN: could not re-arm the replay delay (rc=$?) — it stays due ${WRITEAHEAD_DELAY}s after staging"
+fi
 
 cd "$CWD" 2>/dev/null || cd "$HOME/Claude"
 
@@ -138,9 +216,22 @@ echo "$PROMPT" | CLAUDE_LIFECYCLE_AGENT=1 timeout -k 10 300 claude -p \
     > "$STDOUT_FILE" 2> "$STDERR_FILE" 9>&-
 RC=$?
 if [ "$RC" -eq 0 ]; then
-    log "OK: save completed ($(wc -c < "$STDOUT_FILE") chars output)"
     rm -f "$STDOUT_FILE" "$STDERR_FILE"
-    mq_cancel "$JOBDIR" 2>/dev/null || true   # live save won; drop the write-ahead replay
+    # Live save won. Record the excerpt hash (SFH-4), then drop the replay job
+    # and SAY what happened to it (directive 6; QA 2026-10-05, SLA-2/CR-3): a job
+    # that is already gone means the worker replayed it and a duplicate may exist.
+    if [ -n "$JOBDIR" ]; then
+        mkdir -p "$MQ_ROOT/last-save" && echo "$EXCERPT_HASH" > "$HASH_FILE"
+        if ! mq_job_present "$JOBDIR"; then
+            log "OK: save completed; replay job was already gone — the worker may have written a duplicate (queue=$(basename "$JOBDIR"))"
+        elif mq_cancel "$JOBDIR"; then
+            log "OK: save completed; replay job cancelled (queue=$(basename "$JOBDIR"))"
+        else
+            log "WARN: save completed but the replay job could not be removed (rc=$?) — it will replay as a duplicate (queue=$(basename "$JOBDIR"))"
+        fi
+    else
+        log "OK: save completed (no replay job was staged)"
+    fi
 elif [ "$RC" -eq 124 ]; then
     log "FAIL: internal timeout after 300s (stdout=$(head -c 300 "$STDOUT_FILE" 2>/dev/null | tr '\n' ' '))"
 elif [ "$RC" -eq 137 ]; then
@@ -152,15 +243,17 @@ fi
 # Durable retry (2026-07-02; write-ahead since 2026-10-05): the replay job was
 # persisted above, before the live attempt. On failure, pull it forward so
 # memory-retry.timer runs it at the next tick and retries with backoff until
-# usage/capacity returns. If the write-ahead step itself failed, say so loudly:
-# this session's tail (every turn since the last mid-session checkpoint) is
-# unique data and is now lost.
+# usage/capacity returns. Every branch logs what is true of the job (directive
+# 6): staged or not, still present or already replayed, made due or not.
 if [ "$RC" -ne 0 ]; then
-    if [ -n "$JOBDIR" ] && [ -d "$JOBDIR" ]; then
-        mq_make_due "$JOBDIR"
+    if [ -z "$JOBDIR" ]; then
+        log "WARN: save failed and no replay job was staged — tail lost"
+    elif ! mq_job_present "$JOBDIR"; then
+        log "WARN: save failed but the replay job is already gone — the worker replayed it, nothing more to retry (queue=$(basename "$JOBDIR"))"
+    elif mq_make_due "$JOBDIR"; then
         log "QUEUED: failed save will be retried from the write-ahead job (queue=$(basename "$JOBDIR"))"
     else
-        log "WARN: save failed and no replay job exists — tail lost"
+        log "WARN: save failed and the replay job could not be made due (rc=$?) — it stays due ${WRITEAHEAD_DELAY}s after staging (queue=$(basename "$JOBDIR"))"
     fi
 fi
 

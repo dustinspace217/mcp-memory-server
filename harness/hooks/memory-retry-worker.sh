@@ -123,5 +123,9 @@ done
 # than the queue's own layout.
 find "$MQ_ROOT/failed" -mindepth 1 -maxdepth 1 -type d -mtime +30 -exec rm -rf {} + 2>/dev/null || true
 find "$MQ_ROOT/staging" -mindepth 1 -maxdepth 1 -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+# last-save/<session-id> holds the excerpt hash of each session's last completed
+# save (sessionend-save.sh skips an unchanged excerpt). One small file per session
+# id, nothing else resets it, so prune after 30 days (QA 2026-10-05, SFH-4/SLA).
+find "$MQ_ROOT/last-save" -mindepth 1 -maxdepth 1 -type f -mtime +30 -delete 2>/dev/null || true
 
 exit 0
