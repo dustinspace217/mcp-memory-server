@@ -109,7 +109,10 @@ mq_cancel() {
 # its last act while still holding the lock, so a helper that wakes in that gap
 # sees "completed", not "present" (cross-family QA 2026-10-05, XFA-3/XFK-3).
 mq_job_present() {
-    [ -n "${1:-}" ] && [ -d "$1" ] && [ ! -e "$1/.done" ]
+    if [ -n "${1:-}" ] && [ -d "$1" ] && [ ! -e "$1/.done" ]; then
+        return 0
+    fi
+    return 1
 }
 
 # mq_make_due JOB_DIR — pull a job forward so the next worker tick runs it (the
@@ -129,7 +132,9 @@ mq_make_due() {
 # where an unbounded lock wait could outlast it (QA 2026-10-05, CR-1/SLA-1).
 mq_defer() {
     local jobdir="$1" secs="${2:-0}"
-    [ -n "$jobdir" ] && [ -f "$jobdir/meta" ] || return 1
+    if [ -z "$jobdir" ] || [ ! -f "$jobdir/meta" ]; then
+        return 1
+    fi
     sed -i "s/^NEXT_AFTER=.*/NEXT_AFTER=$(( $(date +%s) + secs ))/" "$jobdir/meta"
 }
 

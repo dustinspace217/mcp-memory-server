@@ -87,11 +87,15 @@ PROMPT=$(sed \
 # enqueue-on-failure block, nothing was queued either. A shutdown-detection
 # gate was rejected: the scope stop lands in the same second as the hook, so
 # detection could miss while a persisted job cannot. Staging costs a mkdir+cp
-# (milliseconds). The job becomes due WRITEAHEAD_DELAY after it is RE-ARMED
-# below (right after the lock), so a long lock wait cannot make it due while
-# the live attempt is still pending (QA 2026-10-05, four seats). A helper
-# killed before the re-arm leaves the job due WRITEAHEAD_DELAY after staging,
-# and memory-retry.timer replays it at its next tick after that.
+# (milliseconds). The job becomes due WRITEAHEAD_DELAY after staging, and is
+# RE-ARMED below (right after the lock) so that once the live attempt starts
+# the delay only has to outlast that one bounded attempt. A lock wait longer
+# than the delay CAN make the job due while the helper still waits; in that
+# case job.sh finds the lock held and yields (exit 75, no attempt counted), and
+# the hash check / .done marker keep the two paths from both saving (QA
+# 2026-10-05, four seats + cross-family). A helper killed before the re-arm
+# leaves the job due WRITEAHEAD_DELAY after staging, and memory-retry.timer
+# replays it at its next tick after that.
 JOBDIR=""
 QUEUE_LIB="$HOME/.claude/hooks/memory-queue-lib.sh"
 if [ -f "$QUEUE_LIB" ]; then
@@ -105,9 +109,11 @@ if [ -f "$QUEUE_LIB" ]; then
     # SFH-4). The hash of the last COMPLETED save is kept per session id under
     # the queue root (written by the live path below and by job.sh on replay;
     # pruned after 30 days by the worker).
-    EXCERPT_HASH=$(sha256sum "$EXCERPT" | cut -d' ' -f1)
+    EXCERPT_HASH=$(sha256sum "$EXCERPT" 2>/dev/null | cut -d' ' -f1)
     HASH_FILE="$MQ_ROOT/last-save/${SESSION_ID}"
-    if [ -f "$HASH_FILE" ] && [ "$(cat "$HASH_FILE" 2>/dev/null)" = "$EXCERPT_HASH" ]; then
+    # -n guard: an empty hash (sha256sum failed) must never compare equal to a
+    # missing file and skip a real save (QA 2026-10-05, SCR-11).
+    if [ -n "$EXCERPT_HASH" ] && [ -f "$HASH_FILE" ] && [ "$(cat "$HASH_FILE" 2>/dev/null)" = "$EXCERPT_HASH" ]; then
         log "SKIP: excerpt unchanged since this session's last completed save — nothing new to narrate"
         rm -f "$EXCERPT"
         exit 0
@@ -142,6 +148,12 @@ if [ -f "$QUEUE_LIB" ]; then
 # (killed by a shutdown, usage limit, timeout, ...).
 set -uo pipefail
 DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+# Already completed on an earlier attempt (the worker died between my .done and
+# its rm)? Then there is nothing to replay (QA 2026-10-05, SCR-12).
+if [ -e "\$DIR/.done" ]; then
+    echo "already completed; nothing to replay"
+    exit 0
+fi
 # The lock lives under /tmp/claude, which a reboot erases and only a Claude hook
 # recreates; a replay at the first post-boot tick may run before any does
 # (cross-family QA 2026-10-05, XFA-1). An open() failure here would otherwise
@@ -159,7 +171,7 @@ fi
 # job, so a helper killed between those two steps leaves a job whose save is
 # complete. Checking the hash here turns the "accepted duplicate window" into a
 # no-op replay (cross-family QA 2026-10-05, XFK-1).
-if [ "\$(cat "${MQ_ROOT}/last-save/${SESSION_ID}" 2>/dev/null)" = "${EXCERPT_HASH}" ]; then
+if [ -n "${EXCERPT_HASH}" ] && [ "\$(cat "${MQ_ROOT}/last-save/${SESSION_ID}" 2>/dev/null)" = "${EXCERPT_HASH}" ]; then
     echo "live save already recorded this excerpt; nothing to replay"
     touch "\$DIR/.done" 2>/dev/null || true
     exit 0
@@ -173,7 +185,11 @@ CLAUDE_LIFECYCLE_AGENT=1 claude -p \\
     --permission-mode bypassPermissions \\
     --model sonnet \\
     --no-session-persistence \\
-    --output-format text < "\$DIR/prompt.resolved" || exit \$?
+    --output-format text < "\$DIR/prompt.resolved" 8>&- || exit \$?
+# 8>&- above: the lock fd must not leak to claude's process tree, or a lingering
+# descendant would hold the save lock after this script exits and every live
+# save would block forever (same fix as the live path's 9>&-, QA 2026-07-02;
+# re-found 2026-10-05, SCR-4).
 # The narrative is the payload; the hash and the marker are bookkeeping and must
 # never turn a completed save into a failed attempt that replays it (XFK-4).
 { mkdir -p "${MQ_ROOT}/last-save" && echo "${EXCERPT_HASH}" > "${MQ_ROOT}/last-save/${SESSION_ID}"; } 2>/dev/null || true
@@ -203,10 +219,11 @@ exec 9>"$LOCK_PATH"
 flock 9
 
 # Past the lock. Two things before the live run (QA 2026-10-05, CR-1/SLA-1):
-# (1) if the worker already replayed this save while we waited, the job dir is
-#     gone — running the live save now would write a duplicate, so skip it;
-# (2) otherwise re-arm the delay from NOW, so it only has to outlast this one
-#     attempt (bounded at 310 s) rather than the whole lock wait.
+# (1) if the worker already replayed this save while we waited, the job is
+#     gone or marked .done — running the live save now would write a
+#     duplicate, so skip it;
+# (2) otherwise re-arm the delay from NOW, so from here it only has to outlast
+#     this one attempt (bounded at 310 s).
 if [ -n "$JOBDIR" ]; then
     if ! mq_job_present "$JOBDIR"; then
         log "SKIP: replay job already consumed by the worker while waiting for the lock — live save skipped to avoid a duplicate (queue=$(basename "$JOBDIR"))"

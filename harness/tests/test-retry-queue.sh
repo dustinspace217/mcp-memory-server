@@ -381,6 +381,22 @@ bash "$MQ_ROOT/jobs/$QID15/job.sh" >/dev/null 2>&1
 [ "$(cat "$MQ_ROOT/last-save/tsess15" 2>/dev/null)" = "$(sha256sum <(tail -300 "$TRANSCRIPT") | cut -d' ' -f1)" ]; check "done-marker: job.sh records the excerpt hash on success" $?
 rm -rf "$MQ_ROOT/jobs/$QID15"
 
+# ── SCR-12: job.sh exits 0 at entry when its own .done already exists (worker died before rm) ──
+echo '{"line":18}' >> "$TRANSCRIPT"
+snapshot_stub 1
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess16" "$TRANSCRIPT" "$HOME/Claude"   # fails -> due job
+QID16=$(grep "session=tsess16" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
+touch "$MQ_ROOT/jobs/$QID16/.done"
+SNAP_BEFORE=$(grep -c "^== run" "$SNAP")
+snapshot_stub 0
+bash "$MQ_ROOT/jobs/$QID16/job.sh" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && [ "$(grep -c "^== run" "$SNAP")" -eq "$SNAP_BEFORE" ]; check "scr-12: a job already marked .done exits 0 without running claude" $?
+# Match the fd-close on the claude INVOCATION line (the explanatory comment in job.sh
+# also contains the token, which made a bare grep vacuous — caught by mutant M19).
+grep -q 'prompt.resolved" 8>&-' "$MQ_ROOT/jobs/$QID16/job.sh"; check "scr-4: job.sh closes the lock fd for the claude child" $?
+grep -q -- '-n "[0-9a-f]\{64\}" \] && \[ "' "$MQ_ROOT/jobs/$QID16/job.sh"; check "scr-11: job.sh hash check is guarded by a non-empty baked hash" $?
+rm -rf "$MQ_ROOT/jobs/$QID16"
+
 # ── STA-3: the three producer branches that only execute when the job vanishes mid-run ──
 # (a) success, job gone -> OK "already gone — may have written a duplicate"
 snapshot_stub 0 'rm -rf "$MQ_ROOT"/jobs/*sessionend-save*'
