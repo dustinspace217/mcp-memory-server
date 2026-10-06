@@ -48,13 +48,18 @@ mq_new_staging() {
     echo "$dir"
 }
 
-# mq_enqueue STAGING_DIR JOB_TIMEOUT_SECS — finalize a staged job.
+# mq_enqueue STAGING_DIR JOB_TIMEOUT_SECS [INITIAL_DELAY_SECS] — finalize a staged job.
 # Writes meta, marks job.sh executable, atomically publishes to jobs/.
 # Returns non-zero if the staging dir is missing job.sh (refuse to enqueue
 # a job that can never run — explicit recovery per Power-of-Ten rule 5).
+# INITIAL_DELAY_SECS (default 0 = due at the next worker tick) exists for the
+# WRITE-AHEAD pattern (2026-10-05): a producer persists the job BEFORE its live
+# attempt and cancels it on success, so the job must not become due while the
+# live attempt is still running or waiting on the save lock.
 mq_enqueue() {
     local staging="$1"
     local job_timeout="${2:-420}"
+    local initial_delay="${3:-0}"
     if [ ! -f "$staging/job.sh" ]; then
         return 1
     fi
@@ -64,12 +69,30 @@ mq_enqueue() {
         echo "LABEL='${jobid}'"
         echo "CREATED=$(date +%s)"
         echo "ATTEMPTS=0"
-        echo "NEXT_AFTER=0"
+        echo "NEXT_AFTER=$(( $(date +%s) + initial_delay ))"
         echo "JOB_TIMEOUT=${job_timeout}"
     } > "$staging/meta"
     chmod +x "$staging/job.sh"
     mkdir -p "$MQ_ROOT/jobs"
     mv "$staging" "$MQ_ROOT/jobs/$jobid"
+}
+
+# mq_cancel JOB_DIR — remove a published job that is no longer needed (the
+# write-ahead producer's live attempt succeeded). Idempotent: a missing dir
+# (the worker already ran and dequeued it) is not an error.
+mq_cancel() {
+    local jobdir="$1"
+    [ -n "$jobdir" ] && [ -d "$jobdir" ] && rm -rf "$jobdir"
+    return 0
+}
+
+# mq_make_due JOB_DIR — pull a delayed job forward so the next worker tick runs
+# it (the write-ahead producer's live attempt FAILED; retry as soon as possible,
+# exactly as the old enqueue-on-failure path did).
+mq_make_due() {
+    local jobdir="$1"
+    [ -n "$jobdir" ] && [ -f "$jobdir/meta" ] && sed -i 's/^NEXT_AFTER=.*/NEXT_AFTER=0/' "$jobdir/meta"
+    return 0
 }
 
 # mq_has_job LABEL_SUBSTRING — 0 if any pending job's id contains the substring.

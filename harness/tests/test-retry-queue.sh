@@ -171,6 +171,10 @@ if grep -q "{{" "$SJOB/prompt.txt" 2>/dev/null; then false; else true; fi
 check "sessionend: no unsubstituted placeholders in prompt" $?
 grep -q "@@EXCERPT@@" "$SJOB/prompt.txt" 2>/dev/null; check "sessionend: prompt carries the run-time excerpt token" $?
 [ -s "$SJOB/excerpt.jsonl" ]; check "sessionend: excerpt persisted into the job" $?
+# Write-ahead (2026-10-05): the job is persisted BEFORE the live attempt with a
+# 1800 s delay; a FAILED attempt must pull it forward so the next tick runs it.
+grep -q "^NEXT_AFTER=0$" "$SJOB/meta" 2>/dev/null; check "sessionend: failed save makes the write-ahead job due now" $?
+grep -q "SessionEndSave | STAGED:" "$HOME/.claude/hooks/hook-execution.log" 2>/dev/null; check "sessionend: STAGED line logged before the live save" $?
 
 # ── E2E replay: worker resolves the token to the MOVED job's excerpt ─────
 # Swap the shim for a capturing success stub and run the real worker over the
@@ -182,6 +186,31 @@ bash "$WORKER"
 grep -q -- "$SJOB/excerpt.jsonl" "$SANDBOX/replay-stdin.txt" 2>/dev/null; check "replay: sessionend prompt resolves to the moved excerpt path" $?
 grep -q -- "$PJOB/excerpt.jsonl" "$SANDBOX/replay-stdin.txt" 2>/dev/null; check "replay: precompact prompt resolves to the moved excerpt path" $?
 [ ! -d "$SJOB" ] && [ ! -d "$PJOB" ]; check "replay: successful jobs dequeued" $?
+
+# ── Write-ahead success path: live save wins → replay job cancelled ──────
+# Still on the success stub. The helper must stage a job, run the save, and
+# remove the job again, leaving nothing for the worker to replay twice.
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess3" "$TRANSCRIPT" "$HOME/Claude"
+if ls "$MQ_ROOT/jobs/"*sessionend-save* >/dev/null 2>&1; then false; else true; fi
+check "writeahead: successful save cancels its replay job" $?
+grep -q "SessionEndSave | OK: save completed" "$HOME/.claude/hooks/hook-execution.log" 2>/dev/null; check "writeahead: success logged" $?
+# The stub received the LIVE prompt (excerpt path under /tmp), not the queued one.
+grep -q "transcript-excerpt-tsess3.jsonl" "$SANDBOX/replay-stdin.txt" 2>/dev/null; check "writeahead: live save ran with the live excerpt" $?
+
+# ── Lib: initial delay + cancel + make_due ───────────────────────────────
+STAGE=$(mq_new_staging "t-delay"); printf '#!/bin/bash\nexit 0\n' > "$STAGE/job.sh"
+mq_enqueue "$STAGE" 30 1800
+DJOB="$MQ_ROOT/jobs/$(basename "$STAGE")"
+NA=$(sed -n 's/^NEXT_AFTER=//p' "$DJOB/meta"); NOW=$(date +%s)
+[ "$NA" -gt $(( NOW + 1700 )) ] && [ "$NA" -le $(( NOW + 1800 )) ]; check "lib: initial delay sets NEXT_AFTER ~1800 s ahead" $?
+bash "$WORKER"
+[ -d "$DJOB" ]; check "lib: delayed job is skipped by the worker (not due)" $?
+mq_make_due "$DJOB"
+grep -q "^NEXT_AFTER=0$" "$DJOB/meta"; check "lib: mq_make_due pulls the job forward" $?
+mq_cancel "$DJOB"
+[ ! -d "$DJOB" ]; check "lib: mq_cancel removes the job" $?
+mq_cancel "$DJOB"; check "lib: mq_cancel is idempotent on a missing dir" $?
+mq_cancel ""; check "lib: mq_cancel tolerates an empty path" $?
 
 echo "---"
 echo "RESULT: $PASS passed, $FAIL failed"
