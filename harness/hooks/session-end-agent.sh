@@ -1,25 +1,47 @@
 #!/bin/bash
-# SessionEnd hook — spawns claude -p to save session context to MCP memory.
+# SessionEnd hook — launches a DETACHED memory save that outlives teardown.
 #
-# Reads hook input JSON from stdin. Extracts transcript_path, cwd, session_id.
-# NO DEBOUNCE — SessionEnd fires exactly once per session. Every session deserves
-# a final save pass regardless of when PreCompact last ran.
-# Extracts the last 300 lines of the transcript to avoid overwhelming context.
-# Spawns claude -p with the sessionend prompt template, injecting paths.
-# Logs success/failure to ~/.claude/hooks/hook-execution.log.
+# Reads hook input JSON from stdin (transcript_path, cwd, session_id). Does only
+# fast, bounded work — recursion guard + transcript guards — then launches
+# sessionend-save.sh via `setsid nohup ... &` so the actual claude -p save runs
+# in its own session and completes AFTER this hook returns and the session tears
+# down.
 #
-# Stdout goes to stderr for SessionEnd (no injection path back to session).
-# Timeout governed by settings.json (180s).
+# WHY DETACHED (2026-06-10): SessionEnd hooks "cannot block termination" (Claude
+# Code docs). The harness SIGTERMs this hook during teardown EARLIER than its
+# 180s settings.json budget, so an in-line 20-90s claude -p save lost the race
+# and the session's tail — every turn since the last mid-session checkpoint,
+# which is unique data this save exists to capture — was lost. Raising the
+# timeout cannot help (teardown ignores it). Detaching the save removes it from
+# the dying session's process group entirely; setsid was empirically verified to
+# survive a process-group SIGTERM. The save logs its own outcome (SessionEndSave
+# source), so a real failure still surfaces via the health-check.
+#
+# Logs to ~/.claude/hooks/hook-execution.log.
 
 set -uo pipefail
-# Note: not using -e because we want to handle errors explicitly
 
 LOGFILE="$HOME/.claude/hooks/hook-execution.log"
 mkdir -p /tmp/claude
 
 log() {
-    echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') | SessionEnd | $1" >> "$LOGFILE"
+    # session= appended centrally so EVERY line (incl. SKIP/WARN) is correlatable.
+    echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') | SessionEnd | $1 (session=${SESSION_ID:-unset})" >> "$LOGFILE"
 }
+
+# Recursion guard: the detached save runs claude -p with CLAUDE_LIFECYCLE_AGENT=1,
+# and that child fires its own SessionEnd hook on exit. Seeing the env var here
+# means we ARE that child's hook — skip so we don't recurse.
+if [ -n "${CLAUDE_LIFECYCLE_AGENT:-}" ]; then
+    log "SKIP: recursion guard (lifecycle agent child)"
+    exit 0
+fi
+
+# This hook now does only sub-second setup (parse + guards) before launching the
+# detached save. A SIGTERM during that window means the save never launched —
+# rare, but a real miss of this session's tail, so WARN (visible) rather than a
+# hard FAIL. Once the save is launched we exit 0 immediately and this is moot.
+trap 'log "WARN: torn down during setup, before the detached save could launch"; exit 143' TERM
 
 INPUT=$(cat)
 TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
@@ -32,53 +54,26 @@ if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
     exit 0
 fi
 
-# Check transcript has enough content to be worth analyzing
+# Enough content to be worth saving? (wc -l reads the file but is sub-second
+# even on a multi-MB transcript.)
 LINES=$(wc -l < "$TRANSCRIPT_PATH")
 if [ "$LINES" -lt 10 ]; then
     log "SKIP: transcript too short ($LINES lines)"
     exit 0
 fi
 
-# Extract last 300 lines of transcript to a temp file
-# Recent context is most valuable; full transcript may exceed claude -p's context window
-EXCERPT="/tmp/claude/transcript-excerpt-${SESSION_ID}.jsonl"
-tail -300 "$TRANSCRIPT_PATH" > "$EXCERPT"
-
-# Load the prompt template and inject paths
-PROMPT_TEMPLATE="$HOME/.claude/hooks/sessionend-prompt.md"
-if [ ! -f "$PROMPT_TEMPLATE" ]; then
-    log "FAIL: prompt template not found at $PROMPT_TEMPLATE"
+# Launch the detached save. setsid → new session (survives the teardown
+# process-group SIGTERM); nohup → ignore SIGHUP; </dev/null + redirects → fully
+# detached I/O; & + disown → return immediately. The helper builds the prompt,
+# runs the save, logs its own outcome, and cleans up.
+SAVE_HELPER="$HOME/.claude/hooks/sessionend-save.sh"
+if [ ! -f "$SAVE_HELPER" ]; then
+    log "FAIL: detached save helper not found at $SAVE_HELPER"
     exit 0
 fi
-
-# sed uses | as delimiter since paths contain /
-PROMPT=$(sed \
-    -e "s|{{TRANSCRIPT_PATH}}|$EXCERPT|g" \
-    -e "s|{{CWD}}|${CWD:-$HOME/Claude}|g" \
-    -e "s|{{SESSION_ID}}|${SESSION_ID}|g" \
-    "$PROMPT_TEMPLATE")
-
-# Spawn claude -p in the session's working directory
-# --permission-mode bypassPermissions: no interactive prompts (background hook)
-# --model sonnet: balance of capability and speed for memory saves
-# --no-session-persistence: don't clutter session history with hook subprocess
-cd "${CWD:-$HOME/Claude}" 2>/dev/null || cd "$HOME/Claude"
-
-CLAUDE_OUTPUT=$(echo "$PROMPT" | claude -p \
-    --permission-mode bypassPermissions \
-    --model sonnet \
-    --no-session-persistence \
-    --output-format text \
-    2>/tmp/claude/sessionend-stderr-${SESSION_ID}.txt) && \
-    log "OK: save completed (session=$SESSION_ID, ${#CLAUDE_OUTPUT} chars output)" || \
-    log "FAIL: claude -p exited with error (session=$SESSION_ID, stderr=$(head -1 /tmp/claude/sessionend-stderr-${SESSION_ID}.txt 2>/dev/null))"
-
-# Chase this session's final memory write with the anti-sycophancy auditor (Phase 7.4).
-# The session-end agent above just saved/updated the self-record; audit it now. Detached so it
-# does not extend SessionEnd teardown; self-gates (skips if unchanged) and single-flight-locked,
-# same as the Stop-hook launch. Self-skips if claude/deps are missing.
-nohup python3 "$HOME/.claude/audit/run-memory-audit.py" --cwd "${CWD:-$HOME/Claude}" >/dev/null 2>&1 &
+setsid nohup bash "$SAVE_HELPER" "$SESSION_ID" "$TRANSCRIPT_PATH" "${CWD:-$HOME/Claude}" \
+    </dev/null >/dev/null 2>&1 &
 disown 2>/dev/null || true
 
-# Clean up
-rm -f "$EXCERPT" "/tmp/claude/sessionend-stderr-${SESSION_ID}.txt"
+log "OK: detached save launched (runs to completion independent of teardown)"
+exit 0
