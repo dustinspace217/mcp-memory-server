@@ -24,7 +24,7 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 HOOKS="$REPO/harness/hooks"
 
 SANDBOX="$(mktemp -d /tmp/claude/mq-test-XXXXXX 2>/dev/null || mktemp -d)"
-trap 'rm -rf "$SANDBOX"' EXIT
+trap 'rm -rf "$SANDBOX"; rm -f /tmp/claude/*-tsess[0-9]*.jsonl /tmp/claude/sessionend-std*-tsess[0-9]*.txt' EXIT
 
 export MQ_ROOT="$SANDBOX/queue"
 export MQ_LOGFILE="$SANDBOX/hook-execution.log"
@@ -189,9 +189,11 @@ grep -q "@@EXCERPT@@" "$SJOB/prompt.txt" 2>/dev/null; check "sessionend: prompt 
 [ -s "$SJOB/excerpt.jsonl" ]; check "sessionend: excerpt persisted into the job" $?
 # Write-ahead (2026-10-05): the job is persisted BEFORE the live attempt with a
 # 1800 s delay; a FAILED attempt must pull it forward so the next tick runs it.
-grep -q "^NEXT_AFTER=0$" "$SJOB/meta" 2>/dev/null; check "sessionend: failed save makes the write-ahead job due now" $?
+[ "$(sed -n 's/^NEXT_AFTER=//p' "$SJOB/meta" 2>/dev/null)" -le "$(date +%s)" ] 2>/dev/null; check "sessionend: failed save makes the write-ahead job due now" $?
 grep -q "SessionEndSave | STAGED:" "$HOME/.claude/hooks/hook-execution.log" 2>/dev/null; check "sessionend: STAGED line logged before the live save" $?
-grep -q "SessionEndSave | START: helper running" "$HOME/.claude/hooks/hook-execution.log" 2>/dev/null; check "sessionend: START line logged first (SLA-3)" $?
+L_START=$(grep -n "session=tsess2" "$HOME/.claude/hooks/hook-execution.log" | grep "START: helper running" | head -1 | cut -d: -f1)
+L_STAGED=$(grep -n "session=tsess2" "$HOME/.claude/hooks/hook-execution.log" | grep "STAGED:" | head -1 | cut -d: -f1)
+[ -n "$L_START" ] && [ -n "$L_STAGED" ] && [ "$L_START" -lt "$L_STAGED" ]; check "sessionend: START line precedes STAGED (SLA-3, order pinned)" $?
 # Order pin (TA-1): the stub's snapshot must show a sessionend-save job at claude-run time,
 # and (TA-2) its NEXT_AFTER must carry the re-armed delay (> now+500 with the 600 s default).
 grep -q "sessionend-save" "$SNAP" 2>/dev/null; check "writeahead: job existed when claude ran (failure path, TA-1)" $?
@@ -206,7 +208,7 @@ grep -q "flock -n" "$SJOB/job.sh" 2>/dev/null; check "writeahead: job.sh yields 
 # substitution → claude stdin references a path that actually exists.
 snapshot_stub 0 "cat >> \"$SANDBOX/replay-stdin.txt\""
 bash "$WORKER"
-[ -f "$MQ_ROOT/last-save/tsess2" ]; check "replay: successful replay records the excerpt hash (SFH-4)" $?
+[ "$(cat "$MQ_ROOT/last-save/tsess2" 2>/dev/null)" = "$(sha256sum <(tail -300 "$TRANSCRIPT") | cut -d' ' -f1)" ]; check "replay: successful replay records the excerpt HASH (SFH-4, content pinned)" $?
 grep -q -- "$SJOB/excerpt.jsonl" "$SANDBOX/replay-stdin.txt" 2>/dev/null; check "replay: sessionend prompt resolves to the moved excerpt path" $?
 grep -q -- "$PJOB/excerpt.jsonl" "$SANDBOX/replay-stdin.txt" 2>/dev/null; check "replay: precompact prompt resolves to the moved excerpt path" $?
 [ ! -d "$SJOB" ] && [ ! -d "$PJOB" ]; check "replay: successful jobs dequeued" $?
@@ -272,17 +274,21 @@ grep -q -- "$MQ_ROOT/jobs/$QID5/excerpt.jsonl" "$SANDBOX/replay-stdin.txt"; chec
 
 # ── Kill cell (c): helper dies between claude exit 0 and mq_cancel (TA-4c) ──
 # The stub kills its grandparent (the helper; its parent is `timeout`) and exits 0.
-# The helper runs its claude pipeline in a SUBSHELL (echo | timeout claude), so the
-# stub's grandparent is that subshell, not the helper. Walk up and SIGKILL every
-# ancestor that is the helper script (subshell and helper alike) so the helper dies
-# before mq_cancel, which is the window under test.
-snapshot_stub 0 'p=$PPID; while [ "$p" -gt 1 ]; do tr "\\0" " " < /proc/$p/cmdline 2>/dev/null | grep -q sessionend-save.sh && kill -9 $p; p=$(ps -o ppid= -p $p 2>/dev/null | tr -d " "); [ -n "$p" ] || break; done'
+# The stub's parent is `timeout`, its grandparent the helper (bash forks each pipeline
+# element and the child execs the command directly). The walk kills every ancestor
+# whose cmdline is the helper script, so it is robust to either process shape. The
+# stub writes a "committed" marker first: what this cell pins is that a kill landing
+# AFTER the save's output exists but BEFORE the helper's bookkeeping leaves a replay
+# job on disk (STA-9/XFA-6: the precise exit-0-to-cancel instant cannot be hit from
+# outside; the hash check in job.sh makes that window a no-op replay, see below).
+snapshot_stub 0 'echo committed > "$SNAPDIR/committed-tsess6"; p=$PPID; while [ "$p" -gt 1 ]; do tr "\\0" " " < /proc/$p/cmdline 2>/dev/null | grep -q sessionend-save.sh && kill -9 $p; p=$(ps -o ppid= -p $p 2>/dev/null | tr -d " "); [ -n "$p" ] || break; done'
+export SNAPDIR="$SANDBOX"
 bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess6" "$TRANSCRIPT" "$HOME/Claude" 2>/dev/null
 QID6=$(grep "session=tsess6" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
-[ -n "$QID6" ] && [ -d "$MQ_ROOT/jobs/$QID6" ]; check "kill-c: job survives a kill after claude exit, before cancel (accepted duplicate window)" $?
+[ -f "$SANDBOX/committed-tsess6" ] && [ -n "$QID6" ] && [ -d "$MQ_ROOT/jobs/$QID6" ]; check "kill-c: save output committed, helper killed before cancel, replay job survives" $?
 if grep "session=tsess6" "$HLOG" | grep -q "OK:"; then false; else true; fi
 check "kill-c: no OK line when the helper died before logging" $?
-rm -rf "$MQ_ROOT/jobs/$QID6"
+[ -n "$QID6" ] && rm -rf "$MQ_ROOT/jobs/$QID6"
 
 # ── Skip-if-gone: the worker consumed the job while the helper waited ────
 snapshot_stub 0
@@ -292,7 +298,7 @@ bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess7" "$TRANSCRIPT" "$HOME/Clau
 HPID=$!
 for _ in $(seq 1 40); do grep "session=tsess7" "$HLOG" 2>/dev/null | grep -q STAGED && break; sleep 0.25; done
 QID7=$(grep "session=tsess7" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
-rm -rf "$MQ_ROOT/jobs/$QID7"          # simulate: worker replayed and dequeued it
+[ -n "$QID7" ] && rm -rf "$MQ_ROOT/jobs/$QID7"          # simulate: worker replayed and dequeued it
 flock -u 7; wait "$HPID" 2>/dev/null
 grep "session=tsess7" "$HLOG" | grep -q "SKIP: replay job already consumed"; check "skip-if-gone: live save skipped when the replay already ran (CR-1/SLA-1)" $?
 [ "$(grep -c "^== run" "$SNAP")" -eq "$SNAP_BEFORE" ]; check "skip-if-gone: no live claude run" $?
@@ -305,7 +311,10 @@ exec 7>"$SESSIONEND_LOCK"; flock 7
 snapshot_stub 0
 bash "$WORKER"
 flock -u 7
-[ -d "$MQ_ROOT/jobs/$QID8" ] && grep -q "attempt 1 failed (rc=75)" "$MQ_LOGFILE"; check "yield: replay exits 75 and stays queued while a live save holds the lock" $?
+[ -d "$MQ_ROOT/jobs/$QID8" ] && grep "$QID8" "$MQ_LOGFILE" | grep -q "INFO: job .* yielded to a live save"; check "yield: replay exits 75 and stays queued while a live save holds the lock" $?
+grep -q "^ATTEMPTS=0$" "$MQ_ROOT/jobs/$QID8/meta"; check "yield: a yield does not count as an attempt (XFK-6)" $?
+NA8=$(sed -n 's/^NEXT_AFTER=//p' "$MQ_ROOT/jobs/$QID8/meta"); NOW=$(date +%s)
+[ "$NA8" -gt $(( NOW + 200 )) ] && [ "$NA8" -le $(( NOW + 300 )) ]; check "yield: deferred ~5 min, not backed off" $?
 sed -i 's/^NEXT_AFTER=.*/NEXT_AFTER=0/' "$MQ_ROOT/jobs/$QID8/meta"
 bash "$WORKER"
 [ ! -d "$MQ_ROOT/jobs/$QID8" ]; check "yield: replay runs once the lock is free" $?
@@ -313,15 +322,82 @@ bash "$WORKER"
 # ── Re-arm: delay measured from the lock, not from staging (CR-1/SLA-1) ──
 # Hold the lock 3 s with a 1 s delay: without the re-arm the snapshot would show a
 # NEXT_AFTER already in the past when claude ran.
-export SESSIONEND_WRITEAHEAD_DELAY=1
+export SESSIONEND_WRITEAHEAD_DELAY=2
 snapshot_stub 0
 exec 7>"$SESSIONEND_LOCK"; flock 7
 bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess9" "$TRANSCRIPT" "$HOME/Claude" &
 HPID=$!
-sleep 3; T_RELEASE=$(date +%s); flock -u 7; wait "$HPID" 2>/dev/null
+for _ in $(seq 1 40); do grep "session=tsess9" "$HLOG" 2>/dev/null | grep -q STAGED && break; sleep 0.25; done
+QID9=$(grep "session=tsess9" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
+NA_STAGED=$(sed -n 's/^NEXT_AFTER=//p' "$MQ_ROOT/jobs/$QID9/meta")
+# Hold the lock until the STAGED deadline has passed, so a missing re-arm would leave
+# NEXT_AFTER in the past at claude-run time (STA-5: a delta, not a timing inference).
+while [ "$(date +%s)" -le "$NA_STAGED" ]; do sleep 0.25; done
+T_RELEASE=$(date +%s); flock -u 7; wait "$HPID" 2>/dev/null
 SNAP_NA=$(grep -h "^NEXT_AFTER=" "$SNAP" | tail -1 | cut -d= -f2)
-[ -n "$SNAP_NA" ] && [ "$SNAP_NA" -ge "$T_RELEASE" ]; check "re-arm: NEXT_AFTER re-stamped after the lock was acquired" $?
+[ -n "$SNAP_NA" ] && [ "$SNAP_NA" -gt "$NA_STAGED" ] && [ "$SNAP_NA" -ge "$T_RELEASE" ] && [ "$SNAP_NA" -le $(( T_RELEASE + 2 + 2 )) ]
+check "re-arm: NEXT_AFTER re-stamped from the lock acquisition with the seam's delay" $?
 unset SESSIONEND_WRITEAHEAD_DELAY
+
+# ── XFK-1: a replay whose live save already completed is a no-op (hash check in job.sh) ──
+snapshot_stub 1
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess10" "$TRANSCRIPT" "$HOME/Claude"   # fails -> due job
+QID10=$(grep "session=tsess10" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
+mkdir -p "$MQ_ROOT/last-save"; sha256sum <(tail -300 "$TRANSCRIPT") | cut -d' ' -f1 > "$MQ_ROOT/last-save/tsess10"
+SNAP_BEFORE=$(grep -c "^== run" "$SNAP")
+snapshot_stub 0
+bash "$WORKER"
+[ ! -d "$MQ_ROOT/jobs/$QID10" ] && [ "$(grep -c "^== run" "$SNAP")" -eq "$SNAP_BEFORE" ]; check "xfk-1: replay skips claude and dequeues when the live save already recorded this excerpt" $?
+
+# ── XFA-1: replay must create the lock's parent dir (a reboot erases /tmp/claude) ──
+echo '{"line":16}' >> "$TRANSCRIPT"
+SAVED_LOCK="$SESSIONEND_LOCK"; export SESSIONEND_LOCK="$SANDBOX/not-yet/lock"
+snapshot_stub 1
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess14" "$TRANSCRIPT" "$HOME/Claude"   # stages job.sh with the new lock path, fails -> due
+QID14=$(grep "session=tsess14" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
+rm -rf "$SANDBOX/not-yet"                      # the parent is gone when the replay runs
+snapshot_stub 0
+bash "$WORKER"
+[ -n "$QID14" ] && [ ! -d "$MQ_ROOT/jobs/$QID14" ] && [ -e "$SANDBOX/not-yet/lock" ]; check "xfa-1: replay creates the lock dir and succeeds when /tmp/claude is absent" $?
+export SESSIONEND_LOCK="$SAVED_LOCK"
+
+# ── XFA-3/XFK-3: .done marker closes the replay-exit -> dequeue gap ──
+STAGE=$(mq_new_staging "t-done"); printf '#!/bin/bash\nexit 0\n' > "$STAGE/job.sh"; mq_enqueue "$STAGE" 30
+DONEJOB="$MQ_LAST_JOB"
+mq_job_present "$DONEJOB"; check "done-marker: job without marker is present" $?
+touch "$DONEJOB/.done"
+if mq_job_present "$DONEJOB"; then false; else true; fi
+check "done-marker: a completed job reads as consumed before the worker removes it (XFA-3/XFK-3)" $?
+rm -rf "$DONEJOB"
+
+# ── job.sh writes the .done marker itself on success (run it directly: the worker would rm the dir) ──
+echo '{"line":17}' >> "$TRANSCRIPT"
+snapshot_stub 1
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess15" "$TRANSCRIPT" "$HOME/Claude"   # fails -> due job
+QID15=$(grep "session=tsess15" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
+snapshot_stub 0
+bash "$MQ_ROOT/jobs/$QID15/job.sh" >/dev/null 2>&1
+[ -n "$QID15" ] && [ -e "$MQ_ROOT/jobs/$QID15/.done" ]; check "done-marker: job.sh marks itself done on success (XFA-3/XFK-3)" $?
+[ "$(cat "$MQ_ROOT/last-save/tsess15" 2>/dev/null)" = "$(sha256sum <(tail -300 "$TRANSCRIPT") | cut -d' ' -f1)" ]; check "done-marker: job.sh records the excerpt hash on success" $?
+rm -rf "$MQ_ROOT/jobs/$QID15"
+
+# ── STA-3: the three producer branches that only execute when the job vanishes mid-run ──
+# (a) success, job gone -> OK "already gone — may have written a duplicate"
+snapshot_stub 0 'rm -rf "$MQ_ROOT"/jobs/*sessionend-save*'
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess11" "$TRANSCRIPT" "$HOME/Claude"
+grep "session=tsess11" "$HLOG" | grep -q "OK: save completed; replay job was already gone"; check "sta-3a: success with a vanished job logs the possible duplicate" $?
+# (b) failure, job gone -> WARN "already gone — the worker replayed it"
+echo '{"line":14}' >> "$TRANSCRIPT"
+snapshot_stub 1 'rm -rf "$MQ_ROOT"/jobs/*sessionend-save*'
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess12" "$TRANSCRIPT" "$HOME/Claude"
+grep "session=tsess12" "$HLOG" | grep -q "WARN: save failed but the replay job is already gone"; check "sta-3b: failure with a vanished job says the worker replayed it" $?
+# (c) success, cancel fails -> WARN "could not be removed"
+echo '{"line":15}' >> "$TRANSCRIPT"
+snapshot_stub 0 'chmod a-w "$MQ_ROOT/jobs"'
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess13" "$TRANSCRIPT" "$HOME/Claude" 2>/dev/null
+chmod u+w "$MQ_ROOT/jobs"
+grep "session=tsess13" "$HLOG" | grep -q "WARN: save completed but the replay job could not be removed"; check "sta-3c: a failed cancel is a WARN, not a false OK" $?
+rm -rf "$MQ_ROOT"/jobs/*sessionend-save*
 
 # ── Lib: initial delay + cancel + make_due ───────────────────────────────
 STAGE=$(mq_new_staging "t-delay"); printf '#!/bin/bash\nexit 0\n' > "$STAGE/job.sh"
@@ -335,7 +411,8 @@ mq_defer "$DJOB" 300
 NA=$(sed -n 's/^NEXT_AFTER=//p' "$DJOB/meta"); NOW=$(date +%s)
 [ "$NA" -gt $(( NOW + 290 )) ] && [ "$NA" -le $(( NOW + 300 )) ]; check "lib: mq_defer re-stamps NEXT_AFTER from now" $?
 mq_make_due "$DJOB"
-grep -q "^NEXT_AFTER=0$" "$DJOB/meta"; check "lib: mq_make_due pulls the job forward" $?
+NA=$(sed -n 's/^NEXT_AFTER=//p' "$DJOB/meta"); NOW=$(date +%s)
+[ "$NA" -le "$NOW" ] && [ "$NA" -gt $(( NOW - 5 )) ]; check "lib: mq_make_due stamps the job due NOW (not a literal 0; XFA-4)" $?
 mq_job_present "$DJOB"; check "lib: mq_job_present sees a live job" $?
 # rm failure must be REPORTED (CR-3): make the jobs dir read-only so rm -rf fails.
 chmod a-w "$MQ_ROOT/jobs"

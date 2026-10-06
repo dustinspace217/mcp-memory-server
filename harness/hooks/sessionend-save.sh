@@ -142,22 +142,42 @@ if [ -f "$QUEUE_LIB" ]; then
 # (killed by a shutdown, usage limit, timeout, ...).
 set -uo pipefail
 DIR="\$(cd "\$(dirname "\$0")" && pwd)"
-# Yield, never wait: if a live session-end save holds the lock, exit nonzero and
-# let the worker retry later (a blocking wait would stall the single-flight
-# worker behind a whole burst; QA 2026-10-05, CR-1/SLA-1).
-exec 8>"${LOCK_PATH}"
+# The lock lives under /tmp/claude, which a reboot erases and only a Claude hook
+# recreates; a replay at the first post-boot tick may run before any does
+# (cross-family QA 2026-10-05, XFA-1). An open() failure here would otherwise
+# read as lock contention.
+mkdir -p "$(dirname "${LOCK_PATH}")" || exit 1
+# Yield, never wait: if a live session-end save holds the lock, exit 75 (the
+# worker defers without counting an attempt); a blocking wait would stall the
+# single-flight worker behind a whole burst (QA 2026-10-05, CR-1/SLA-1).
+exec 8>"${LOCK_PATH}" || exit 1
 if ! flock -n 8; then
     echo "live session-end save holds the lock; yielding"
     exit 75
 fi
+# Already saved? The live path writes the excerpt hash BEFORE cancelling this
+# job, so a helper killed between those two steps leaves a job whose save is
+# complete. Checking the hash here turns the "accepted duplicate window" into a
+# no-op replay (cross-family QA 2026-10-05, XFK-1).
+if [ "\$(cat "${MQ_ROOT}/last-save/${SESSION_ID}" 2>/dev/null)" = "${EXCERPT_HASH}" ]; then
+    echo "live save already recorded this excerpt; nothing to replay"
+    touch "\$DIR/.done" 2>/dev/null || true
+    exit 0
+fi
 cd "\$(cat "\$DIR/cwd" 2>/dev/null)" 2>/dev/null || cd "\$HOME/Claude" || exit 1
-sed "s|@@EXCERPT@@|\$DIR/excerpt.jsonl|g" "\$DIR/prompt.txt" | \\
+# Prompt via a FILE, not a pipe: if claude exits early (usage-limit error) a pipe
+# writer dies of SIGPIPE and pipefail reports 141 instead of claude's real exit
+# code (XFK-5).
+sed "s|@@EXCERPT@@|\$DIR/excerpt.jsonl|g" "\$DIR/prompt.txt" > "\$DIR/prompt.resolved" || exit 1
 CLAUDE_LIFECYCLE_AGENT=1 claude -p \\
     --permission-mode bypassPermissions \\
     --model sonnet \\
     --no-session-persistence \\
-    --output-format text || exit \$?
-mkdir -p "${MQ_ROOT}/last-save" && echo "${EXCERPT_HASH}" > "${MQ_ROOT}/last-save/${SESSION_ID}"
+    --output-format text < "\$DIR/prompt.resolved" || exit \$?
+# The narrative is the payload; the hash and the marker are bookkeeping and must
+# never turn a completed save into a failed attempt that replays it (XFK-4).
+{ mkdir -p "${MQ_ROOT}/last-save" && echo "${EXCERPT_HASH}" > "${MQ_ROOT}/last-save/${SESSION_ID}"; } 2>/dev/null || true
+touch "\$DIR/.done" 2>/dev/null || true   # completed: a waiting helper must not save again (XFA-3/XFK-3)
 JOBEOF
         if mq_enqueue "$STAGE" 420 "$WRITEAHEAD_DELAY"; then
             JOBDIR="$MQ_LAST_JOB"
@@ -208,12 +228,18 @@ STDERR_FILE="/tmp/claude/sessionend-stderr-${SESSION_ID}.txt"
 # the daemonized audit): exec fds are not close-on-exec, and the nohup'd audit
 # inheriting fd 9 held the BLOCKING flock until the audit finished — needlessly
 # serializing every later session-end save behind it. QA 2026-07-02.
-echo "$PROMPT" | CLAUDE_LIFECYCLE_AGENT=1 timeout -k 10 300 claude -p \
+# Prompt via a here-string, not `echo | claude`: bash buffers a here-string
+# itself (a temp file, or on bash >= 5.1 a pre-filled pipe for small documents)
+# before the command runs, so no writer PROCESS is left behind. With `echo |`,
+# a claude that exits before draining stdin (a usage-limit error, for instance)
+# kills the echo with SIGPIPE and pipefail reports 141 in place of claude's own
+# exit code (cross-family QA 2026-10-05, XFK-5).
+CLAUDE_LIFECYCLE_AGENT=1 timeout -k 10 300 claude -p \
     --permission-mode bypassPermissions \
     --model sonnet \
     --no-session-persistence \
     --output-format text \
-    > "$STDOUT_FILE" 2> "$STDERR_FILE" 9>&-
+    <<< "$PROMPT" > "$STDOUT_FILE" 2> "$STDERR_FILE" 9>&-
 RC=$?
 if [ "$RC" -eq 0 ]; then
     rm -f "$STDOUT_FILE" "$STDERR_FILE"

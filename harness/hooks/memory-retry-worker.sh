@@ -31,6 +31,23 @@ BACKOFF_BASE=900         # 15 min; doubles per attempt
 BACKOFF_CAP=28800        # 8 h
 MAX_JOBS_PER_TICK=10     # bound one tick's work (Power-of-Ten rule 2); the
                          # timer re-fires in 20 min, so a backlog still drains
+YIELD_DEFER=300          # rc=75 (replay yielded to a live save): retry in 5 min
+
+# write_meta JOB_DIR — rewrite meta ATOMICALLY (temp file + rename). The
+# producer may be editing the same file at the same moment (mq_defer /
+# mq_make_due use sed -i, which also renames); a plain `>` truncate-then-write
+# could leave an EMPTY meta if the two interleave (cross-family QA 2026-10-05,
+# XFA-2). Last writer still wins, but every observable state is complete.
+write_meta() {
+    local jobdir="$1"
+    {
+        echo "LABEL='${LABEL}'"
+        echo "CREATED=${CREATED}"
+        echo "ATTEMPTS=${ATTEMPTS}"
+        echo "NEXT_AFTER=${NEXT_AFTER}"
+        echo "JOB_TIMEOUT=${JOB_TIMEOUT}"
+    } > "$jobdir/meta.tmp" && mv -f "$jobdir/meta.tmp" "$jobdir/meta"
+}
 
 log() {
     echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') | RetryQueue | $1" >> "$LOGFILE"
@@ -98,19 +115,22 @@ for jobdir in "$MQ_ROOT/jobs"/*/; do
     if [ "$rc" -eq 0 ]; then
         log "OK: job $jobid succeeded on attempt $(( ATTEMPTS + 1 ))"
         rm -rf "$jobdir"
+    elif [ "$rc" -eq 75 ]; then
+        # A session-end replay YIELDED because a live save holds the save lock
+        # (job.sh exits 75 on `flock -n` failure). Not a failed attempt: defer
+        # a few minutes without touching ATTEMPTS or the backoff, so a job that
+        # keeps landing behind live saves cannot burn its budget and give up
+        # (cross-family QA 2026-10-05, XFK-6).
+        NEXT_AFTER=$(( NOW + YIELD_DEFER ))
+        write_meta "$jobdir"
+        log "INFO: job $jobid yielded to a live save — retry in $(( YIELD_DEFER / 60 ))m (attempts unchanged)"
     else
         ATTEMPTS=$(( ATTEMPTS + 1 ))
         # Exponential backoff: BACKOFF_BASE * 2^(ATTEMPTS-1), capped.
         backoff=$(( BACKOFF_BASE * (1 << (ATTEMPTS - 1)) ))
         if [ "$backoff" -gt "$BACKOFF_CAP" ]; then backoff=$BACKOFF_CAP; fi
         NEXT_AFTER=$(( NOW + backoff ))
-        {
-            echo "LABEL='${LABEL}'"
-            echo "CREATED=${CREATED}"
-            echo "ATTEMPTS=${ATTEMPTS}"
-            echo "NEXT_AFTER=${NEXT_AFTER}"
-            echo "JOB_TIMEOUT=${JOB_TIMEOUT}"
-        } > "$jobdir/meta"
+        write_meta "$jobdir"
         # WARN (not FAIL): a retryable miss is degraded operation, not a loss —
         # FAIL is reserved for gave-up jobs so the health-check alarm stays
         # meaningful. rc=124 is the job's own timeout.

@@ -101,11 +101,15 @@ mq_cancel() {
     [ ! -d "$jobdir" ]
 }
 
-# mq_job_present JOB_DIR — 0 if the published job still exists. The write-ahead
-# producer uses it after taking the save lock: a missing job means the worker
-# already replayed this save, so the live attempt must be skipped.
+# mq_job_present JOB_DIR — 0 if the published job still exists AND has not been
+# completed. The write-ahead producer uses it after taking the save lock: a
+# missing job means the worker already replayed this save, so the live attempt
+# must be skipped. The `.done` marker closes the gap between job.sh releasing
+# the lock (process exit) and the worker removing the dir: job.sh touches it as
+# its last act while still holding the lock, so a helper that wakes in that gap
+# sees "completed", not "present" (cross-family QA 2026-10-05, XFA-3/XFK-3).
 mq_job_present() {
-    [ -n "${1:-}" ] && [ -d "$1" ]
+    [ -n "${1:-}" ] && [ -d "$1" ] && [ ! -e "$1/.done" ]
 }
 
 # mq_make_due JOB_DIR — pull a job forward so the next worker tick runs it (the
@@ -113,9 +117,10 @@ mq_job_present() {
 # as the old enqueue-on-failure path did). Nonzero when meta is missing (job
 # already consumed) or the rewrite failed, so the caller can log the truth.
 mq_make_due() {
-    local jobdir="${1:-}"
-    [ -n "$jobdir" ] && [ -f "$jobdir/meta" ] || return 1
-    sed -i 's/^NEXT_AFTER=.*/NEXT_AFTER=0/' "$jobdir/meta"
+    # Stamps NOW, not a literal 0: the worker treats both as due, but a real
+    # timestamp lets the health check measure how long the job has actually
+    # been waiting (a 0 reads as "overdue since 1970"; XFA-4).
+    mq_defer "${1:-}" 0
 }
 
 # mq_defer JOB_DIR SECS — set NEXT_AFTER to now+SECS. The write-ahead producer
