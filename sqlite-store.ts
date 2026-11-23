@@ -1888,18 +1888,40 @@ export class SqliteStore implements GraphStore {
     const BATCH_SIZE = 100;
     let totalEmbedded = 0;
 
-    while (true) {
+    // Bounded loop over batches (Power-of-Ten rule 2), same cap as the trigger
+    // sweep below: at 100/batch, 1000 iterations covers 100k observations, ~11x
+    // the live corpus (2026-11). Before the cap this was while(true): an
+    // observation that never embeds is re-selected every batch, and only the
+    // embedding circuit breaker (which turns vector search off) ended the loop.
+    const MAX_ITERATIONS = 1000;
+    let iter = 0;
+    for (; iter < MAX_ITERATIONS; iter++) {
       // If the database was closed (e.g., during shutdown), stop the sweep
       if (!this.db) break;
       // If shutdown was signaled, let the current batch finish but don't start new ones
       if (this.shuttingDown) break;
 
       // Find active observations missing from vec_observations.
-      // LEFT JOIN on the TEXT observation_id column (cast to match observations.id).
+      // NOT IN over the vec table's TEXT observation_id (cast to match observations.id).
+      // Why NOT IN and not a LEFT JOIN: the join condition is a CAST expression on a
+      // vec0 auxiliary column, which no index can serve, so SQLite rescanned the whole
+      // vec table once per observation — quadratic. Measured on a live-DB copy
+      // 2026-11-23: LEFT JOIN 100-124 s, NOT IN 22-29 ms, identical rows (incl. a copy
+      // with 40 embeddings removed). The slow version blocked the main thread for that
+      // long after the model loaded, so every request in the window waited; under
+      // machine load one session's server missed Claude Code's 30 s startup deadline
+      // and the session ran without memory (2026-10-17 diagnosis).
+      // The IS NOT NULL is load-bearing: vec0 does NOT enforce the NOT NULL declared on
+      // this auxiliary column (probed 2026-11-23: a NULL insert is accepted), and one
+      // NULL in a NOT IN list makes the whole predicate match nothing, which would stop
+      // the sweep from ever embedding again, silently. The old LEFT JOIN ignored NULLs.
       const batch = this.db.prepare(`
         SELECT o.id, o.content FROM observations o
-        LEFT JOIN vec_observations v ON CAST(v.observation_id AS INTEGER) = o.id
-        WHERE v.observation_id IS NULL AND o.superseded_at = ''
+        WHERE o.superseded_at = ''
+          AND o.id NOT IN (
+            SELECT CAST(observation_id AS INTEGER) FROM vec_observations
+            WHERE observation_id IS NOT NULL
+          )
         ORDER BY o.id
         LIMIT ?
       `).all(BATCH_SIZE) as { id: number; content: string }[];
@@ -1946,6 +1968,12 @@ export class SqliteStore implements GraphStore {
       if (this.embeddingPipeline.state.status !== 'ready') break;
     }
 
+    if (iter === MAX_ITERATIONS) {
+      // Fail loudly: hitting the cap usually means un-embeddable rows or a corpus far
+      // past the design size. "May" because the 1000th batch could have held the last
+      // missing rows; the cap alone cannot tell (cross-family review XFK-2).
+      console.error(`Vector search: embedding sweep stopped at its ${MAX_ITERATIONS}-batch cap; observations may remain un-embedded`);
+    }
     if (totalEmbedded > 0) {
       console.error(`Vector search: embedded ${totalEmbedded} observations during sweep`);
     }
@@ -1974,10 +2002,18 @@ export class SqliteStore implements GraphStore {
     for (let iter = 0; iter < 1000; iter++) {
       if (!this.db || this.shuttingDown) break;
 
+      // Same NOT IN shape as runEmbeddingSweep, for the same reasons (a LEFT JOIN on
+      // a CAST of a vec0 auxiliary column is a full rescan per row; IS NOT NULL
+      // because vec0 accepts NULL aux values and one NULL empties a NOT IN). Cheap
+      // either way today since only pending triggers hold vec rows; changed so the
+      // two sweeps do not diverge.
       const batch = this.db.prepare(`
         SELECT t.id, t.trigger_text FROM prospective_triggers t
-        LEFT JOIN vec_triggers v ON CAST(v.trigger_id AS INTEGER) = t.id
-        WHERE v.trigger_id IS NULL AND t.fired_at = ''
+        WHERE t.fired_at = ''
+          AND t.id NOT IN (
+            SELECT CAST(trigger_id AS INTEGER) FROM vec_triggers
+            WHERE trigger_id IS NOT NULL
+          )
         ORDER BY t.id
         LIMIT ?
       `).all(BATCH_SIZE) as { id: number; trigger_text: string }[];

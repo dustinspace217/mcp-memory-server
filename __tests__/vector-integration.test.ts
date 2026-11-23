@@ -393,6 +393,164 @@ describe('Vector search integration', () => {
     expect(emptied.rerankApplied).toBeUndefined();
   });
 
+  // Pins both startup sweeps' "which rows lack a vector?" queries (observations in
+  // runEmbeddingSweep, pending triggers in runTriggerEmbeddingSweep). Before this
+  // test, nothing failed if either query matched nothing: write-time syncEmbedding
+  // covers every other test's rows, and the model-guard test below accepts 0 rows.
+  // Added 2026-11-23 with the LEFT JOIN -> NOT IN rewrite, which must return exactly
+  // the same set. Memory: every SqliteStore loads its own model and close() does not
+  // release it, so up to three instances (the shared fixture's, store1's, store2's;
+  // ~400 MB each per vitest.config.ts) can be resident until GC. Loads are sequential
+  // and this pool is forced single-fork, so the peak is bounded (~1.2 GB).
+  it('startup sweeps re-embed exactly the rows missing a vector, and nothing else', async () => {
+    const sweepPath = path.join(testDir, `test-vec-sweep-${Date.now()}.db`);
+    const Database = (await import('better-sqlite3')).default;
+    const sqliteVec = await import('sqlite-vec');
+    const FILL = 0.5; // a constant vector no real model output ever equals
+    const fillBytes = () => Buffer.from(new Float32Array(384).fill(FILL).buffer);
+
+    // Receives an open store; polls (bounded, 60 s) until its model is ready.
+    // Returns nothing; throws if the model never loads so the failure names the cause.
+    const waitReady = async (s: SqliteStore): Promise<void> => {
+      const deadline = Date.now() + 60_000;
+      while (s.vectorState.status === 'loading' && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      if (s.vectorState.status !== 'ready') throw new Error(`model not ready: ${s.vectorState.status}`);
+    };
+    // Receives a db path and a vec table name; returns the non-NULL ids in it
+    // (as numbers, sorted). NULL-id rows are excluded so the planted NULL row
+    // below never counts as an embedded observation.
+    const vecIds = (p: string, table: 'vec_observations' | 'vec_triggers'): number[] => {
+      const col = table === 'vec_observations' ? 'observation_id' : 'trigger_id';
+      const db = new Database(p, { readonly: true });
+      try {
+        sqliteVec.load(db);
+        return (db.prepare(`SELECT ${col} AS id FROM ${table} WHERE ${col} IS NOT NULL`).all() as { id: string }[])
+          .map(r => Number(r.id)).sort((a, b) => a - b);
+      } finally { db.close(); }
+    };
+    // Receives a db path, an expected observation-vector count and a timeout; polls
+    // (bounded) until vec_observations holds that many non-NULL rows. Returns true
+    // on success, false on timeout, so the caller's expect() reports the miss.
+    const waitForVecCount = async (p: string, n: number, ms: number): Promise<boolean> => {
+      const deadline = Date.now() + ms;
+      while (Date.now() < deadline) {
+        if (vecIds(p, 'vec_observations').length === n) return true;
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      return false;
+    };
+
+    // Declared out here so the finally block can always stop them: a store left
+    // open on a failed assertion keeps its model and sweep alive in this fork.
+    let store1: SqliteStore | undefined;
+    let store2: SqliteStore | undefined;
+    try {
+      // Seed: four active observations, one retired, and three pending triggers, all
+      // embedded at write time. The retired one still has its vector here (it is
+      // kept at runtime for as_of KNN), so 5 observation vectors exist.
+      store1 = new SqliteStore(sweepPath);
+      await store1.init();
+      await waitReady(store1);
+      await store1.createEntities([
+        { name: 'SweepA', entityType: 'test', observations: ['sweep alpha: a lighthouse keeper logs the tides'] },
+        { name: 'SweepB', entityType: 'test', observations: ['sweep beta: an orchard harvests late apples', 'sweep beta old claim'] },
+        { name: 'SweepC', entityType: 'test', observations: ['sweep gamma: a ferry crosses the sound at dawn'] },
+      ]);
+      await store1.supersedeObservations([
+        { entityName: 'SweepB', oldContent: 'sweep beta old claim', newContent: 'sweep beta new claim' },
+      ]);
+      const trigger = await store1.setProspectiveTrigger('sweep trigger: the tide tables come up', 'sweep payload');
+      const keptTrigger = await store1.setProspectiveTrigger('sweep kept trigger: the ferry schedule changes', 'kept payload');
+      const firedTrigger = await store1.setProspectiveTrigger('sweep fired trigger: the orchard opens', 'fired payload');
+      expect(await waitForVecCount(sweepPath, 5, 20_000)).toBe(true); // 4 active + 1 retired
+      // Trigger vectors are also written fire-and-forget; wait (bounded) for all three.
+      const seedTrigDeadline = Date.now() + 20_000;
+      while (vecIds(sweepPath, 'vec_triggers').length < 3 && Date.now() < seedTrigDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      expect(vecIds(sweepPath, 'vec_triggers').length).toBe(3);
+      store1.shutdown();
+      await store1.close();
+      store1 = undefined;
+
+      // While closed, shape the database the second store will sweep:
+      //  - holes: remove the vectors of two ACTIVE observations (must be refilled);
+      //  - remove the RETIRED claim's vector (must NOT be refilled: superseded_at filter);
+      //  - anchor: replace a kept row's vector with a constant fill (must survive:
+      //    a query that re-selects every row would re-embed it with real values);
+      //  - plant one NULL-id row (vec0 accepts it; without IS NOT NULL in the
+      //    subquery, NOT IN would match nothing and no hole would be refilled);
+      //  - remove the pending trigger's vector (the trigger sweep must refill it),
+      //    and plant a NULL-id trigger row for the same reason as above;
+      //  - anchor a second pending trigger with the constant fill (must survive), and
+      //    mark a third trigger fired with no vector (must stay unembedded: the
+      //    fired_at = '' filter). Both added after the cross-family review (XFA-1).
+      const db = new Database(sweepPath);
+      let active: number[]; let holes: number[]; let superseded: number; let keepId: number;
+      try {
+        sqliteVec.load(db);
+        const idOf = (c: string) => (db.prepare('SELECT id FROM observations WHERE content = ?').get(c) as { id: number }).id;
+        active = (db.prepare(`SELECT id FROM observations WHERE superseded_at = '' ORDER BY id`).all() as { id: number }[]).map(r => r.id);
+        holes = [idOf('sweep alpha: a lighthouse keeper logs the tides'), idOf('sweep beta new claim')];
+        superseded = idOf('sweep beta old claim');
+        keepId = idOf('sweep gamma: a ferry crosses the sound at dawn');
+        const del = db.prepare('DELETE FROM vec_observations WHERE observation_id = ?');
+        for (const id of [...holes, superseded, keepId]) del.run(String(id));
+        db.prepare('INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)').run(fillBytes(), String(keepId));
+        db.prepare('INSERT INTO vec_observations (embedding, observation_id) VALUES (?, NULL)').run(fillBytes());
+        const delTrig = db.prepare('DELETE FROM vec_triggers WHERE trigger_id = ?');
+        for (const id of [trigger.id, keptTrigger.id, firedTrigger.id]) delTrig.run(String(id));
+        db.prepare('INSERT INTO vec_triggers (embedding, trigger_id) VALUES (?, ?)').run(fillBytes(), String(keptTrigger.id));
+        db.prepare('UPDATE prospective_triggers SET fired_at = ? WHERE id = ?').run(new Date().toISOString(), firedTrigger.id);
+        db.prepare('INSERT INTO vec_triggers (embedding, trigger_id) VALUES (?, NULL)').run(fillBytes());
+      } finally { db.close(); }
+      expect(active.length).toBe(4);
+      // The holes are real before the sweep runs: only the two untouched active rows remain.
+      expect(vecIds(sweepPath, 'vec_observations')).toEqual(active.filter(id => !holes.includes(id)));
+      expect(vecIds(sweepPath, 'vec_triggers')).toEqual([keptTrigger.id]);
+
+      // Reopen: the sweeps must find exactly the holes and fill them.
+      store2 = new SqliteStore(sweepPath);
+      await store2.init();
+      await waitReady(store2);
+      const filled = await waitForVecCount(sweepPath, 4, 30_000);
+      // The trigger sweep runs after the observation sweep; give it a bounded moment.
+      const trigDeadline = Date.now() + 10_000;
+      while (vecIds(sweepPath, 'vec_triggers').length < 2 && Date.now() < trigDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      store2.shutdown();
+      await store2.close();
+      store2 = undefined;
+
+      expect(filled).toBe(true);
+      const after = vecIds(sweepPath, 'vec_observations');
+      expect(after).toEqual(active);                // every active obs once, no duplicates
+      expect(after).not.toContain(superseded);       // the sweep never embeds a retired claim
+      // Pending hole refilled, anchor kept, fired trigger never embedded.
+      expect(vecIds(sweepPath, 'vec_triggers')).toEqual([trigger.id, keptTrigger.id].sort((a, b) => a - b));
+      const check = new Database(sweepPath, { readonly: true });
+      try {
+        sqliteVec.load(check);
+        const kept = (check.prepare('SELECT embedding FROM vec_observations WHERE observation_id = ?').get(String(keepId)) as { embedding: Buffer }).embedding;
+        const first = new Float32Array(kept.buffer, kept.byteOffset, 4)[0];
+        expect(first).toBe(FILL); // the anchored row was not re-embedded
+        const keptTrig = (check.prepare('SELECT embedding FROM vec_triggers WHERE trigger_id = ?').get(String(keptTrigger.id)) as { embedding: Buffer }).embedding;
+        expect(new Float32Array(keptTrig.buffer, keptTrig.byteOffset, 4)[0]).toBe(FILL); // anchored trigger kept
+      } finally { check.close(); }
+    } finally {
+      // Intentional ignores: cleanup must not mask the test's own failure.
+      for (const s of [store1, store2]) {
+        if (s) { s.shutdown(); try { await s.close(); } catch { /* already failing */ } }
+      }
+      for (const suffix of ['', '-wal', '-shm']) {
+        try { await fs.unlink(sweepPath + suffix); } catch { /* ok */ }
+      }
+    }
+  }, 240_000); // waits: 60 s model + 20 s seed + 60 s model + 30 s sweep + 10 s trigger = 180 s
+
   it('vec_config model guard: a model switch clears stale vectors on startup (v15)', async () => {
     // Dedicated store on its own db file — this test mutates vec_config and
     // clears vec_observations, which must never touch the shared fixture.
