@@ -1454,19 +1454,23 @@ export class SqliteStore implements GraphStore {
         }).immediate();
 
         // Startup consistency check: find stale embeddings and delete them.
-        // Catches both truly orphaned vec rows (observation was CASCADE-deleted)
-        // AND embeddings for superseded observations that should no longer be searchable.
-        // Count and delete use the same NOT IN (active observations) predicate.
+        // Catches truly orphaned vec rows (observation was CASCADE-deleted),
+        // embeddings of retired observations (the retire paths drop these at once via
+        // deleteVectorsFor; this catches any a failed drop or an older build left),
+        // and rows with a NULL id: vec0 accepts NULL in this auxiliary column despite
+        // the declared NOT NULL, and NULL NOT IN (...) is never true, so the explicit
+        // IS NULL arm is needed to remove them (#95, cross-family review XFK-1).
+        // Count and delete use the same predicate.
         const staleCount = (this.db.prepare(`
           SELECT COUNT(*) AS cnt FROM vec_observations
-          WHERE CAST(observation_id AS INTEGER) NOT IN (
+          WHERE observation_id IS NULL OR CAST(observation_id AS INTEGER) NOT IN (
             SELECT id FROM observations WHERE superseded_at = ''
           )
         `).get() as { cnt: number }).cnt;
 
         if (staleCount > 0) {
           this.db.exec(`
-            DELETE FROM vec_observations WHERE CAST(observation_id AS INTEGER) NOT IN (
+            DELETE FROM vec_observations WHERE observation_id IS NULL OR CAST(observation_id AS INTEGER) NOT IN (
               SELECT id FROM observations WHERE superseded_at = ''
             )
           `);
@@ -1476,18 +1480,18 @@ export class SqliteStore implements GraphStore {
         // Trigger-vector consistency: vec_triggers should hold exactly the
         // PENDING triggers (fired_at = ''). Anything else is stale — a trigger
         // hard-deleted or fired while the server was down, or a crash between
-        // marking fired_at and dropping the vec row. Same NOT IN predicate shape
-        // as the observation cleanup above.
+        // marking fired_at and dropping the vec row. Same predicate shape as the
+        // observation cleanup above, including the IS NULL arm for NULL-id rows.
         const staleTriggerCount = (this.db.prepare(`
           SELECT COUNT(*) AS cnt FROM vec_triggers
-          WHERE CAST(trigger_id AS INTEGER) NOT IN (
+          WHERE trigger_id IS NULL OR CAST(trigger_id AS INTEGER) NOT IN (
             SELECT id FROM prospective_triggers WHERE fired_at = ''
           )
         `).get() as { cnt: number }).cnt;
 
         if (staleTriggerCount > 0) {
           this.db.exec(`
-            DELETE FROM vec_triggers WHERE CAST(trigger_id AS INTEGER) NOT IN (
+            DELETE FROM vec_triggers WHERE trigger_id IS NULL OR CAST(trigger_id AS INTEGER) NOT IN (
               SELECT id FROM prospective_triggers WHERE fired_at = ''
             )
           `);
@@ -1777,9 +1781,10 @@ export class SqliteStore implements GraphStore {
   }
 
   /**
-   * Centralized helper for maintaining vec_observations in sync with observations.
-   * All mutation paths (create, add, delete, supersede) call this after their
-   * core transaction commits. Never throws -- embedding is best-effort.
+   * Centralized helper for writing embeddings: the create, add and supersede paths
+   * call this ('upsert') after their core transaction commits. Retire paths do NOT
+   * use it: they drop vectors inside their own transaction via deleteVectorsFor.
+   * Never throws -- embedding is best-effort.
    *
    * For 'delete': removes the embedding synchronously (can run inside or outside txn).
    * For 'upsert': generates embedding async, then inserts. Skips if model not ready.
@@ -1812,18 +1817,72 @@ export class SqliteStore implements GraphStore {
     if (!embedding) return;
 
     try {
-      // Delete any existing embedding first, then insert new one.
-      // vec0 doesn't support INSERT OR REPLACE, so we do delete+insert.
-      this.db.prepare('DELETE FROM vec_observations WHERE observation_id = ?').run(String(observationId));
-      this.db.prepare(
-        'INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)'
-      ).run(
-        Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
-        String(observationId)
-      );
+      // Still active? The embed above awaited the model, and the observation may
+      // have been retired meanwhile (create then quick supersede/delete). Inserting
+      // anyway would put back the vector the retire just dropped (#95). The check,
+      // DELETE and INSERT run in one IMMEDIATE transaction: IMMEDIATE takes the
+      // write lock first, so another server process cannot commit a retire between
+      // the check and the insert (and a read-first DEFERRED transaction could fail
+      // with SQLITE_BUSY_SNAPSHOT instead of waiting; review CR-3/SL-2).
+      const upsert = this.db.transaction(() => {
+        const stillActive = this.db.prepare(
+          `SELECT 1 FROM observations WHERE id = ? AND superseded_at = ''`
+        ).get(observationId);
+        if (!stillActive) return;
+        // Delete any existing embedding first, then insert new one.
+        // vec0 doesn't support INSERT OR REPLACE, so we do delete+insert.
+        this.db.prepare('DELETE FROM vec_observations WHERE observation_id = ?').run(String(observationId));
+        this.db.prepare(
+          'INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)'
+        ).run(
+          Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+          String(observationId)
+        );
+      });
+      upsert.immediate();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`syncEmbedding upsert failed for observation ${observationId}: ${msg}`);
+    }
+  }
+
+  /**
+   * Removes the embeddings of observations that were just retired (supersede, soft
+   * delete, entity soft-delete). Receives the retired observation ids; returns nothing.
+   * Called INSIDE the caller's transaction so the retire and the vector removal
+   * commit together.
+   *
+   * Why retired embeddings are dropped (owner's ruling 2026-11-23, issue #95): every
+   * vector search asks vec0 for a fixed number of nearest rows (k = 20/50/...) and
+   * filters out retired observations afterwards. A retired observation usually sits
+   * right next to the observation that replaced it, so keeping its vector costs a
+   * result slot exactly where the answer is. Keeping them served only point-in-time
+   * SEMANTIC search, which never survived a restart anyway (the startup cleanup has
+   * long deleted these rows). Point-in-time search still finds retired text by
+   * substring (LIKE); relevance mode and FTS do not take asOf at all.
+   * This reverses the v1.1 choice (2026-04-09 spec, Part B) on purpose.
+   *
+   * Callers collect every retired id of their transaction and call this ONCE, so a
+   * 100-item delete costs one scan per 900-id chunk, not 100 scans: each DELETE
+   * filtered on the vec0 auxiliary column scans the whole vector table (issue #96).
+   * A statement-level failure is logged, not thrown: the retire must still succeed,
+   * and the startup cleanup removes any vector left behind. But if SQLite has rolled
+   * back the whole transaction (SQLITE_FULL, IOERR, NOMEM), the error is rethrown:
+   * swallowing it would let the caller's remaining statements run in autocommit and
+   * commit half a retire (review CR-1/SL-6).
+   */
+  private deleteVectorsFor(observationIds: number[]): void {
+    if (!this.vecTableExists || observationIds.length === 0) return;
+    try {
+      for (let i = 0; i < observationIds.length; i += CHUNK_SIZE) {
+        const chunk = observationIds.slice(i, i + CHUNK_SIZE).map(id => String(id));
+        const placeholders = chunk.map(() => '?').join(', ');
+        this.db.prepare(`DELETE FROM vec_observations WHERE observation_id IN (${placeholders})`).run(...chunk);
+      }
+    } catch (err: unknown) {
+      if (!this.db.inTransaction) throw err; // the transaction is gone: fail the retire
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`deleteVectorsFor failed for ${observationIds.length} retired observations (startup cleanup will retry): ${msg}`);
     }
   }
 
@@ -1942,18 +2001,28 @@ export class SqliteStore implements GraphStore {
         const insert = this.db.prepare(
           'INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)'
         );
+        // The batch was selected before the await on embedBatch; an observation
+        // retired meanwhile must not get its vector back (#95).
+        const isActive = this.db.prepare(`SELECT 1 FROM observations WHERE id = ? AND superseded_at = ''`);
         try {
+          // IMMEDIATE: the loop now reads (isActive) before it writes, and a DEFERRED
+          // read-first transaction fails with SQLITE_BUSY_SNAPSHOT when another server
+          // commits in between, which would end this sweep (review CR-2/SL-1; same
+          // lesson as the v10->v11 migration note in CLAUDE.md).
+          let inserted = 0;
           const txn = this.db.transaction(() => {
             for (const { id, embedding } of results) {
+              if (!isActive.get(id)) continue;
               del.run(String(id));
               insert.run(
                 Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
                 String(id)
               );
+              inserted++;
             }
           });
-          txn();
-          totalEmbedded += results.length;
+          txn.immediate();
+          totalEmbedded += inserted;
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`Embedding sweep batch insert failed: ${msg}`);
@@ -2517,9 +2586,9 @@ export class SqliteStore implements GraphStore {
    * superseded_at='' (added in v6→v7) makes re-creation after soft-delete
    * possible without UNIQUE collisions.
    *
-   * vec_observations is intentionally NOT cleaned up — historical embeddings
-   * survive soft-delete the same way they survive observation supersession.
-   * This is what makes vector search at an earlier asOf still recoverable.
+   * The retired observations' embeddings ARE dropped, in this same transaction
+   * (deleteVectorsFor; changed 2026-11-23, #95: kept vectors cost current searches
+   * result slots). Point-in-time reads still see the rows themselves.
    *
    * @param entityNames - Array of entity name strings to soft-delete
    */
@@ -2533,9 +2602,10 @@ export class SqliteStore implements GraphStore {
     const supersedeEntity = this.db.prepare(
       `UPDATE entities SET superseded_at = ? WHERE id = ? AND superseded_at = ''`
     );
-    // Soft-delete all of the entity's active observations.
+    // Soft-delete all of the entity's active observations. RETURNING id hands back the
+    // retired rows so their embeddings can be dropped in the same transaction (#95).
     const supersedeEntityObservations = this.db.prepare(
-      `UPDATE observations SET superseded_at = ? WHERE entity_id = ? AND superseded_at = ''`
+      `UPDATE observations SET superseded_at = ? WHERE entity_id = ? AND superseded_at = '' RETURNING id`
     );
     // Soft-delete all active relations originating from this entity. After v8,
     // relations.from_entity holds the normalized form, so we bind the normalized name.
@@ -2549,6 +2619,9 @@ export class SqliteStore implements GraphStore {
 
     const txn = this.db.transaction(() => {
       const now = new Date().toISOString();
+      // Every observation retired in this transaction; their vectors are dropped in
+      // one deleteVectorsFor call at the end (one scan per chunk, review CR-7/SL-3).
+      const retiredIds: number[] = [];
       for (const name of entityNames) {
         // deleteEntities is documented as idempotent — empty/separator-only names
         // can't refer to anything that exists, so swallow the normalize error and
@@ -2562,10 +2635,12 @@ export class SqliteStore implements GraphStore {
         const row = findActiveEntity.get(normalizedName) as { id: number } | undefined;
         if (!row) continue; // already soft-deleted or never existed
         supersedeEntity.run(now, row.id);
-        supersedeEntityObservations.run(now, row.id);
+        const retired = supersedeEntityObservations.all(now, row.id) as { id: number }[];
+        for (const r of retired) retiredIds.push(r.id);
         supersedeOutgoingRelations.run(now, normalizedName);
         supersedeIncomingRelations.run(now, normalizedName);
       }
+      this.deleteVectorsFor(retiredIds);
     });
     txn();
     this.maybeRunEviction();
@@ -2592,8 +2667,10 @@ export class SqliteStore implements GraphStore {
     // never this method. (This aligns to the long-documented "Tier 2, recoverable" intent;
     // the prior hard DELETE FROM was the anomaly — see
     // docs/superpowers/plans/2026-05-30-delete-observations-soft-delete.md.)
+    // RETURNING id: the retired row's id, so its embedding is dropped in the same
+    // transaction (#95).
     const softDeleteObs = this.db.prepare(
-      `UPDATE observations SET superseded_at = ? WHERE entity_id = ? AND content = ? AND superseded_at = ''`
+      `UPDATE observations SET superseded_at = ? WHERE entity_id = ? AND content = ? AND superseded_at = '' RETURNING id`
     );
     // Prepared statement to bump updated_at and last_accessed_at when observations
     // are retired from an entity — writes are the strongest access signal.
@@ -2605,6 +2682,8 @@ export class SqliteStore implements GraphStore {
       // One timestamp for the whole batch: the superseded_at marker and the entity
       // access bump share it.
       const now = new Date().toISOString();
+      // Collected for one deleteVectorsFor call at the end (review CR-7/SL-3).
+      const retiredIds: number[] = [];
       for (const d of deletions) {
         // deleteObservations is idempotent — empty/separator-only names can't refer
         // to anything that exists, so swallow the normalize error and skip silently.
@@ -2618,11 +2697,13 @@ export class SqliteStore implements GraphStore {
         if (!row) continue;
         let anyRetired = false;
         for (const content of d.contents) {
-          // Stamp superseded_at on the active row. The vec_observations embedding is
-          // deliberately KEPT (not deleted) so asOf vector search can still recover the
-          // historically-active observation — same rationale as supersedeObservations.
-          const result = softDeleteObs.run(now, row.id, content);
-          if (result.changes > 0) anyRetired = true;
+          // Stamp superseded_at on the active row and drop its embedding (see
+          // deleteVectorsFor for why retired embeddings are not kept).
+          const retired = softDeleteObs.all(now, row.id, content) as { id: number }[];
+          if (retired.length > 0) {
+            anyRetired = true;
+            for (const r of retired) retiredIds.push(r.id);
+          }
         }
         // Only bump updated_at if observations were actually retired —
         // avoids spurious timestamp advances on no-op deletions (e.g., misspelled content)
@@ -2630,6 +2711,7 @@ export class SqliteStore implements GraphStore {
           updateTimestamp.run(now, now, row.id);
         }
       }
+      this.deleteVectorsFor(retiredIds);
     });
     txn();
     this.maybeRunEviction();
@@ -2721,6 +2803,8 @@ export class SqliteStore implements GraphStore {
     // satisfies the GraphStore interface contract
     const txn = this.db.transaction(() => {
       const now = new Date().toISOString();
+      // Collected for one deleteVectorsFor call at the end (review CR-7/SL-3).
+      const retiredIds: number[] = [];
 
       for (const s of supersessions) {
         // Look up the entity by its normalized identity key.
@@ -2741,14 +2825,11 @@ export class SqliteStore implements GraphStore {
           );
         }
 
-        // Retire the old observation by setting its superseded_at timestamp.
-        // We deliberately do NOT delete the corresponding vec_observations row:
-        // historical embeddings must survive supersession so that point-in-time
-        // vector search at an asOf earlier than `now` can still recover the
-        // historically-active observation. The vec table grows monotonically
-        // with observation history. (~1.5KB per superseded observation; acceptable
-        // cost for Goal A correctness — see Phase B Task 3 fix #4 Part B.)
+        // Retire the old observation by setting its superseded_at timestamp, and drop
+        // its embedding in the same transaction (see deleteVectorsFor for why retired
+        // embeddings are not kept; this reverses the v1.1 Part B choice, #95).
         supersedeObs.run(now, obsRow.id);
+        retiredIds.push(obsRow.id);
 
         // Insert the replacement — carry forward importance, context_layer, and memory_type
         // from the old observation so metadata survives content updates.
@@ -2758,6 +2839,7 @@ export class SqliteStore implements GraphStore {
         // Bump updated_at and last_accessed_at so the entity surfaces in recency-ordered queries
         updateTimestamp.run(now, now, entityRow.id);
       }
+      this.deleteVectorsFor(retiredIds);
     });
     txn();
 
@@ -3447,10 +3529,10 @@ export class SqliteStore implements GraphStore {
 
             // Temporal filters for the KNN result hydration. With asOf undefined,
             // both filters reduce to `superseded_at = ''` (current state). With
-            // asOf set, both filters check the temporal interval — including the
-            // case where the observation has since been superseded but was active
-            // at asOf, which is exactly the historical recall path that depends on
-            // vec_observations rows surviving supersession (see Phase B fix #4).
+            // asOf set, both filters check the temporal interval. Since #95
+            // (2026-11-23) retired observations have no vectors, so with asOf the KNN
+            // can only return observations still active now that were also active at
+            // asOf; retired text is found by the LIKE path instead.
             const knnObsFilter = this.temporalObsFilter(asOf);
             const knnEntFilter = this.temporalEntFilter(asOf, 'e');
             for (let i = 0; i < obsIds.length; i += CHUNK_SIZE) {

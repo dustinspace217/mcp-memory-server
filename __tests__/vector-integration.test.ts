@@ -162,7 +162,8 @@ describe('Vector search integration', () => {
 
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    // Supersede the observation — old embedding should be deleted by syncEmbedding
+    // Supersede the observation — the old embedding is dropped by deleteVectorsFor inside
+    // the supersede transaction (#95); the replacement is embedded by syncEmbedding
     await store.supersedeObservations([
       { entityName: 'supersede-vec-test', oldContent: 'The sky is green', newContent: 'The sky is blue' }
     ]);
@@ -203,62 +204,97 @@ describe('Vector search integration', () => {
     // Not having similarExisting is acceptable (best-effort)
   });
 
-  it('should recover historical match via KNN at as_of after the observation was superseded', async () => {
-    // This test pins the vector-search-at-as_of fix: vec_observations rows
-    // are NOT deleted on supersession, so KNN can still match the historical
-    // embedding when queried with an as_of before the supersedeAt timestamp.
-    //
-    // Use semantically distinct observations with NO substring overlap with
-    // the search query, so the only path that can recover the match is KNN
-    // (LIKE will return zero results for the query).
+  // Receives an observation's content; returns how many vec_observations rows the
+  // shared fixture holds for it (0 or 1 normally). Reads the DB file directly so the
+  // check sees the vector table itself, not a search result.
+  const vecRowsFor = async (content: string): Promise<number> => {
+    const Database = (await import('better-sqlite3')).default;
+    const sqliteVec = await import('sqlite-vec');
+    const db = new Database(storePath, { readonly: true });
+    try {
+      sqliteVec.load(db);
+      const ids = (db.prepare('SELECT id FROM observations WHERE content = ?').all(content) as { id: number }[]).map(r => String(r.id));
+      if (ids.length === 0) return 0;
+      return (db.prepare(`SELECT COUNT(*) AS n FROM vec_observations WHERE observation_id IN (${ids.map(() => '?').join(', ')})`).get(...ids) as { n: number }).n;
+    } finally { db.close(); }
+  };
+
+  it('retiring an observation drops its embedding at once; as_of lookup still returns the old text', async () => {
+    // Pins the 2026-11-23 ruling (#95): retired observations do not keep their
+    // vectors, because they would take KNN result slots from current searches.
+    // This replaced the v1.1 test that expected supersede to KEEP the vector for
+    // point-in-time semantic search (that never survived a restart: the startup
+    // cleanup has long deleted those rows). Point-in-time history stays readable.
+    const oldText = 'An exoplanet hunter spacecraft launched in 2009';
+    const newText = 'A 17th century German mathematician';
+    const deletedText = 'A deep-space probe that studied the outer planets';
+    // Bystander on the same entity: its vector must survive both retires (an
+    // entity-wide or whole-table delete would take it; review TA-2).
+    const bystanderText = 'A radio telescope dish in a desert valley';
     await store.createEntities([
-      { name: 'kepler-historical', entityType: 'astronomy', observations: ['An exoplanet hunter spacecraft launched in 2009'] },
+      { name: 'kepler-historical', entityType: 'astronomy', observations: [oldText, deletedText, bystanderText] },
     ], undefined);
 
-    // Wait for embedding sweep to pick up the new observation
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    const beforeSupersede = new Date().toISOString();
+    // Bounded wait for all three write-time embeddings to land.
+    const embedDeadline = Date.now() + 10_000;
+    while ((await vecRowsFor(oldText)) + (await vecRowsFor(deletedText)) + (await vecRowsFor(bystanderText)) < 3 && Date.now() < embedDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    expect(await vecRowsFor(oldText)).toBe(1);
+    expect(await vecRowsFor(deletedText)).toBe(1);
+    expect(await vecRowsFor(bystanderText)).toBe(1);
+    const beforeRetire = new Date().toISOString();
     await new Promise(resolve => setTimeout(resolve, 100));
 
-    // Supersede with a totally unrelated observation. The old vec row must
-    // remain in vec_observations so historical KNN still finds it.
-    await store.supersedeObservations([
-      { entityName: 'kepler-historical', oldContent: 'An exoplanet hunter spacecraft launched in 2009', newContent: 'A 17th century German mathematician' }
-    ]);
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    // Retire one by supersede, one by soft delete: both vectors go immediately
+    // (in the retire transaction, no restart involved).
+    await store.supersedeObservations([{ entityName: 'kepler-historical', oldContent: oldText, newContent: newText }]);
+    await store.deleteObservations([{ entityName: 'kepler-historical', contents: [deletedText] }]);
+    expect(await vecRowsFor(oldText)).toBe(0);
+    expect(await vecRowsFor(deletedText)).toBe(0);
+    expect(await vecRowsFor(bystanderText)).toBe(1); // only the retired rows' vectors go
 
-    // Query with a phrase that's semantically close to the OLD content but
-    // shares no substring with it — only KNN can recover this match.
-    const historical = await store.searchNodes('telescope NASA mission', undefined, undefined, beforeSupersede);
-    const found = historical.entities.find(e => e.name === 'kepler-historical');
+    // The replacement is embedded at write time (fire-and-forget, bounded wait).
+    const newDeadline = Date.now() + 10_000;
+    while ((await vecRowsFor(newText)) < 1 && Date.now() < newDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    expect(await vecRowsFor(newText)).toBe(1);
 
-    // Best-effort: model-quality may vary, but at minimum the historical
-    // observation must still be present in the entity's observations list
-    // when looked up via openNodes at the same as_of.
-    const opened = await store.openNodes(['kepler-historical'], undefined, beforeSupersede);
+    // History is still there for point-in-time reads.
+    const opened = await store.openNodes(['kepler-historical'], undefined, beforeRetire);
     const historicalEntity = opened.entities.find(e => e.name === 'kepler-historical');
     expect(historicalEntity).toBeDefined();
-    expect(historicalEntity!.observations.map(o => o.content)).toContain('An exoplanet hunter spacecraft launched in 2009');
-
-    // If the model quality is good enough that KNN found it via search, verify
-    // the historical observation is what came back (not the new mathematician one).
-    if (found) {
-      const contents = found.observations.map(o => o.content);
-      expect(contents).toContain('An exoplanet hunter spacecraft launched in 2009');
-    }
-  });
+    expect(historicalEntity!.observations.map(o => o.content)).toEqual(expect.arrayContaining([oldText, deletedText]));
+  }, 30_000); // two bounded 10 s waits; vitest's default 5 s would cut them short (review TA-5)
 
   it('should exclude KNN matches when the parent entity is soft-deleted at as_of', async () => {
-    // After soft-delete, the entity row's superseded_at is set. Even if a
-    // vec_observations row would otherwise match the KNN query, the JOIN to
-    // entities should filter it out via temporalEntFilter at as_of > deletion.
+    // After soft-delete, the entity row's superseded_at is set and (since #95,
+    // 2026-11-23) its observations' vectors are dropped in the same transaction.
+    // The JOIN to entities via temporalEntFilter at as_of > deletion stays as the
+    // second line of defence for any vector an older build left behind.
+    // Two observations, so a drop of only the first retired id is caught (review
+    // TA-1), and an untouched second entity whose vector must survive (TA-2).
+    const doomedText = 'A unique watermark phrase about quantum entanglement experiments';
+    const doomedText2 = 'A second doomed note about superconducting qubits';
+    const survivorText = 'A survivor note about tidal pools on a rocky coast';
     await store.createEntities([
-      { name: 'doomed-entity', entityType: 'test', observations: ['A unique watermark phrase about quantum entanglement experiments'] },
+      { name: 'doomed-entity', entityType: 'test', observations: [doomedText, doomedText2] },
+      { name: 'survivor-entity', entityType: 'test', observations: [survivorText] },
     ], undefined);
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    const doomDeadline = Date.now() + 10_000;
+    while ((await vecRowsFor(doomedText)) + (await vecRowsFor(doomedText2)) + (await vecRowsFor(survivorText)) < 3 && Date.now() < doomDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    expect(await vecRowsFor(doomedText)).toBe(1);
+    expect(await vecRowsFor(doomedText2)).toBe(1);
+    expect(await vecRowsFor(survivorText)).toBe(1);
 
-    // Soft-delete the entity
+    // Soft-delete the entity: both observations' vectors go with it, nothing else does.
     await store.deleteEntities(['doomed-entity']);
+    expect(await vecRowsFor(doomedText)).toBe(0);
+    expect(await vecRowsFor(doomedText2)).toBe(0);
+    expect(await vecRowsFor(survivorText)).toBe(1);
     await new Promise(resolve => setTimeout(resolve, 100));
     const afterDelete = new Date().toISOString();
 
@@ -266,7 +302,7 @@ describe('Vector search integration', () => {
     const result = await store.searchNodes('quantum entanglement experiments', undefined, undefined, afterDelete);
     const found = result.entities.find(e => e.name === 'doomed-entity');
     expect(found).toBeUndefined();
-  });
+  }, 30_000); // bounded 10 s embed wait; vitest default is 5 s (review TA-5)
 
   it('checkDuplicates should find semantically similar existing observations', async () => {
     // Use 'dog-entity' from the first test — its observation "A loyal canine
@@ -393,6 +429,104 @@ describe('Vector search integration', () => {
     expect(emptied.rerankApplied).toBeUndefined();
   });
 
+  // Pins the sweep insert loop's "still active?" guard (review TA-4/MU-1, made
+  // deterministic on the cross-family review's suggestion XFA-2). The sweep selects
+  // its batch, then awaits embedBatch; a retire that lands during that await must
+  // not get its vector back. The test wraps the store's embedBatch so the retire
+  // happens exactly there, through the real store API. Reaches into two private
+  // members (embeddingPipeline, runEmbeddingSweep) on purpose: there is no public
+  // way to pause the sweep mid-batch.
+  it('sweep does not re-embed an observation retired while its batch was being embedded', async () => {
+    const retireText = 'sweep guard: a note retired during the embed await';
+    const keepText = 'sweep guard: a bystander note that must be embedded';
+    await store.createEntities([
+      { name: 'sweep-guard-entity', entityType: 'test', observations: [retireText, keepText] },
+    ], undefined);
+    const embedDeadline = Date.now() + 10_000;
+    while ((await vecRowsFor(retireText)) + (await vecRowsFor(keepText)) < 2 && Date.now() < embedDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    // Punch both holes so the sweep selects both.
+    const Database = (await import('better-sqlite3')).default;
+    const sqliteVec = await import('sqlite-vec');
+    const db = new Database(storePath);
+    try {
+      sqliteVec.load(db);
+      for (const c of [retireText, keepText]) {
+        const id = (db.prepare('SELECT id FROM observations WHERE content = ?').get(c) as { id: number }).id;
+        db.prepare('DELETE FROM vec_observations WHERE observation_id = ?').run(String(id));
+      }
+    } finally { db.close(); }
+    expect(await vecRowsFor(retireText)).toBe(0);
+    expect(await vecRowsFor(keepText)).toBe(0);
+
+    // Wrap embedBatch: after the real call returns (batch selected, vectors
+    // computed), retire one observation, then hand the results back to the sweep.
+    const internals = store as unknown as {
+      embeddingPipeline: { embedBatch: (items: { id: number; content: string }[]) => Promise<unknown> };
+      runEmbeddingSweep: () => Promise<void>;
+    };
+    const pipeline = internals.embeddingPipeline;
+    const realEmbedBatch = pipeline.embedBatch.bind(pipeline);
+    let retiredMidSweep = false;
+    pipeline.embedBatch = async (items) => {
+      const results = await realEmbedBatch(items);
+      if (!retiredMidSweep) {
+        retiredMidSweep = true;
+        await store.deleteObservations([{ entityName: 'sweep-guard-entity', contents: [retireText] }]);
+      }
+      return results;
+    };
+    try {
+      await internals.runEmbeddingSweep();
+    } finally {
+      pipeline.embedBatch = realEmbedBatch; // restore for the remaining tests
+    }
+
+    expect(retiredMidSweep).toBe(true);           // the retire really happened mid-sweep
+    expect(await vecRowsFor(retireText)).toBe(0); // the guard kept its vector out
+    expect(await vecRowsFor(keepText)).toBe(1);   // the rest of the batch was still embedded
+  }, 30_000);
+
+  // Same pin for the write-time path (cross-family review XFK-1): syncEmbedding
+  // awaits embed() before its insert transaction; a retire landing during that
+  // await must not get its vector back. Wraps embed() on the store's private
+  // pipeline so the retire happens exactly there, through the real store API.
+  it('write-time embed does not insert a vector for an observation retired during the embed await', async () => {
+    const retireText = 'sync guard: a note retired while its embedding was computed';
+    await store.createEntities([{ name: 'sync-guard-entity', entityType: 'test', observations: [] }], undefined);
+
+    const internals = store as unknown as {
+      embeddingPipeline: { embed: (text: string, kind?: 'passage' | 'query') => Promise<Float32Array | null> };
+    };
+    const pipeline = internals.embeddingPipeline;
+    const realEmbed = pipeline.embed.bind(pipeline);
+    let retiredMidEmbed = false;
+    pipeline.embed = async (text, kind) => {
+      const vec = await realEmbed(text, kind);
+      if (text === retireText && !retiredMidEmbed) {
+        retiredMidEmbed = true;
+        await store.deleteObservations([{ entityName: 'sync-guard-entity', contents: [retireText] }]);
+      }
+      return vec;
+    };
+    try {
+      await store.addObservations([{ entityName: 'sync-guard-entity', contents: [retireText] }]);
+      // syncEmbedding is fire-and-forget; wait (bounded) until the wrapper has run
+      // and a little past it, so a wrongful insert would have landed.
+      const deadline = Date.now() + 10_000;
+      while (!retiredMidEmbed && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    } finally {
+      pipeline.embed = realEmbed; // restore for the remaining tests
+    }
+
+    expect(retiredMidEmbed).toBe(true);           // the retire really happened mid-embed
+    expect(await vecRowsFor(retireText)).toBe(0); // the guard kept its vector out
+  }, 30_000);
+
   // Pins both startup sweeps' "which rows lack a vector?" queries (observations in
   // runEmbeddingSweep, pending triggers in runTriggerEmbeddingSweep). Before this
   // test, nothing failed if either query matched nothing: write-time syncEmbedding
@@ -448,8 +582,8 @@ describe('Vector search integration', () => {
     let store2: SqliteStore | undefined;
     try {
       // Seed: four active observations, one retired, and three pending triggers, all
-      // embedded at write time. The retired one still has its vector here (it is
-      // kept at runtime for as_of KNN), so 5 observation vectors exist.
+      // embedded at write time. The retired claim's vector is dropped by the supersede
+      // itself (#95), so 4 observation vectors exist: one per active observation.
       store1 = new SqliteStore(sweepPath);
       await store1.init();
       await waitReady(store1);
@@ -464,7 +598,7 @@ describe('Vector search integration', () => {
       const trigger = await store1.setProspectiveTrigger('sweep trigger: the tide tables come up', 'sweep payload');
       const keptTrigger = await store1.setProspectiveTrigger('sweep kept trigger: the ferry schedule changes', 'kept payload');
       const firedTrigger = await store1.setProspectiveTrigger('sweep fired trigger: the orchard opens', 'fired payload');
-      expect(await waitForVecCount(sweepPath, 5, 20_000)).toBe(true); // 4 active + 1 retired
+      expect(await waitForVecCount(sweepPath, 4, 20_000)).toBe(true); // the 4 active, retired one dropped
       // Trigger vectors are also written fire-and-forget; wait (bounded) for all three.
       const seedTrigDeadline = Date.now() + 20_000;
       while (vecIds(sweepPath, 'vec_triggers').length < 3 && Date.now() < seedTrigDeadline) {
@@ -477,11 +611,14 @@ describe('Vector search integration', () => {
 
       // While closed, shape the database the second store will sweep:
       //  - holes: remove the vectors of two ACTIVE observations (must be refilled);
-      //  - remove the RETIRED claim's vector (must NOT be refilled: superseded_at filter);
+      //  - the RETIRED claim already has no vector (dropped at supersede); the sweep
+      //    must not create one (superseded_at filter, plus the insert-time guard);
       //  - anchor: replace a kept row's vector with a constant fill (must survive:
       //    a query that re-selects every row would re-embed it with real values);
-      //  - plant one NULL-id row (vec0 accepts it; without IS NOT NULL in the
-      //    subquery, NOT IN would match nothing and no hole would be refilled);
+      //  - plant one NULL-id row before restart: the startup cleanup must remove it
+      //    (its IS NULL arm, #95). A second NULL row is planted just after init below,
+      //    after the cleanup has run, to reach the sweep: without IS NOT NULL in the
+      //    sweep's subquery, NOT IN would match nothing and no hole would be refilled;
       //  - remove the pending trigger's vector (the trigger sweep must refill it),
       //    and plant a NULL-id trigger row for the same reason as above;
       //  - anchor a second pending trigger with the constant fill (must survive), and
@@ -497,7 +634,7 @@ describe('Vector search integration', () => {
         superseded = idOf('sweep beta old claim');
         keepId = idOf('sweep gamma: a ferry crosses the sound at dawn');
         const del = db.prepare('DELETE FROM vec_observations WHERE observation_id = ?');
-        for (const id of [...holes, superseded, keepId]) del.run(String(id));
+        for (const id of [...holes, keepId]) del.run(String(id));
         db.prepare('INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)').run(fillBytes(), String(keepId));
         db.prepare('INSERT INTO vec_observations (embedding, observation_id) VALUES (?, NULL)').run(fillBytes());
         const delTrig = db.prepare('DELETE FROM vec_triggers WHERE trigger_id = ?');
@@ -514,6 +651,16 @@ describe('Vector search integration', () => {
       // Reopen: the sweeps must find exactly the holes and fill them.
       store2 = new SqliteStore(sweepPath);
       await store2.init();
+      // Startup cleanup has run; plant the post-init NULL rows for the sweeps to meet.
+      // The model is still loading at this point (the sweep starts on its ready
+      // callback); if it were already ready the sweep might finish first and this
+      // NULL row would only make the sweep check vacuous for that run, never fail it.
+      const late = new Database(sweepPath);
+      try {
+        sqliteVec.load(late);
+        late.prepare('INSERT INTO vec_observations (embedding, observation_id) VALUES (?, NULL)').run(fillBytes());
+        late.prepare('INSERT INTO vec_triggers (embedding, trigger_id) VALUES (?, NULL)').run(fillBytes());
+      } finally { late.close(); }
       await waitReady(store2);
       const filled = await waitForVecCount(sweepPath, 4, 30_000);
       // The trigger sweep runs after the observation sweep; give it a bounded moment.
@@ -539,6 +686,10 @@ describe('Vector search integration', () => {
         expect(first).toBe(FILL); // the anchored row was not re-embedded
         const keptTrig = (check.prepare('SELECT embedding FROM vec_triggers WHERE trigger_id = ?').get(String(keptTrigger.id)) as { embedding: Buffer }).embedding;
         expect(new Float32Array(keptTrig.buffer, keptTrig.byteOffset, 4)[0]).toBe(FILL); // anchored trigger kept
+        // Exactly the post-init NULL rows remain: the pre-restart ones were removed by
+        // the startup cleanup's IS NULL arm (#95, XFK-1).
+        expect((check.prepare('SELECT COUNT(*) AS n FROM vec_observations WHERE observation_id IS NULL').get() as { n: number }).n).toBe(1);
+        expect((check.prepare('SELECT COUNT(*) AS n FROM vec_triggers WHERE trigger_id IS NULL').get() as { n: number }).n).toBe(1);
       } finally { check.close(); }
     } finally {
       // Intentional ignores: cleanup must not mask the test's own failure.

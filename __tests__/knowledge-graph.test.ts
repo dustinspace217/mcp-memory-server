@@ -2843,6 +2843,10 @@ describe.each<[string, string, StoreFactory]>([
 			await store.createEntities([
 				{ name: 'Alice', entityType: 'person', observations: ['keep this'] },
 			]);
+			// readGraph does not touch entities, so it can read updatedAt without moving it.
+			const before = (await store.readGraph()).entities.find(e => e.name === 'Alice')?.updatedAt;
+			// Let the clock move so a wrongful timestamp bump would be visible.
+			await new Promise(resolve => setTimeout(resolve, 5));
 
 			// Delete an observation that doesn't exist — should not throw or affect existing obs
 			await store.deleteObservations([
@@ -2853,6 +2857,9 @@ describe.each<[string, string, StoreFactory]>([
 			const alice = graph.entities.find(e => e.name === 'Alice');
 			expect(alice?.observations).toHaveLength(1);
 			expect(alice?.observations[0].content).toBe('keep this');
+			// A no-op delete must not bump the entity (the anyRetired gate; pinned after
+			// the 2026-11-23 switch to UPDATE ... RETURNING, review TA-3).
+			expect(alice?.updatedAt).toBe(before);
 		});
 
 		it('should silently handle deleting relations that do not exist', async () => {
