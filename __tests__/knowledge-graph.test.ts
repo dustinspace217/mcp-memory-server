@@ -3590,6 +3590,63 @@ describe('SqliteStore-specific', () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		});
 
+		it('reads at most 512 bytes of the label file and ignores a non-file path (review FR-7, #99)', async () => {
+			// The label is read on every write, so the read is bounded: a huge file still
+			// yields its first 120 chars, and a path that is not a regular file (a
+			// directory, a device) falls back to the env label. A FIFO is covered by the
+			// next test, which needs a child process (an open could block forever).
+			const dir = await fs.mkdtemp(path.join(tmpdir(), 'memory-instance-'));
+			try {
+			const bigFile = path.join(dir, 'big.label');
+			await fs.writeFile(bigFile, 'Claude Code ' + 'm'.repeat(10_000) + '\nSECOND LINE');
+			// Only the bound decides this one: 600 bytes of whitespace, then a label. A
+			// 512-byte read sees nothing and falls back; an unbounded read would find it.
+			const lateFile = path.join(dir, 'late.label');
+			await fs.writeFile(lateFile, ' '.repeat(600) + 'LateLabel');
+			vi.stubEnv('MEMORY_INSTANCE_NAME', 'Kimi Code');
+			vi.stubEnv('MEMORY_INSTANCE_NAME_FILE', bigFile);
+			await store.createEntities([{ name: 'BigLabel', entityType: 'machine', observations: ['big label file'] }]);
+			vi.stubEnv('MEMORY_INSTANCE_NAME_FILE', lateFile);
+			await store.createEntities([{ name: 'LateLabel', entityType: 'machine', observations: ['label past the bound'] }]);
+			vi.stubEnv('MEMORY_INSTANCE_NAME_FILE', dir); // a directory, not a file
+			await store.createEntities([{ name: 'DirLabel', entityType: 'machine', observations: ['directory as label path'] }]);
+			// A readable non-file: without the regular-file check this would read 512 NUL
+			// bytes and stamp them as the label (Linux path; the server targets Linux).
+			vi.stubEnv('MEMORY_INSTANCE_NAME_FILE', '/dev/zero');
+			await store.createEntities([{ name: 'DevLabel', entityType: 'machine', observations: ['device as label path'] }]);
+
+			const graph = await store.readGraph();
+			const big = graph.entities.find(e => e.name === 'BigLabel')!.observations[0].sourceInstance;
+			expect(big).toBe(('Claude Code ' + 'm'.repeat(10_000)).slice(0, 120));
+			expect(graph.entities.find(e => e.name === 'LateLabel')!.observations[0].sourceInstance).toBe('Kimi Code'); // bound holds
+			expect(graph.entities.find(e => e.name === 'DirLabel')!.observations[0].sourceInstance).toBe('Kimi Code');
+			expect(graph.entities.find(e => e.name === 'DevLabel')!.observations[0].sourceInstance).toBe('Kimi Code');
+			} finally {
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		});
+
+		it('a FIFO label path never blocks the write (O_NONBLOCK; review TA-6)', async () => {
+			// Opening a FIFO with no writer blocks forever without O_NONBLOCK, and inside
+			// the write path that would freeze the server. A blocked open cannot be
+			// interrupted in-process, so the resolver runs in a child with a timeout: a
+			// regression shows up as a killed child, not as a hung test run.
+			const { spawnSync } = await import('node:child_process');
+			const dir = await fs.mkdtemp(path.join(tmpdir(), 'memory-instance-'));
+			try {
+				const fifo = path.join(dir, 'label.fifo');
+				expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
+				const typesPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'types.js');
+				const child = spawnSync(process.execPath, ['--input-type=module', '-e',
+					`const { resolveSourceInstance } = await import(${JSON.stringify(typesPath)}); process.stdout.write(resolveSourceInstance());`],
+					{ env: { ...process.env, MEMORY_INSTANCE_NAME: 'Kimi Code', MEMORY_INSTANCE_NAME_FILE: fifo }, timeout: 5_000, encoding: 'utf8' });
+				expect(child.signal).toBeNull();          // not killed by the timeout
+				expect(child.stdout).toBe('Kimi Code');   // the FIFO was skipped, env label used
+			} finally {
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		}, 15_000);
+
 		it('surfaces sourceInstance through entityTimeline, getContextLayers, and getSummary', async () => {
 			vi.stubEnv('MEMORY_INSTANCE_NAME', 'surface-rig');
 			await store.createEntities([{ name: 'Surfaced', entityType: 'machine', observations: [] }]);

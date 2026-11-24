@@ -439,11 +439,14 @@ describe('Vector search integration', () => {
   it('sweep does not re-embed an observation retired while its batch was being embedded', async () => {
     const retireText = 'sweep guard: a note retired during the embed await';
     const keepText = 'sweep guard: a bystander note that must be embedded';
+    // Second bystander so the batched DELETE runs with more than one id (review
+    // TA-4: with one id, a single-placeholder or first-id-only DELETE would pass).
+    const keepText2 = 'sweep guard: a second bystander note';
     await store.createEntities([
-      { name: 'sweep-guard-entity', entityType: 'test', observations: [retireText, keepText] },
+      { name: 'sweep-guard-entity', entityType: 'test', observations: [retireText, keepText, keepText2] },
     ], undefined);
     const embedDeadline = Date.now() + 10_000;
-    while ((await vecRowsFor(retireText)) + (await vecRowsFor(keepText)) < 2 && Date.now() < embedDeadline) {
+    while ((await vecRowsFor(retireText)) + (await vecRowsFor(keepText)) + (await vecRowsFor(keepText2)) < 3 && Date.now() < embedDeadline) {
       await new Promise(resolve => setTimeout(resolve, 250));
     }
     // Punch both holes so the sweep selects both.
@@ -452,13 +455,14 @@ describe('Vector search integration', () => {
     const db = new Database(storePath);
     try {
       sqliteVec.load(db);
-      for (const c of [retireText, keepText]) {
+      for (const c of [retireText, keepText, keepText2]) {
         const id = (db.prepare('SELECT id FROM observations WHERE content = ?').get(c) as { id: number }).id;
         db.prepare('DELETE FROM vec_observations WHERE observation_id = ?').run(String(id));
       }
     } finally { db.close(); }
     expect(await vecRowsFor(retireText)).toBe(0);
     expect(await vecRowsFor(keepText)).toBe(0);
+    expect(await vecRowsFor(keepText2)).toBe(0);
 
     // Wrap embedBatch: after the real call returns (batch selected, vectors
     // computed), retire one observation, then hand the results back to the sweep.
@@ -474,6 +478,18 @@ describe('Vector search integration', () => {
       if (!retiredMidSweep) {
         retiredMidSweep = true;
         await store.deleteObservations([{ entityName: 'sweep-guard-entity', contents: [retireText] }]);
+        // Plant a stale vector for the bystander, as if another process's write had
+        // landed: the sweep's single batched DELETE must clear it so exactly one
+        // (real) vector remains (issue #96).
+        const plant = new Database(storePath);
+        try {
+          sqliteVec.load(plant);
+          for (const c of [keepText, keepText2]) {
+            const keepId = (plant.prepare('SELECT id FROM observations WHERE content = ?').get(c) as { id: number }).id;
+            plant.prepare('INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)')
+              .run(Buffer.from(new Float32Array(384).fill(0.5).buffer), String(keepId));
+          }
+        } finally { plant.close(); }
       }
       return results;
     };
@@ -485,7 +501,18 @@ describe('Vector search integration', () => {
 
     expect(retiredMidSweep).toBe(true);           // the retire really happened mid-sweep
     expect(await vecRowsFor(retireText)).toBe(0); // the guard kept its vector out
-    expect(await vecRowsFor(keepText)).toBe(1);   // the rest of the batch was still embedded
+    expect(await vecRowsFor(keepText)).toBe(1);   // one row each: both planted stale rows were cleared (#96)
+    expect(await vecRowsFor(keepText2)).toBe(1);
+    // ... and each is the real embedding, not the planted 0.5 fill.
+    const check = new Database(storePath, { readonly: true });
+    try {
+      sqliteVec.load(check);
+      for (const c of [keepText, keepText2]) {
+        const keepId = (check.prepare('SELECT id FROM observations WHERE content = ?').get(c) as { id: number }).id;
+        const row = check.prepare('SELECT embedding FROM vec_observations WHERE observation_id = ?').get(String(keepId)) as { embedding: Buffer };
+        expect(new Float32Array(row.embedding.buffer, row.embedding.byteOffset, 1)[0]).not.toBe(0.5);
+      }
+    } finally { check.close(); }
   }, 30_000);
 
   // Same pin for the write-time path (cross-family review XFK-1): syncEmbedding
@@ -700,6 +727,109 @@ describe('Vector search integration', () => {
     }
   }, 30_000);
 
+  // Issue #101: checkProspectiveTriggers decides every readable gate (threshold,
+  // then scope + pending) OUTSIDE its transaction, and fires inside an IMMEDIATE
+  // one only when a candidate survives. Three cells, each with its own project so
+  // no other fixture trigger is a candidate.
+  //  (a) nothing clears the threshold, another connection holds the write lock:
+  //      the check returns at once (no write lock taken).
+  //  (b) a trigger in ANOTHER project clears the threshold (review SL-1): the
+  //      scope pre-filter drops it, so again no write lock is taken.
+  //  (c) an in-scope trigger clears it while a worker thread holds the lock: the
+  //      IMMEDIATE fire transaction waits for the commit and fires (a DEFERRED one
+  //      would read, then fail on the upgrade).
+  // A version that always opened the IMMEDIATE transaction would wait out
+  // busy_timeout (5 s) in (a) and (b) and throw SQLITE_BUSY.
+  it('trigger checks take the write lock only when something will fire (#101)', async () => {
+    const Database = (await import('better-sqlite3')).default;
+    const { Worker } = await import('node:worker_threads');
+    const workerPath = path.join(testDir, 'helpers', 'lock-holder-worker.mjs');
+    const text = 'lock probe: the observatory roof opens at dusk';
+    const created: number[] = [];
+    try {
+      const inA = await store.setProspectiveTrigger(text, 'payload-a', 'lock-proj-a');
+      const inB = await store.setProspectiveTrigger(text, 'payload-b', 'lock-proj-b');
+      created.push(inA.id, inB.id);
+      const deadline = Date.now() + 10_000;
+      while ((await vecTrigRowsFor(inA.id)) + (await vecTrigRowsFor(inB.id)) < 2 && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      expect(await vecTrigRowsFor(inA.id)).toBe(1); // precondition: KNN has rows to score
+      expect(await vecTrigRowsFor(inB.id)).toBe(1);
+
+      // (a) and (b) under a lock held on a second connection in this thread.
+      const holder = new Database(storePath);
+      try {
+        holder.exec('BEGIN IMMEDIATE');
+        let started = Date.now();
+        const none = await store.checkProspectiveTriggers('a sourdough loaf proofing overnight in a cold kitchen', 'lock-proj-a');
+        const noneMs = Date.now() - started;
+        started = Date.now();
+        const otherProject = await store.checkProspectiveTriggers(text, 'lock-proj-c'); // only A/B triggers match; neither is in C
+        const otherMs = Date.now() - started;
+        holder.exec('ROLLBACK');
+        expect(none.fired).toEqual([]);
+        expect(noneMs).toBeLessThan(3_500);  // no 5 s busy wait
+        expect(otherProject.fired).toEqual([]);
+        expect(otherMs).toBeLessThan(3_500); // the scope pre-filter kept it lock-free (SL-1)
+      } finally {
+        if (holder.inTransaction) holder.exec('ROLLBACK');
+        holder.close();
+      }
+
+      // (c) an in-scope fire while a worker thread holds the lock. The hold (2 s)
+      // leaves ample room for the check's query embed (tens of ms) to finish
+      // before the worker commits, and the timestamps below prove it did (review
+      // XFA-1): the check started before the commit and returned after it.
+      const worker = new Worker(workerPath, { workerData: { dbPath: storePath, holdMs: 2_000 } });
+      try {
+        const committed = new Promise<number>((resolve, reject) => {
+          worker.on('message', (m: string | { committedAt: number }) => { if (typeof m === 'object') resolve(m.committedAt); });
+          worker.on('error', reject);
+        });
+        await new Promise<void>((resolve, reject) => {
+          worker.on('message', (m: string | { committedAt: number }) => { if (m === 'locked') resolve(); });
+          worker.on('error', reject);
+        });
+        const started = Date.now();
+        const fired = await store.checkProspectiveTriggers(text, 'lock-proj-a');
+        const ended = Date.now();
+        const committedAt = await committed;
+        expect(fired.fired.map(f => f.id)).toEqual([inA.id]); // waited for the lock, then fired
+        expect(started).toBeLessThan(committedAt);
+        expect(ended).toBeGreaterThanOrEqual(committedAt);
+      } finally {
+        await worker.terminate();
+      }
+    } finally {
+      await store.deleteProspectiveTriggers(created);
+    }
+  }, 30_000);
+
+  // The threshold gate moved before the transaction (#101). A trigger in the same
+  // project that does NOT clear the threshold must stay pending while a close one
+  // fires (review TA-2: a version that used the gate only for the early return
+  // and then fired every KNN row would fire both).
+  it('only triggers that clear the threshold fire; a distant one in the same project stays pending', async () => {
+    const closeText = 'threshold probe: the comet passes perihelion tonight';
+    const farText = 'threshold probe: a recipe for slow-cooked lentil soup';
+    const close = await store.setProspectiveTrigger(closeText, 'close', 'threshold-proj');
+    const far = await store.setProspectiveTrigger(farText, 'far', 'threshold-proj');
+    try {
+      const deadline = Date.now() + 10_000;
+      while ((await vecTrigRowsFor(close.id)) + (await vecTrigRowsFor(far.id)) < 2 && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      expect(await vecTrigRowsFor(far.id)).toBe(1); // precondition: the distant one is a KNN row
+      const result = await store.checkProspectiveTriggers(closeText, 'threshold-proj');
+      expect(result.fired.map(f => f.id)).toEqual([close.id]);
+      const pending = await store.listProspectiveTriggers('threshold-proj');
+      expect(pending.map(p => p.id)).toContain(far.id);
+    } finally {
+      await store.deleteProspectiveTriggers([close.id, far.id]);
+    }
+  }, 30_000);
+
   // Pins both startup sweeps' "which rows lack a vector?" queries (observations in
   // runEmbeddingSweep, pending triggers in runTriggerEmbeddingSweep). Before this
   // test, nothing failed if either query matched nothing: write-time syncEmbedding
@@ -873,7 +1003,7 @@ describe('Vector search integration', () => {
         try { await fs.unlink(sweepPath + suffix); } catch { /* ok */ }
       }
     }
-  }, 240_000); // waits: 60 s model + 20 s seed + 60 s model + 30 s sweep + 10 s trigger = 180 s
+  }, 240_000); // waits: 60 s model + 20 s seed obs + 20 s seed triggers + 60 s model + 30 s sweep + 10 s trigger = 200 s
 
   it('vec_config model guard: a model switch clears stale vectors on startup (v15)', async () => {
     // Dedicated store on its own db file — this test mutates vec_config and

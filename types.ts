@@ -2,10 +2,10 @@
 // SqliteStore (the sole live backend since v1.6.0) and the jsonl-reader migration
 // parser both depend on these types.
 
-// Only used by resolveSourceInstance() below: a synchronous read of the tiny
-// per-launch label file. Sync on purpose — the resolver is called from inside
-// write paths that are not async at that point, and the file is ~40 bytes.
-import { readFileSync } from 'node:fs';
+// Only used by resolveSourceInstance() below: a synchronous, bounded read of the
+// tiny per-launch label file. Sync on purpose — the resolver is called from
+// inside write paths that are not async at that point, and the file is ~40 bytes.
+import { openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 
 /**
  * A single piece of knowledge attached to an entity.
@@ -697,10 +697,29 @@ export function resolveSourceInstance(): string {
   const labelFile = (process.env.MEMORY_INSTANCE_NAME_FILE ?? '').trim();
   if (labelFile) {
     try {
+      // Bounded read (review FR-7, issue #99): this runs once per write call (and
+      // per observation for any caller that does not pass the label in), so it
+      // must never block or read much.
+      // O_NONBLOCK so opening a FIFO cannot stall the event loop; only a regular
+      // file is read; at most 512 bytes (the label is ~40, and only the first 120
+      // chars are kept below).
+      const fd = openSync(labelFile, constants.O_RDONLY | constants.O_NONBLOCK);
+      let raw = '';
+      try {
+        if (fstatSync(fd).isFile()) {
+          const buf = Buffer.alloc(512);
+          const n = readSync(fd, buf, 0, buf.length, 0);
+          // A multi-byte character cut by the 512-byte bound decodes to U+FFFD;
+          // drop it rather than stamp a replacement character (review TA-7).
+          raw = buf.subarray(0, n).toString('utf8').replace(/\uFFFD+$/, '');
+        }
+      } finally {
+        closeSync(fd);
+      }
       // One line, inner whitespace collapsed, at most 120 chars: the label is
       // rendered verbatim into loaded context headers, so a newline smuggled
       // through a model argument must not become a second line there.
-      const fromFile = readFileSync(labelFile, 'utf8').split(/\s+/).filter(Boolean).join(' ').slice(0, 120);
+      const fromFile = raw.split(/\s+/).filter(Boolean).join(' ').slice(0, 120);
       if (fromFile) return fromFile;
     } catch {
       // Deliberately ignored: the file is optional; the static env label below
@@ -728,9 +747,13 @@ export function createObservation(
   importance: number = 3.0,
   contextLayer: string | null = null,
   memoryType: string | null = null,
-  sourceRef: string = ''
+  sourceRef: string = '',
+  sourceInstance?: string
 ): Observation {
-  const obs: Observation = { content, createdAt: new Date().toISOString(), importance, contextLayer, memoryType, sourceInstance: resolveSourceInstance() };
+  // sourceInstance: callers that already resolved the label once for the whole
+  // call pass it in, so the label file is not re-read per observation inside a
+  // write transaction (review SL-3/CR-3). Omitted -> resolved here.
+  const obs: Observation = { content, createdAt: new Date().toISOString(), importance, contextLayer, memoryType, sourceInstance: sourceInstance ?? resolveSourceInstance() };
   if (sourceRef) obs.sourceRef = sourceRef;
   return obs;
 }

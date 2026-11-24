@@ -859,8 +859,10 @@ export class SqliteStore implements GraphStore {
       // Migration 9 → 10: source instance tracking for multi-machine setups.
       //
       // Adds `source_instance` to observations so each observation records which
-      // Claude Code instance (machine/environment) created it. The value comes
-      // from the MEMORY_INSTANCE_NAME env var at insert time.
+      // Claude Code instance (machine/environment) created it. The value came
+      // from the MEMORY_INSTANCE_NAME env var at insert time; since 2026-09-10 a
+      // launch-time label file (MEMORY_INSTANCE_NAME_FILE) takes precedence (see
+      // resolveSourceInstance in types.ts).
       //
       // Why on observations (not entities): the same entity ("dustin" profile,
       // "working-relationship") can have observations from multiple machines.
@@ -2010,7 +2012,6 @@ export class SqliteStore implements GraphStore {
       // concurrent MCP request already embedded this observation between
       // our query and this insert (race window during await embedBatch).
       if (results.length > 0 && this.db) {
-        const del = this.db.prepare('DELETE FROM vec_observations WHERE observation_id = ?');
         const insert = this.db.prepare(
           'INSERT INTO vec_observations (embedding, observation_id) VALUES (?, ?)'
         );
@@ -2024,9 +2025,21 @@ export class SqliteStore implements GraphStore {
           // lesson as the v10->v11 migration note in CLAUDE.md).
           let inserted = 0;
           const txn = this.db.transaction(() => {
-            for (const { id, embedding } of results) {
-              if (!isActive.get(id)) continue;
-              del.run(String(id));
+            const live = results.filter(r => isActive.get(r.id));
+            if (live.length === 0) return;
+            // Clear any existing vectors for the batch with ONE DELETE, not one per
+            // row: each DELETE filtered on the vec0 auxiliary column scans the whole
+            // vector table (issue #96; measured on a live-size copy 2026-11-23: 100
+            // per-row DELETEs 922 ms vs one IN-list DELETE 11 ms). The batch is at
+            // most BATCH_SIZE (100) ids, well under SQLite's 999-parameter limit.
+            // Not deleteVectorsFor: that helper logs and swallows errors, and here a
+            // failed DELETE followed by the inserts would leave duplicate vectors; a
+            // throw must abort the batch instead (review CR-4).
+            const ids = live.map(r => String(r.id));
+            this.db.prepare(
+              `DELETE FROM vec_observations WHERE observation_id IN (${ids.map(() => '?').join(', ')})`
+            ).run(...ids);
+            for (const { id, embedding } of live) {
               insert.run(
                 Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
                 String(id)
@@ -2081,7 +2094,9 @@ export class SqliteStore implements GraphStore {
     // Bounded loop over batches — cap iterations so a pathological state (rows
     // that never embed) can't spin forever (Power-of-Ten rule 2). At 100/batch,
     // 1000 iterations covers 100k pending triggers, far beyond any real corpus.
-    for (let iter = 0; iter < 1000; iter++) {
+    const MAX_ITERATIONS = 1000;
+    let iter = 0;
+    for (; iter < MAX_ITERATIONS; iter++) {
       if (!this.db || this.shuttingDown) break;
 
       // Same NOT IN shape as runEmbeddingSweep, for the same reasons (a LEFT JOIN on
@@ -2141,6 +2156,11 @@ export class SqliteStore implements GraphStore {
       if (this.embeddingPipeline.state.status !== 'ready') break;
     }
 
+    if (iter === MAX_ITERATIONS) {
+      // Same loud cap log as the observation sweep (review FR-8, #99); "may"
+      // because the last batch could have held the final rows.
+      console.error(`Vector search: trigger embedding sweep stopped at its ${MAX_ITERATIONS}-batch cap; triggers may remain un-embedded`);
+    }
     if (totalEmbedded > 0) {
       console.error(`Vector search: embedded ${totalEmbedded} prospective triggers during sweep`);
     }
@@ -2195,15 +2215,16 @@ export class SqliteStore implements GraphStore {
       'INSERT OR IGNORE INTO observations (entity_id, content, created_at, importance, context_layer, memory_type, source_instance, source_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
     );
 
-    // Which Claude Code instance is writing (MEMORY_INSTANCE_NAME, e.g. "fedora",
-    // "windows-mele"), stamped on every observation so cross-instance setups can
-    // trace provenance; 'unknown' when unset makes a misconfigured instance
-    // visible rather than silently untagged. Resolved PER CALL via the shared
-    // types.ts helper (Issue #80 consolidated three drifted copies into one) —
-    // read here, not cached at module load, so tests can stub the env without
-    // resetModules; the cost is a string trim per write, irrelevant next to the
-    // SQLite write itself. Resolved once here so the INSERT and the returned
-    // Entity always agree on the same value.
+    // Which harness and model is writing (the launch-time label file named by
+    // MEMORY_INSTANCE_NAME_FILE, else MEMORY_INSTANCE_NAME), stamped on every
+    // observation so cross-instance setups can trace provenance; 'unknown' when
+    // unset makes a misconfigured instance visible rather than silently untagged.
+    // Resolved PER CALL via the shared types.ts helper (Issue #80 consolidated
+    // three drifted copies into one), not cached at module load, so a label that
+    // changes under a running server is picked up and tests can stub the env
+    // without resetModules; the cost is a bounded (<=512-byte) file read per
+    // write, small next to the SQLite write itself. Resolved once here so the
+    // INSERT and the returned Entity always agree on the same value.
     const sourceInstance = resolveSourceInstance();
 
     const created: Entity[] = [];
@@ -2246,7 +2267,7 @@ export class SqliteStore implements GraphStore {
           // but EntityInput observations are plain strings or Observation objects --
           // strings get defaults via createObservation(obs, ..., sref), objects pass
           // through as-is (their own sourceRef, if any, wins over the call-level sref).
-          const o = typeof obs === 'string' ? createObservation(obs, 3.0, null, null, sref) : obs;
+          const o = typeof obs === 'string' ? createObservation(obs, 3.0, null, null, sref, sourceInstance) : obs;
           // For a plain string, createObservation already baked sref into o.sourceRef
           // (when sref is non-empty); an object input carries its own. Either way
           // o.sourceRef is the source of truth here; '' when unset.
@@ -2331,36 +2352,44 @@ export class SqliteStore implements GraphStore {
     // the input stores VERBATIM. Open vocabulary is a standing decision
     // (DEF-CG-03), and the canonicalizer never guesses between ambiguous
     // spellings. Map values: spelling to reuse, or null = ambiguous key.
-    const typeKeyMap = new Map<string, string | null>();
-    const coreSpellings = Object.values(CORE_RELATION_TYPES) as string[];
-    for (const core of coreSpellings) {
-      typeKeyMap.set(relationTypeKey(core), core);
-    }
-    // One DISTINCT scan per call — ~130 rows in the live graph, trivial.
-    const existingTypes = this.db.prepare(
-      `SELECT DISTINCT relation_type FROM relations WHERE superseded_at = ''`
-    ).all() as { relation_type: string }[];
-    for (const { relation_type } of existingTypes) {
-      const key = relationTypeKey(relation_type);
-      const held = typeKeyMap.get(key);
-      if (held === undefined) {
-        typeKeyMap.set(key, relation_type);
-      } else if (held !== null && held !== relation_type && !coreSpellings.includes(held)) {
-        // Two different stored spellings share this key (pre-v13 data) and
-        // neither is core vocab — ambiguous; store future inputs verbatim.
-        // KNOWN LIMITATION (the "ambiguity ratchet", review #85): this state
-        // persists until one spelling's rows are retired — the map is rebuilt
-        // per call from the live DISTINCT scan, so the repair path is data
-        // (invalidate/supersede one spelling, e.g. via the consolidation
-        // agent), not code. Consequence is verbatim storage (pre-C2 behavior),
-        // never corruption.
-        typeKeyMap.set(key, null);
+    // Built INSIDE the IMMEDIATE transaction below, not before it (review
+    // SL-4/CR-2, #101): read outside, another server process could commit a new
+    // spelling between this scan and our INSERT, and both processes would store
+    // their own spelling. Under IMMEDIATE the scan costs no extra lock.
+    const buildTypeKeyMap = (): Map<string, string | null> => {
+      const typeKeyMap = new Map<string, string | null>();
+      const coreSpellings = Object.values(CORE_RELATION_TYPES) as string[];
+      for (const core of coreSpellings) {
+        typeKeyMap.set(relationTypeKey(core), core);
       }
-    }
+      // One DISTINCT scan per call — ~130 rows in the live graph, trivial.
+      const existingTypes = this.db.prepare(
+        `SELECT DISTINCT relation_type FROM relations WHERE superseded_at = ''`
+      ).all() as { relation_type: string }[];
+      for (const { relation_type } of existingTypes) {
+        const key = relationTypeKey(relation_type);
+        const held = typeKeyMap.get(key);
+        if (held === undefined) {
+          typeKeyMap.set(key, relation_type);
+        } else if (held !== null && held !== relation_type && !coreSpellings.includes(held)) {
+          // Two different stored spellings share this key (pre-v13 data) and
+          // neither is core vocab — ambiguous; store future inputs verbatim.
+          // KNOWN LIMITATION (the "ambiguity ratchet", review #85): this state
+          // persists until one spelling's rows are retired — the map is rebuilt
+          // per call from the live DISTINCT scan, so the repair path is data
+          // (invalidate/supersede one spelling, e.g. via the consolidation
+          // agent), not code. Consequence is verbatim storage (pre-C2 behavior),
+          // never corruption.
+          typeKeyMap.set(key, null);
+        }
+      }
+      return typeKeyMap;
+    };
 
     const results: Relation[] = [];
 
     const txn = this.db.transaction(() => {
+      const typeKeyMap = buildTypeKeyMap();
       for (const r of relations) {
         // normalizeEntityName throws on empty/separator-only — surfaces as a clean error.
         const fromNorm = normalizeEntityName(r.from);
@@ -2397,7 +2426,7 @@ export class SqliteStore implements GraphStore {
         }
       }
     });
-    txn();
+    txn.immediate(); // IMMEDIATE: the body reads before it writes; a DEFERRED txn could fail with SQLITE_BUSY_SNAPSHOT under another process's commit (#101)
 
     // Touch last_accessed_at on endpoint entities — creating a relation is a write that
     // signals the caller cares about these entities.
@@ -2484,7 +2513,7 @@ export class SqliteStore implements GraphStore {
         results.push({ entityName: o.entityName, addedObservations });
       }
     });
-    txn();
+    txn.immediate(); // IMMEDIATE: the body reads before it writes; a DEFERRED txn could fail with SQLITE_BUSY_SNAPSHOT under another process's commit (#101)
 
     // Fire-and-forget embedding generation for newly added observations (best-effort).
     // Not awaited — the MCP response returns immediately after the sync transaction.
@@ -2663,7 +2692,7 @@ export class SqliteStore implements GraphStore {
       }
       this.deleteVectorsFor(retiredIds);
     });
-    txn();
+    txn.immediate(); // IMMEDIATE: the body reads before it writes; a DEFERRED txn could fail with SQLITE_BUSY_SNAPSHOT under another process's commit (#101)
     this.maybeRunEviction();
   }
 
@@ -2734,7 +2763,7 @@ export class SqliteStore implements GraphStore {
       }
       this.deleteVectorsFor(retiredIds);
     });
-    txn();
+    txn.immediate(); // IMMEDIATE: the body reads before it writes; a DEFERRED txn could fail with SQLITE_BUSY_SNAPSHOT under another process's commit (#101)
     this.maybeRunEviction();
   }
 
@@ -2862,7 +2891,7 @@ export class SqliteStore implements GraphStore {
       }
       this.deleteVectorsFor(retiredIds);
     });
-    txn();
+    txn.immediate(); // IMMEDIATE: the body reads before it writes; a DEFERRED txn could fail with SQLITE_BUSY_SNAPSHOT under another process's commit (#101)
 
     // Fire-and-forget embedding generation for replacement observations (best-effort).
     // Not awaited — the MCP response returns immediately after the sync transaction.
@@ -5046,7 +5075,7 @@ export class SqliteStore implements GraphStore {
           updateEntity.run(now, now, id);
         }
       }
-    })();
+    }).immediate(); // IMMEDIATE: reads before it writes (#101)
 
     this.maybeRunEviction();
     return totalUpdated;
@@ -5235,16 +5264,33 @@ export class SqliteStore implements GraphStore {
     const markFired = this.db.prepare(`UPDATE prospective_triggers SET fired_at = ? WHERE id = ? AND fired_at = ''`);
     const dropVec = this.db.prepare(`DELETE FROM vec_triggers WHERE trigger_id = ?`);
 
+    // Every gate that can be decided by reading runs OUTSIDE the transaction, so a
+    // check that would fire nothing (the common case, run at every session start)
+    // returns without touching the write lock (issue #101): first the threshold
+    // (needs only the KNN rows above), then scope + pending (a read-only lookup
+    // with the same findPending statement; review SL-1: an above-threshold
+    // trigger in another project, or one another process already fired, used to
+    // reach the IMMEDIATE transaction and could wait out busy_timeout for nothing).
+    // L2 distance on unit vectors → cosine (same conversion as dedup/precedents);
+    // the gate uses the RAW cosine. A NaN similarity or threshold fails >= and is
+    // dropped (the old `< threshold → continue` loop let a NaN through; review CR-5).
+    const candidates = knnRows
+      .map(knn => ({ id: parseInt(knn.trigger_id, 10), similarity: 1 - (knn.distance * knn.distance) / 2 }))
+      .filter(c => c.similarity >= threshold)
+      .filter(c => (normalizedProject ? findPending.get(c.id, normalizedProject) : findPending.get(c.id)) !== undefined);
+    if (candidates.length === 0) return { fired: [], vectorSearchEnabled: true };
+
     const fired: FiredTrigger[] = [];
     const now = new Date().toISOString();
     // One transaction for the whole fire set — either all matched triggers are
     // marked+dropped or none are (a mid-loop DB error rolls back the batch).
+    // IMMEDIATE (issue #101): the loop reads (findPending) before it writes
+    // (markFired); a DEFERRED transaction would fail with SQLITE_BUSY_SNAPSHOT,
+    // uncaught, if another server process committed in between. IMMEDIATE takes
+    // the write lock first and waits (busy_timeout) instead. Scope and pending
+    // state are still re-read inside the transaction (findPending).
     const fireTxn = this.db.transaction(() => {
-      for (const knn of knnRows) {
-        // L2 distance on unit vectors → cosine (same conversion as dedup/precedents).
-        const similarity = 1 - (knn.distance * knn.distance) / 2;
-        if (similarity < threshold) continue;   // gate on RAW cosine
-        const id = parseInt(knn.trigger_id, 10);
+      for (const { id, similarity } of candidates) {
         const row = (normalizedProject
           ? findPending.get(id, normalizedProject)
           : findPending.get(id)) as
@@ -5265,7 +5311,7 @@ export class SqliteStore implements GraphStore {
         });
       }
     });
-    fireTxn();
+    fireTxn.immediate();
 
     return { fired, vectorSearchEnabled: true };
   }

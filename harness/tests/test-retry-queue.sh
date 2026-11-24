@@ -187,8 +187,9 @@ if grep -q "{{" "$SJOB/prompt.txt" 2>/dev/null; then false; else true; fi
 check "sessionend: no unsubstituted placeholders in prompt" $?
 grep -q "@@EXCERPT@@" "$SJOB/prompt.txt" 2>/dev/null; check "sessionend: prompt carries the run-time excerpt token" $?
 [ -s "$SJOB/excerpt.jsonl" ]; check "sessionend: excerpt persisted into the job" $?
-# Write-ahead (2026-10-05): the job is persisted BEFORE the live attempt with a
-# 1800 s delay; a FAILED attempt must pull it forward so the next tick runs it.
+# Write-ahead (2026-10-05): the job is persisted BEFORE the live attempt with the
+# write-ahead delay (600 s default); a FAILED attempt must pull it forward so the
+# next tick runs it.
 [ "$(sed -n 's/^NEXT_AFTER=//p' "$SJOB/meta" 2>/dev/null)" -le "$(date +%s)" ] 2>/dev/null; check "sessionend: failed save makes the write-ahead job due now" $?
 grep -q "SessionEndSave | STAGED:" "$HOME/.claude/hooks/hook-execution.log" 2>/dev/null; check "sessionend: STAGED line logged before the live save" $?
 L_START=$(grep -n "session=tsess2" "$HOME/.claude/hooks/hook-execution.log" | grep "START: helper running" | head -1 | cut -d: -f1)
@@ -320,8 +321,8 @@ bash "$WORKER"
 [ ! -d "$MQ_ROOT/jobs/$QID8" ]; check "yield: replay runs once the lock is free" $?
 
 # ── Re-arm: delay measured from the lock, not from staging (CR-1/SLA-1) ──
-# Hold the lock 3 s with a 1 s delay: without the re-arm the snapshot would show a
-# NEXT_AFTER already in the past when claude ran.
+# Hold the lock past the staged deadline with a 2 s delay: without the re-arm the
+# snapshot would show a NEXT_AFTER already in the past when claude ran.
 export SESSIONEND_WRITEAHEAD_DELAY=2
 snapshot_stub 0
 exec 7>"$SESSIONEND_LOCK"; flock 7

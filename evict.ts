@@ -232,7 +232,7 @@ function hardDeleteTombstoned(db: Database): number {
 
       // Finally delete the entity rows themselves.
       db.prepare(`DELETE FROM entities WHERE id IN (${placeholders})`).run(...ids);
-    })();
+    }).immediate(); // IMMEDIATE: the body reads (obsIds) before it writes; a DEFERRED txn could fail with SQLITE_BUSY_SNAPSHOT under another process's commit (#101)
 
     totalDeleted += ids.length;
   }
