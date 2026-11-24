@@ -1890,7 +1890,8 @@ export class SqliteStore implements GraphStore {
    * vec_triggers analogue of syncEmbedding — keeps a prospective trigger's
    * embedding in sync. Never throws (best-effort, mirrors syncEmbedding).
    * 'upsert' embeds trigger_text as a PASSAGE (stored side) and inserts;
-   * 'delete' removes the row (used on fire and on hard-delete). Not awaited on
+   * 'delete' removes the row. Firing and hard delete do NOT use it: they drop the
+   * row inside their own transactions. Not awaited on
    * the write paths, so the MCP response returns immediately.
    *
    * @param triggerId - the prospective_triggers.id to sync
@@ -1922,13 +1923,25 @@ export class SqliteStore implements GraphStore {
     if (!embedding) return;
 
     try {
-      this.db.prepare('DELETE FROM vec_triggers WHERE trigger_id = ?').run(String(triggerId));
-      this.db.prepare(
-        'INSERT INTO vec_triggers (embedding, trigger_id) VALUES (?, ?)'
-      ).run(
-        Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
-        String(triggerId)
-      );
+      // One IMMEDIATE transaction for check + DELETE + INSERT (issue #97, mirroring
+      // syncEmbedding): as two autocommit statements, another server process could
+      // commit between them and leave a duplicate vector row; IMMEDIATE takes the
+      // write lock first. The pending check mirrors #95: only PENDING triggers hold
+      // vectors, so a trigger fired or deleted during the embed await gets none.
+      const upsert = this.db.transaction(() => {
+        const stillPending = this.db.prepare(
+          `SELECT 1 FROM prospective_triggers WHERE id = ? AND fired_at = ''`
+        ).get(triggerId);
+        if (!stillPending) return;
+        this.db.prepare('DELETE FROM vec_triggers WHERE trigger_id = ?').run(String(triggerId));
+        this.db.prepare(
+          'INSERT INTO vec_triggers (embedding, trigger_id) VALUES (?, ?)'
+        ).run(
+          Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+          String(triggerId)
+        );
+      });
+      upsert.immediate();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`syncTriggerEmbedding upsert failed for trigger ${triggerId}: ${msg}`);
@@ -2097,18 +2110,26 @@ export class SqliteStore implements GraphStore {
       if (results.length > 0 && this.db) {
         const del = this.db.prepare('DELETE FROM vec_triggers WHERE trigger_id = ?');
         const insert = this.db.prepare('INSERT INTO vec_triggers (embedding, trigger_id) VALUES (?, ?)');
+        // Same guard as the observation sweep: a trigger fired or deleted while its
+        // batch was being embedded must not get a vector back. The read-first loop
+        // runs IMMEDIATE so a concurrent commit cannot cause SQLITE_BUSY_SNAPSHOT
+        // (see runEmbeddingSweep).
+        const isPending = this.db.prepare(`SELECT 1 FROM prospective_triggers WHERE id = ? AND fired_at = ''`);
         try {
+          let inserted = 0;
           const txn = this.db.transaction(() => {
             for (const { id, embedding } of results) {
+              if (!isPending.get(id)) continue;
               del.run(String(id));
               insert.run(
                 Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
                 String(id)
               );
+              inserted++;
             }
           });
-          txn();
-          totalEmbedded += results.length;
+          txn.immediate();
+          totalEmbedded += inserted;
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`Trigger embedding sweep batch insert failed: ${msg}`);

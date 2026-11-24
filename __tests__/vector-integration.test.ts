@@ -527,6 +527,179 @@ describe('Vector search integration', () => {
     expect(await vecRowsFor(retireText)).toBe(0); // the guard kept its vector out
   }, 30_000);
 
+  // Receives a trigger id; returns how many vec_triggers rows the shared fixture
+  // holds for it. Reads the DB file directly (the vector table itself).
+  const vecTrigRowsFor = async (triggerId: number): Promise<number> => {
+    const Database = (await import('better-sqlite3')).default;
+    const sqliteVec = await import('sqlite-vec');
+    const db = new Database(storePath, { readonly: true });
+    try {
+      sqliteVec.load(db);
+      return (db.prepare('SELECT COUNT(*) AS n FROM vec_triggers WHERE trigger_id = ?').get(String(triggerId)) as { n: number }).n;
+    } finally { db.close(); }
+  };
+
+  // Receives a trigger id; returns the first float of its vector, or null if it has
+  // none. Lets a test tell a real embedding from the constant 0.5 fill it planted.
+  const trigVecFirst = async (triggerId: number): Promise<number | null> => {
+    const Database = (await import('better-sqlite3')).default;
+    const sqliteVec = await import('sqlite-vec');
+    const db = new Database(storePath, { readonly: true });
+    try {
+      sqliteVec.load(db);
+      const row = db.prepare('SELECT embedding FROM vec_triggers WHERE trigger_id = ?').get(String(triggerId)) as { embedding: Buffer } | undefined;
+      return row ? new Float32Array(row.embedding.buffer, row.embedding.byteOffset, 1)[0] : null;
+    } finally { db.close(); }
+  };
+
+  // Issue #97 (trigger half): syncTriggerEmbedding re-checks inside an IMMEDIATE
+  // transaction that the trigger is still PENDING before inserting its vector, and
+  // deletes any existing row first. During the embed await this test (through a
+  // wrapper on the store's private embed): deletes one trigger via the real API,
+  // marks another fired with raw SQL (a vectorless trigger cannot fire through the
+  // API), and plants a stale vector row for a bystander as if another process's
+  // write had landed. Expected: no vector for the deleted or fired trigger, exactly
+  // one for the bystander (positive control + the DELETE-before-INSERT pin).
+  it('write-time trigger embed skips triggers deleted or fired during the embed await, and never duplicates', async () => {
+    const deletedText = 'trigger guard: a condition deleted while it was being embedded';
+    const firedText = 'trigger guard: a condition fired while it was being embedded';
+    const keepText = 'trigger guard: a bystander condition embedded normally';
+    const Database = (await import('better-sqlite3')).default;
+    const sqliteVec = await import('sqlite-vec');
+    const internals = store as unknown as {
+      embeddingPipeline: { embed: (text: string, kind?: 'passage' | 'query') => Promise<Float32Array | null> };
+    };
+    const pipeline = internals.embeddingPipeline;
+    const realEmbed = pipeline.embed.bind(pipeline);
+    const ids: Record<string, number> = {};
+    const acted = new Set<string>();
+    pipeline.embed = async (text, kind) => {
+      const vec = await realEmbed(text, kind);
+      if (!acted.has(text) && (text === deletedText || text === firedText || text === keepText)) {
+        // The trigger row is committed before its fire-and-forget embed starts.
+        const pending = await store.listProspectiveTriggers();
+        const t = pending.find(p => p.triggerText === text);
+        if (t) {
+          acted.add(text);
+          ids[text] = t.id;
+          if (text === deletedText) {
+            await store.deleteProspectiveTriggers([t.id]);
+          } else {
+            const db = new Database(storePath);
+            try {
+              sqliteVec.load(db);
+              if (text === firedText) {
+                db.prepare('UPDATE prospective_triggers SET fired_at = ? WHERE id = ?').run(new Date().toISOString(), t.id);
+              } else {
+                db.prepare('INSERT INTO vec_triggers (embedding, trigger_id) VALUES (?, ?)')
+                  .run(Buffer.from(new Float32Array(384).fill(0.5).buffer), String(t.id));
+              }
+            } finally { db.close(); }
+          }
+        }
+      }
+      return vec;
+    };
+    // Every trigger this test creates, deleted in the outer finally so none outlives
+    // the test on any path, including a failed precondition (review TA-6, XFA-2).
+    const created: number[] = [];
+    try {
+      try {
+        for (const text of [deletedText, firedText, keepText]) {
+          created.push((await store.setProspectiveTrigger(text, 'payload')).id);
+        }
+        const deadline = Date.now() + 10_000;
+        while (acted.size < 3 && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        await new Promise(resolve => setTimeout(resolve, 500)); // let any wrongful insert land
+      } finally {
+        pipeline.embed = realEmbed;
+      }
+      expect(acted.size).toBe(3);                              // all three acted on mid-embed
+      expect(await vecTrigRowsFor(ids[deletedText])).toBe(0);  // deleted: no vector
+      expect(await vecTrigRowsFor(ids[firedText])).toBe(0);    // fired: no vector (fired_at check)
+      expect(await vecTrigRowsFor(ids[keepText])).toBe(1);     // bystander: one row (DELETE-before-INSERT)
+      // ... and it is the real embedding, not the planted 0.5 fill: the planted row
+      // alone would satisfy the count, so this is the actual positive control (XFA-1).
+      expect(await trigVecFirst(ids[keepText])).not.toBe(0.5);
+    } finally {
+      await store.deleteProspectiveTriggers(created);
+    }
+  }, 30_000);
+
+  // Same guard in the trigger sweep: during the batch's embed await one trigger is
+  // deleted (API), one is marked fired (raw SQL), and a stale vector row is planted
+  // for the bystander. Expected: no vector for the first two, exactly one for the
+  // bystander.
+  it('trigger sweep skips triggers deleted or fired while its batch was being embedded, and never duplicates', async () => {
+    const doomedText = 'trigger sweep guard: a condition deleted mid-batch';
+    const firedText = 'trigger sweep guard: a condition fired mid-batch';
+    const keepText = 'trigger sweep guard: a bystander condition';
+    const doomed = await store.setProspectiveTrigger(doomedText, 'payload');
+    const fired = await store.setProspectiveTrigger(firedText, 'payload');
+    const keep = await store.setProspectiveTrigger(keepText, 'payload');
+    const all = [doomed.id, fired.id, keep.id];
+    // Outer try/finally: delete all three on every path, including a failed
+    // precondition (review TA-6, XFA-2).
+    try {
+      const embedDeadline = Date.now() + 10_000;
+      let total = 0;
+      while (Date.now() < embedDeadline) {
+        total = 0;
+        for (const id of all) total += await vecTrigRowsFor(id);
+        if (total === 3) break;
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      expect(total).toBe(3); // precondition: all three embedded at write time
+      // Punch all three holes so the trigger sweep selects them.
+      const Database = (await import('better-sqlite3')).default;
+      const sqliteVec = await import('sqlite-vec');
+      const db = new Database(storePath);
+      try {
+        sqliteVec.load(db);
+        const del = db.prepare('DELETE FROM vec_triggers WHERE trigger_id = ?');
+        for (const id of all) del.run(String(id));
+      } finally { db.close(); }
+      for (const id of all) expect(await vecTrigRowsFor(id)).toBe(0); // precondition: holes are real
+
+      const internals = store as unknown as {
+        embeddingPipeline: { embedBatch: (items: { id: number; content: string }[]) => Promise<unknown> };
+        runEmbeddingSweep: () => Promise<void>;
+      };
+      const pipeline = internals.embeddingPipeline;
+      const realEmbedBatch = pipeline.embedBatch.bind(pipeline);
+      let actedMidSweep = false;
+      pipeline.embedBatch = async (items) => {
+        const results = await realEmbedBatch(items);
+        if (!actedMidSweep && items.some(i => i.content === doomedText)) {
+          actedMidSweep = true;
+          await store.deleteProspectiveTriggers([doomed.id]);
+          const mid = new Database(storePath);
+          try {
+            sqliteVec.load(mid);
+            mid.prepare('UPDATE prospective_triggers SET fired_at = ? WHERE id = ?').run(new Date().toISOString(), fired.id);
+            mid.prepare('INSERT INTO vec_triggers (embedding, trigger_id) VALUES (?, ?)')
+              .run(Buffer.from(new Float32Array(384).fill(0.5).buffer), String(keep.id));
+          } finally { mid.close(); }
+        }
+        return results;
+      };
+      try {
+        await internals.runEmbeddingSweep(); // the observation sweep, then the trigger sweep
+      } finally {
+        pipeline.embedBatch = realEmbedBatch;
+      }
+      expect(actedMidSweep).toBe(true);
+      expect(await vecTrigRowsFor(doomed.id)).toBe(0); // deleted: no vector
+      expect(await vecTrigRowsFor(fired.id)).toBe(0);  // fired: no vector (fired_at check)
+      expect(await vecTrigRowsFor(keep.id)).toBe(1);   // bystander: one row (DELETE-before-INSERT)
+      expect(await trigVecFirst(keep.id)).not.toBe(0.5); // ... the real embedding, not the planted fill (XFA-1)
+    } finally {
+      await store.deleteProspectiveTriggers(all);
+    }
+  }, 30_000);
+
   // Pins both startup sweeps' "which rows lack a vector?" queries (observations in
   // runEmbeddingSweep, pending triggers in runTriggerEmbeddingSweep). Before this
   // test, nothing failed if either query matched nothing: write-time syncEmbedding
