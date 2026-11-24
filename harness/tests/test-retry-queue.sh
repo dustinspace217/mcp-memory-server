@@ -24,7 +24,7 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 HOOKS="$REPO/harness/hooks"
 
 SANDBOX="$(mktemp -d /tmp/claude/mq-test-XXXXXX 2>/dev/null || mktemp -d)"
-trap 'rm -rf "$SANDBOX"; rm -f /tmp/claude/*-tsess[0-9]*.jsonl /tmp/claude/sessionend-std*-tsess[0-9]*.txt' EXIT
+trap 'rm -rf "$SANDBOX"; rm -f /tmp/claude/*-tsess[0-9]*.jsonl /tmp/claude/sessionend-std*-tsess[0-9]*.txt /tmp/claude/last-memory-save-tsess[0-9]*.txt /tmp/claude/precompact-*-tsess[0-9]*.txt' EXIT
 
 export MQ_ROOT="$SANDBOX/queue"
 export MQ_LOGFILE="$SANDBOX/hook-execution.log"
@@ -141,9 +141,10 @@ cp "$HOOKS/pre-compact-agent.sh" "$HOOKS/sessionend-save.sh" \
 export SESSIONEND_LOCK="$SANDBOX/save.lock"
 SNAP="$SANDBOX/snap.txt"
 # The stub ALWAYS drains stdin first (real claude reads its prompt from stdin): a stub
-# that exits early leaves `sed` writing into a closed pipe, and under pipefail the
-# producer's pipeline reports 141 (SIGPIPE) instead of the stub's exit code — seen as a
-# load-dependent flake in the yield cell before this line existed.
+# that exits 0 early leaves a writer writing into a closed pipe, and under pipefail
+# the pipeline reports 141 (SIGPIPE) instead of 0 (a non-zero stub code would win, as
+# pipefail reports the rightmost non-zero status) — seen as a load-dependent flake in
+# the yield cell before this line existed.
 snapshot_stub() { # snapshot_stub EXIT-CODE [EXTRA-LINE]
     printf '#!/bin/bash\ncat >> "%s/replay-stdin.txt"\n{ echo "== run $(date +%%s) ==" ; ls "$MQ_ROOT/jobs"; cat "$MQ_ROOT"/jobs/*/meta 2>/dev/null; } >> "%s"\n%s\nexit %s\n' \
         "$SANDBOX" "$SNAP" "${2:-:}" "$1" > "$SANDBOX/bin/claude"
@@ -192,8 +193,8 @@ grep -q "@@EXCERPT@@" "$SJOB/prompt.txt" 2>/dev/null; check "sessionend: prompt 
 # next tick runs it.
 [ "$(sed -n 's/^NEXT_AFTER=//p' "$SJOB/meta" 2>/dev/null)" -le "$(date +%s)" ] 2>/dev/null; check "sessionend: failed save makes the write-ahead job due now" $?
 grep -q "SessionEndSave | STAGED:" "$HOME/.claude/hooks/hook-execution.log" 2>/dev/null; check "sessionend: STAGED line logged before the live save" $?
-L_START=$(grep -n "session=tsess2" "$HOME/.claude/hooks/hook-execution.log" | grep "START: helper running" | head -1 | cut -d: -f1)
-L_STAGED=$(grep -n "session=tsess2" "$HOME/.claude/hooks/hook-execution.log" | grep "STAGED:" | head -1 | cut -d: -f1)
+L_START=$(grep -n "session=tsess2)" "$HOME/.claude/hooks/hook-execution.log" | grep "START: helper running" | head -1 | cut -d: -f1)
+L_STAGED=$(grep -n "session=tsess2)" "$HOME/.claude/hooks/hook-execution.log" | grep "STAGED:" | head -1 | cut -d: -f1)
 [ -n "$L_START" ] && [ -n "$L_STAGED" ] && [ "$L_START" -lt "$L_STAGED" ]; check "sessionend: START line precedes STAGED (SLA-3, order pinned)" $?
 # Order pin (TA-1): the stub's snapshot must show a sessionend-save job at claude-run time,
 # and (TA-2) its NEXT_AFTER must carry the re-armed delay (> now+500 with the 600 s default).
@@ -395,7 +396,9 @@ bash "$MQ_ROOT/jobs/$QID16/job.sh" >/dev/null 2>&1; rc=$?
 # Match the fd-close on the claude INVOCATION line (the explanatory comment in job.sh
 # also contains the token, which made a bare grep vacuous — caught by mutant M19).
 grep -q 'prompt.resolved" 8>&-' "$MQ_ROOT/jobs/$QID16/job.sh"; check "scr-4: job.sh closes the lock fd for the claude child" $?
-grep -q -- '-n "[0-9a-f]\{64\}" \] && \[ "' "$MQ_ROOT/jobs/$QID16/job.sh"; check "scr-11: job.sh hash check is guarded by a non-empty baked hash" $?
+# (Since #99 FR-4 the comparison is a set lookup, `grep -Fxq <hash> <file>`; the
+# non-empty guard in front of it is what this cell pins.)
+grep -q -- '-n "[0-9a-f]\{64\}" \] && grep -Fxq "[0-9a-f]\{64\}"' "$MQ_ROOT/jobs/$QID16/job.sh"; check "scr-11: job.sh hash check is guarded by a non-empty baked hash" $?
 rm -rf "$MQ_ROOT/jobs/$QID16"
 
 # ── STA-3: the three producer branches that only execute when the job vanishes mid-run ──
@@ -451,6 +454,197 @@ STAGE=$(mq_new_staging "t-lastjob"); printf '#!/bin/bash\nexit 0\n' > "$STAGE/jo
 mq_enqueue "$STAGE" 30 && [ -d "$MQ_LAST_JOB" ] && [ "$MQ_LAST_JOB" = "$MQ_ROOT/jobs/$(basename "$STAGE")" ]
 check "lib: mq_enqueue exposes the published path in MQ_LAST_JOB (CR-4)" $?
 rm -rf "$MQ_LAST_JOB"
+
+# ── Issue #99 (2026-11-23 pre-push review FR-2..FR-5) ────────────────────
+
+# FR-2: PreCompact passes its prompt without a pipe. With the old
+# `echo "$PROMPT" | claude`, a prompt larger than the 64 KiB pipe buffer and a
+# claude that exits 0 WITHOUT reading all of stdin killed the echo with SIGPIPE;
+# pipefail reports the rightmost non-zero status, so the SUCCESSFUL save came back
+# as rc 141 and was logged as a failure. (A failing claude's own code wins anyway,
+# which is why this cell uses exit 0.)
+cp "$HOME/.claude/hooks/precompact-prompt.md" "$SANDBOX/precompact-prompt.md.orig"
+head -c 70000 /dev/zero | tr '\0' 'x' >> "$HOME/.claude/hooks/precompact-prompt.md"
+printf '#!/bin/bash\nexit 0\n' > "$SANDBOX/bin/claude"; chmod +x "$SANDBOX/bin/claude"
+printf '{"transcript_path":"%s","cwd":"%s","session_id":"tsess24","trigger":"auto"}' \
+    "$TRANSCRIPT" "$HOME/Claude" | bash "$HOME/.claude/hooks/pre-compact-agent.sh" >/dev/null
+if grep "session=tsess24)" "$HLOG" | grep -q "FAIL:"; then false; else grep "session=tsess24)" "$HLOG" | grep -q "OK: claude -p completed"; fi
+check "FR-2: a successful precompact save with a >64 KiB prompt is logged OK, not as a failure (no 141)" $?
+cp "$SANDBOX/precompact-prompt.md.orig" "$HOME/.claude/hooks/precompact-prompt.md"
+
+# FR-3: the excerpt hash is recorded on a successful live save even when the
+# write-ahead replay job could not be staged (read-only jobs dir).
+snapshot_stub 0
+chmod a-w "$MQ_ROOT/jobs"
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess21" "$TRANSCRIPT" "$HOME/Claude"
+chmod u+w "$MQ_ROOT/jobs"
+grep -Fxq "$(sha256sum <(tail -300 "$TRANSCRIPT") | cut -d' ' -f1)" "$MQ_ROOT/last-save/tsess21" 2>/dev/null && grep "session=tsess21)" "$HLOG" | grep -q "OK: save completed (no replay job was staged)"
+check "FR-3: live success records the hash even when no replay job was staged" $?
+
+# FR-4: a replay of an OLDER excerpt adds its hash to the per-session set and
+# keeps the newer one already recorded (it used to overwrite it).
+mkdir -p "$MQ_ROOT/last-save"; echo "newer-hash-already-recorded" > "$MQ_ROOT/last-save/tsess20"
+snapshot_stub 1
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess20" "$TRANSCRIPT" "$HOME/Claude"   # fails -> job due now
+snapshot_stub 0
+bash "$WORKER"
+grep -Fxq "newer-hash-already-recorded" "$MQ_ROOT/last-save/tsess20" && grep -Fxq "$(sha256sum <(tail -300 "$TRANSCRIPT") | cut -d' ' -f1)" "$MQ_ROOT/last-save/tsess20"
+check "FR-4: replay adds its hash and keeps the newer one" $?
+CUR_HASH=$(sha256sum <(tail -300 "$TRANSCRIPT") | cut -d' ' -f1)
+# Cap: a set of 25 older hashes plus this save's hash is rewritten to the last 20,
+# ending with this save's hash.
+for i in $(seq 1 25); do echo "filler-hash-$i"; done > "$MQ_ROOT/last-save/tsess25"
+snapshot_stub 0
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess25" "$TRANSCRIPT" "$HOME/Claude"
+EXPECT25=$( { seq 7 25 | sed 's/^/filler-hash-/'; echo "$CUR_HASH"; } )
+[ "$(cat "$MQ_ROOT/last-save/tsess25")" = "$EXPECT25" ]
+check "FR-4: the hash set keeps the newest 20 (oldest dropped), current hash last" $?
+# Skip: an excerpt whose hash sits anywhere in the set (not just the last line) is
+# not saved again.
+{ echo "filler-a"; echo "$CUR_HASH"; echo "filler-b"; } > "$MQ_ROOT/last-save/tsess26"
+SNAP_BEFORE26=$(grep -c "^== run" "$SNAP")
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess26" "$TRANSCRIPT" "$HOME/Claude"
+grep "session=tsess26" "$HLOG" | grep -q "SKIP: excerpt unchanged" && [ "$(grep -c "^== run" "$SNAP")" -eq "$SNAP_BEFORE26" ]
+check "FR-4: an excerpt whose hash is anywhere in the set is skipped (no claude run)" $?
+
+# FR-5: a claude that itself exits 75 must not be read as a replay "yield"
+# (which defers without counting an attempt): without the job's .yield marker the
+# worker counts it as an ordinary failed attempt (review CR-1, XFK-3).
+snapshot_stub 1
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess22" "$TRANSCRIPT" "$HOME/Claude"   # fails -> job due now
+QID22=$(grep "session=tsess22" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
+snapshot_stub 75
+RUNS22=$(grep -c "^== run" "$SNAP")
+bash "$WORKER"
+grep -q "^ATTEMPTS=1$" "$MQ_ROOT/jobs/$QID22/meta" 2>/dev/null && [ "$(grep -c "^== run" "$SNAP")" -eq $(( RUNS22 + 1 )) ]
+check "FR-5: sessionend job: claude ran and its exit 75 counts as a failed attempt, not a yield" $?
+rm -rf "${MQ_ROOT:?}/jobs/$QID22"
+snapshot_stub 1
+printf '{"transcript_path":"%s","cwd":"%s","session_id":"tsess23","trigger":"auto"}' \
+    "$TRANSCRIPT" "$HOME/Claude" | bash "$HOME/.claude/hooks/pre-compact-agent.sh" >/dev/null
+PJOB23=$(grep -l "tsess23-retry" "$MQ_ROOT"/jobs/*precompact-save*/prompt.txt 2>/dev/null | head -1 | xargs -r dirname)
+[ -n "$PJOB23" ] && sed -i 's/^NEXT_AFTER=.*/NEXT_AFTER=0/' "$PJOB23/meta"
+snapshot_stub 75
+RUNS23=$(grep -c "^== run" "$SNAP")
+bash "$WORKER"
+grep -q "^ATTEMPTS=1$" "$PJOB23/meta" 2>/dev/null && [ "$(grep -c "^== run" "$SNAP")" -eq $(( RUNS23 + 1 )) ]
+check "FR-5: precompact job: claude ran and its exit 75 counts as a failed attempt, not a yield" $?
+[ -n "$PJOB23" ] && rm -rf "$PJOB23"
+
+# SL-5: a skipped (unchanged) excerpt refreshes the set's age, so the worker's
+# 30-day prune never drops the set of a session that is still being resumed.
+echo "$CUR_HASH" > "$MQ_ROOT/last-save/tsess33"; touch -d '40 days ago' "$MQ_ROOT/last-save/tsess33"
+snapshot_stub 0
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess33" "$TRANSCRIPT" "$HOME/Claude"
+[ -n "$(find "$MQ_ROOT/last-save/tsess33" -mmin -5)" ]; check "SL-5: a skip refreshes the hash set's age" $?
+
+# TA-2: job.sh's set lookup finds a hash anywhere in the set, not just the last line:
+# a due replay whose excerpt hash sits in the MIDDLE of the set runs no claude and is
+# dequeued.
+snapshot_stub 1
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess27" "$TRANSCRIPT" "$HOME/Claude"   # fails -> job due now
+QID27=$(grep "session=tsess27)" "$HLOG" | grep -o "STAGED: .*queue=[^)]*" | sed 's/.*queue=//')
+{ echo "filler-a"; echo "$CUR_HASH"; echo "filler-b"; } > "$MQ_ROOT/last-save/tsess27"
+snapshot_stub 0
+RUNS27=$(grep -c "^== run" "$SNAP")
+bash "$WORKER"
+[ "$(grep -c "^== run" "$SNAP")" -eq "$RUNS27" ] && [ ! -d "$MQ_ROOT/jobs/$QID27" ]
+check "TA-2: job.sh finds a hash in the middle of the set (no claude run, job dequeued)" $?
+
+# TA-4: the replay path's write keeps the newest 20 (oldest dropped), like the live path.
+snapshot_stub 1
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess28" "$TRANSCRIPT" "$HOME/Claude"   # fails -> job due now
+for i in $(seq 1 25); do echo "filler-hash-$i"; done > "$MQ_ROOT/last-save/tsess28"
+snapshot_stub 0
+bash "$WORKER"
+EXPECT28=$( { seq 7 25 | sed 's/^/filler-hash-/'; echo "$CUR_HASH"; } )
+[ "$(cat "$MQ_ROOT/last-save/tsess28")" = "$EXPECT28" ]; check "TA-4: replay write keeps the newest 20, oldest dropped, current hash last" $?
+
+# TA-5 / SL-2: a live hash write that fails is logged (WARN) and the save still counts.
+chmod a-w "$MQ_ROOT/last-save"
+snapshot_stub 0
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess29" "$TRANSCRIPT" "$HOME/Claude"
+chmod u+w "$MQ_ROOT/last-save"
+grep "session=tsess29)" "$HLOG" | grep -q "WARN: save completed but its excerpt hash could not be recorded" && grep "session=tsess29)" "$HLOG" | grep -q "OK: save completed"
+check "TA-5: a failed live hash write is logged as WARN and the save still completes" $?
+
+# CR-4: an unreadable hash file aborts the write (WARN) instead of silently shrinking
+# the set to just the new hash.
+echo "older-hash" > "$MQ_ROOT/last-save/tsess30"; chmod a-r "$MQ_ROOT/last-save/tsess30"
+snapshot_stub 0
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess30" "$TRANSCRIPT" "$HOME/Claude"
+chmod u+r "$MQ_ROOT/last-save/tsess30"
+grep "session=tsess30)" "$HLOG" | grep -q "WARN: save completed but its excerpt hash could not be recorded" && [ "$(cat "$MQ_ROOT/last-save/tsess30")" = "older-hash" ]
+check "CR-4: an unreadable hash file is left intact and the failed write is logged" $?
+
+# SL-3: the replay path logs a failed hash write to the hook log (run.log is deleted
+# on success, so it cannot carry the evidence).
+snapshot_stub 1
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess31" "$TRANSCRIPT" "$HOME/Claude"   # fails -> job due now
+chmod a-w "$MQ_ROOT/last-save"
+snapshot_stub 0
+bash "$WORKER"
+chmod u+w "$MQ_ROOT/last-save"
+grep "session=tsess31)" "$HLOG" | grep -q "WARN: replay completed but its excerpt hash could not be recorded"
+check "SL-3: a failed replay hash write is logged to the hook log" $?
+
+# TA-6: the precompact replay passes its prompt through a file. With a >64 KiB prompt
+# and a claude that exits 0 without reading stdin, the old `sed | claude` gave 141
+# (pipefail) and counted a failed attempt; now the job succeeds and is dequeued.
+cp "$HOME/.claude/hooks/precompact-prompt.md" "$SANDBOX/precompact-prompt.md.orig"
+head -c 70000 /dev/zero | tr '\0' 'x' >> "$HOME/.claude/hooks/precompact-prompt.md"
+snapshot_stub 1
+printf '{"transcript_path":"%s","cwd":"%s","session_id":"tsess32","trigger":"auto"}' \
+    "$TRANSCRIPT" "$HOME/Claude" | bash "$HOME/.claude/hooks/pre-compact-agent.sh" >/dev/null
+cp "$SANDBOX/precompact-prompt.md.orig" "$HOME/.claude/hooks/precompact-prompt.md"
+PJOB32=$(grep -l "tsess32-retry" "$MQ_ROOT"/jobs/*precompact-save*/prompt.txt 2>/dev/null | head -1 | xargs -r dirname)
+[ -n "$PJOB32" ] && sed -i 's/^NEXT_AFTER=.*/NEXT_AFTER=0/' "$PJOB32/meta"
+printf '#!/bin/bash\nexit 0\n' > "$SANDBOX/bin/claude"; chmod +x "$SANDBOX/bin/claude"
+bash "$WORKER"
+[ -n "$PJOB32" ] && [ ! -d "$PJOB32" ] && [ ! -d "$MQ_ROOT/failed/$(basename "$PJOB32")" ]
+check "TA-6: precompact replay with a >64 KiB prompt and a non-reading claude succeeds (no 141)" $?
+
+# CR-1 (root fix): exit 75 counts as a yield only with the job's .yield marker. A job
+# that returns 75 without it (as claude, or run-consolidation.sh passing claude's code
+# through, could) is an ordinary failed attempt.
+STAGE=$(mq_new_staging "t-75-nomarker"); printf '#!/bin/bash\nexit 75\n' > "$STAGE/job.sh"
+mq_enqueue "$STAGE" 30
+J75="$MQ_ROOT/jobs/$(basename "$STAGE")"
+bash "$WORKER"
+grep -q "^ATTEMPTS=1$" "$J75/meta" 2>/dev/null && ! grep "$(basename "$STAGE")" "$MQ_LOGFILE" | grep -q "yielded"
+check "CR-1: exit 75 without the .yield marker is a failed attempt, not a yield" $?
+rm -rf "$J75"
+
+# XFA-1: a STALE .yield marker (a worker that died after a yield, before its
+# cleanup) must not turn a later real exit 75 into a yield: the worker clears the
+# marker before each attempt.
+STAGE=$(mq_new_staging "t-75-stale"); printf '#!/bin/bash\necho ran >> "$(dirname "$0")/ran.txt"\nexit 75\n' > "$STAGE/job.sh"
+mq_enqueue "$STAGE" 30
+JST="$MQ_ROOT/jobs/$(basename "$STAGE")"
+touch "$JST/.yield"
+bash "$WORKER"
+grep -q "^ran$" "$JST/ran.txt" 2>/dev/null && grep -q "^ATTEMPTS=1$" "$JST/meta" 2>/dev/null && [ ! -e "$JST/.yield" ] && ! grep "$(basename "$STAGE")" "$MQ_LOGFILE" | grep -q "yielded"
+check "XFA-1: a stale .yield marker is cleared before the attempt (real 75 counts as a failure)" $?
+rm -rf "$JST"
+
+# XFK-1: a job cancelled DURING its attempt (a yielded replay whose live save then
+# finished and removed it) is not logged as a failed attempt. Simulated by a job
+# that marks its yield and removes its own directory before exiting 75.
+STAGE=$(mq_new_staging "t-cancel-mid"); printf '#!/bin/bash\nD="$(cd "$(dirname "$0")" && pwd)"\ntouch "$D/.yield"\nrm -rf "$D"\nexit 75\n' > "$STAGE/job.sh"
+mq_enqueue "$STAGE" 30
+JCM=$(basename "$STAGE")
+bash "$WORKER"
+grep "$JCM" "$MQ_LOGFILE" | grep -q "cancelled during its attempt" && ! grep "$JCM" "$MQ_LOGFILE" | grep -q "WARN"
+check "XFK-1: a job cancelled mid-attempt is logged as cancelled, not as a failed attempt" $?
+
+# XFK-2: if the hash path is a DIRECTORY, the write must fail loudly (mv -T), not
+# move the temp file inside it and report success.
+mkdir -p "$MQ_ROOT/last-save/tsess34"
+snapshot_stub 0
+bash "$HOME/.claude/hooks/sessionend-save.sh" "tsess34" "$TRANSCRIPT" "$HOME/Claude"
+grep "session=tsess34)" "$HLOG" | grep -q "WARN: save completed but its excerpt hash could not be recorded"
+check "XFK-2: a hash path that is a directory makes the write fail with a WARN" $?
+rm -rf "$MQ_ROOT/last-save/tsess34"
 
 echo "---"
 echo "RESULT: $PASS passed, $FAIL failed"

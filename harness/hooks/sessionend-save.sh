@@ -106,15 +106,22 @@ if [ -f "$QUEUE_LIB" ]; then
     # reboots by the resume protocol end at EVERY shutdown, and an idle tab's
     # last-300-lines excerpt is identical night after night; without this check
     # each night re-saved the same tail as a fresh narrative (QA 2026-10-05,
-    # SFH-4). The hash of the last COMPLETED save is kept per session id under
-    # the queue root (written by the live path below and by job.sh on replay;
-    # pruned after 30 days by the worker).
+    # SFH-4). The hashes of this session's last 20 COMPLETED saves are kept per
+    # session id under the queue root (written by the live path below and by
+    # job.sh on replay; pruned after 30 days without a write or skip by the worker).
     EXCERPT_HASH=$(sha256sum "$EXCERPT" 2>/dev/null | cut -d' ' -f1)
     HASH_FILE="$MQ_ROOT/last-save/${SESSION_ID}"
     # -n guard: an empty hash (sha256sum failed) must never compare equal to a
     # missing file and skip a real save (QA 2026-10-05, SCR-11).
-    if [ -n "$EXCERPT_HASH" ] && [ -f "$HASH_FILE" ] && [ "$(cat "$HASH_FILE" 2>/dev/null)" = "$EXCERPT_HASH" ]; then
+    # The file holds the hashes of this session's last 20 completed saves, one per
+    # line (issue #99 FR-4: a single slot let a late replay of an OLDER excerpt
+    # overwrite the newer hash, so the unchanged newer excerpt was saved again).
+    if [ -n "$EXCERPT_HASH" ] && [ -f "$HASH_FILE" ] && grep -Fxq "$EXCERPT_HASH" "$HASH_FILE" 2>/dev/null; then
         log "SKIP: excerpt unchanged since this session's last completed save — nothing new to narrate"
+        # Refresh the file's age so the worker's 30-day prune never drops the set
+        # of a session that is still being resumed (review SL-5: it would then
+        # save the unchanged tail once more).
+        touch "$HASH_FILE" 2>/dev/null || true
         rm -f "$EXCERPT"
         exit 0
     fi
@@ -165,21 +172,25 @@ mkdir -p "$(dirname "${LOCK_PATH}")" || exit 1
 exec 8>"${LOCK_PATH}" || exit 1
 if ! flock -n 8; then
     echo "live session-end save holds the lock; yielding"
+    # The marker is what makes the worker treat exit 75 as a yield (issue #99
+    # FR-5): claude itself could exit 75, and that must count as a failure.
+    touch "\$DIR/.yield" 2>/dev/null
     exit 75
 fi
 # Already saved? The live path writes the excerpt hash BEFORE cancelling this
 # job, so a helper killed between those two steps leaves a job whose save is
 # complete. Checking the hash here turns the "accepted duplicate window" into a
 # no-op replay (cross-family QA 2026-10-05, XFK-1).
-if [ -n "${EXCERPT_HASH}" ] && [ "\$(cat "${MQ_ROOT}/last-save/${SESSION_ID}" 2>/dev/null)" = "${EXCERPT_HASH}" ]; then
+if [ -n "${EXCERPT_HASH}" ] && grep -Fxq "${EXCERPT_HASH}" "${MQ_ROOT}/last-save/${SESSION_ID}" 2>/dev/null; then
     echo "live save already recorded this excerpt; nothing to replay"
     touch "\$DIR/.done" 2>/dev/null || true
     exit 0
 fi
 cd "\$(cat "\$DIR/cwd" 2>/dev/null)" 2>/dev/null || cd "\$HOME/Claude" || exit 1
-# Prompt via a FILE, not a pipe: if claude exits early (usage-limit error) a pipe
-# writer dies of SIGPIPE and pipefail reports 141 instead of claude's real exit
-# code (XFK-5).
+# Prompt via a FILE, not a pipe: if claude exits 0 before reading all of stdin, a
+# pipe writer dies of SIGPIPE and pipefail reports 141, so a successful save
+# would count as a failed attempt (XFK-5; pipefail reports the rightmost non-zero
+# status, so a failing claude's own code wins either way).
 sed "s|@@EXCERPT@@|\$DIR/excerpt.jsonl|g" "\$DIR/prompt.txt" > "\$DIR/prompt.resolved" || exit 1
 CLAUDE_LIFECYCLE_AGENT=1 claude -p \\
     --permission-mode bypassPermissions \\
@@ -192,7 +203,20 @@ CLAUDE_LIFECYCLE_AGENT=1 claude -p \\
 # re-found 2026-10-05, SCR-4).
 # The narrative is the payload; the hash and the marker are bookkeeping and must
 # never turn a completed save into a failed attempt that replays it (XFK-4).
-{ mkdir -p "${MQ_ROOT}/last-save" && echo "${EXCERPT_HASH}" > "${MQ_ROOT}/last-save/${SESSION_ID}"; } 2>/dev/null || true
+# Add to the per-session set of the last 20 completed hashes (issue #99 FR-4);
+# never overwrite it, so a late replay of an older excerpt keeps the newer hash.
+# KEEP IN SYNC with the live write in this file ("Record the hash whether or
+# not ..."); this copy is frozen into every queued job (review CR-2).
+# grep exit 1 (nothing left) is fine; exit 2 (unreadable file) aborts the write
+# instead of silently shrinking the set to one entry (review CR-4). A failure is
+# logged to the hook log (baked path), since run.log is deleted on success
+# (review SL-3). Empty baked hash: nothing to record (review CR-6).
+if [ -n "${EXCERPT_HASH}" ]; then
+    if ! { mkdir -p "${MQ_ROOT}/last-save" && { if [ -f "${MQ_ROOT}/last-save/${SESSION_ID}" ]; then grep -Fxv "${EXCERPT_HASH}" "${MQ_ROOT}/last-save/${SESSION_ID}" || [ \$? -eq 1 ]; fi && echo "${EXCERPT_HASH}"; } | tail -n 20 > "${MQ_ROOT}/last-save/${SESSION_ID}.tmp.\$\$" && mv -T "${MQ_ROOT}/last-save/${SESSION_ID}.tmp.\$\$" "${MQ_ROOT}/last-save/${SESSION_ID}"; } 2>/dev/null; then
+        rm -f "${MQ_ROOT}/last-save/${SESSION_ID}.tmp.\$\$"
+        echo "\$(date -u '+%Y-%m-%d %H:%M:%S UTC') | SessionEndSave | WARN: replay completed but its excerpt hash could not be recorded — an unchanged excerpt may be saved again (session=${SESSION_ID})" >> "${LOGFILE}" 2>/dev/null || true
+    fi
+fi
 touch "\$DIR/.done" 2>/dev/null || true   # completed: a waiting helper must not save again (XFA-3/XFK-3)
 JOBEOF
         if mq_enqueue "$STAGE" 420 "$WRITEAHEAD_DELAY"; then
@@ -248,9 +272,10 @@ STDERR_FILE="/tmp/claude/sessionend-stderr-${SESSION_ID}.txt"
 # Prompt via a here-string, not `echo | claude`: bash buffers a here-string
 # itself (a temp file, or on bash >= 5.1 a pre-filled pipe for small documents)
 # before the command runs, so no writer PROCESS is left behind. With `echo |`,
-# a claude that exits before draining stdin (a usage-limit error, for instance)
-# kills the echo with SIGPIPE and pipefail reports 141 in place of claude's own
-# exit code (cross-family QA 2026-10-05, XFK-5).
+# a claude that exits 0 before draining stdin kills the echo with SIGPIPE and
+# pipefail reports 141, so a successful save is logged as a failure (pipefail
+# reports the rightmost non-zero status; a failing claude's own code wins
+# anyway) (cross-family QA 2026-10-05, XFK-5).
 CLAUDE_LIFECYCLE_AGENT=1 timeout -k 10 300 claude -p \
     --permission-mode bypassPermissions \
     --model sonnet \
@@ -263,8 +288,23 @@ if [ "$RC" -eq 0 ]; then
     # Live save won. Record the excerpt hash (SFH-4), then drop the replay job
     # and SAY what happened to it (directive 6; QA 2026-10-05, SLA-2/CR-3): a job
     # that is already gone means the worker replayed it and a duplicate may exist.
+    # Record the hash whether or not a replay job was staged (issue #99 FR-3: it
+    # was recorded only when staging worked, so a failed staging silently turned
+    # off the next shutdown's unchanged-excerpt skip). It must land BEFORE the job
+    # is cancelled (job.sh checks it). Added to the per-session set of the last 20
+    # hashes (FR-4), not overwritten.
+    if [ -n "${HASH_FILE:-}" ] && [ -n "${EXCERPT_HASH:-}" ]; then
+        # mv -T: if the path were a directory, plain mv would move the file INTO it
+        # and report success (cross-family review XFK-2).
+        # KEEP IN SYNC with the job.sh copy above (review CR-2). grep exit 1 (nothing
+        # left) is fine; exit 2 (unreadable file) aborts the write and WARNs instead
+        # of silently shrinking the set to one entry (review CR-4).
+        if ! { mkdir -p "$MQ_ROOT/last-save" && { if [ -f "$HASH_FILE" ]; then grep -Fxv "$EXCERPT_HASH" "$HASH_FILE" || [ $? -eq 1 ]; fi && echo "$EXCERPT_HASH"; } | tail -n 20 > "$HASH_FILE.tmp.$$" && mv -T "$HASH_FILE.tmp.$$" "$HASH_FILE"; } 2>/dev/null; then
+            rm -f "$HASH_FILE.tmp.$$"
+            log "WARN: save completed but its excerpt hash could not be recorded — an unchanged excerpt may be saved again at the next session end"
+        fi
+    fi
     if [ -n "$JOBDIR" ]; then
-        mkdir -p "$MQ_ROOT/last-save" && echo "$EXCERPT_HASH" > "$HASH_FILE"
         if ! mq_job_present "$JOBDIR"; then
             log "OK: save completed; replay job was already gone — the worker may have written a duplicate (queue=$(basename "$JOBDIR"))"
         elif mq_cancel "$JOBDIR"; then

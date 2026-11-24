@@ -109,13 +109,32 @@ for jobdir in "$MQ_ROOT/jobs"/*/; do
     # descendant inheriting it would hold the single-flight lock forever and
     # silently stop all future ticks (flock -n loser exits 0). QA 2026-07-02.
     echo "=== attempt $(( ATTEMPTS + 1 )) at $(date -u '+%Y-%m-%d %H:%M:%S UTC') ===" >> "$jobdir/run.log"
+    # A yield is signalled out of band (see the rc 75 branch); clear any marker a
+    # previous attempt left so only THIS attempt's yield counts.
+    rm -f "$jobdir/.yield"
     timeout -k 15 "$JOB_TIMEOUT" bash "$jobdir/job.sh" >> "$jobdir/run.log" 2>&1 9>&-
     rc=$?
+    # The job's directory can vanish DURING the attempt: a replay that yielded
+    # (touched .yield, exit 75) lets the live session-end save finish, and that
+    # save cancels the job (mq_cancel). Nothing is left to count or reschedule;
+    # without this check the marker is gone with the directory and a legitimate
+    # yield would be logged as a failed attempt (cross-family review XFK-1).
+    if [ "$rc" -ne 0 ] && [ ! -d "$jobdir" ]; then
+        log "INFO: job $jobid was cancelled during its attempt (rc=$rc) — nothing to reschedule"
+        continue
+    fi
 
     if [ "$rc" -eq 0 ]; then
         log "OK: job $jobid succeeded on attempt $(( ATTEMPTS + 1 ))"
         rm -rf "$jobdir"
-    elif [ "$rc" -eq 75 ]; then
+    elif [ "$rc" -eq 75 ] && [ -e "$jobdir/.yield" ]; then
+        rm -f "$jobdir/.yield"
+        # Exit code 75 counts as a yield ONLY with the .yield marker the job writes
+        # just before yielding (issue #99 FR-5, fixed at the root on review CR-1):
+        # a job's own child (claude, or run-consolidation.sh, which exits with
+        # claude's code) can also return 75, and without the marker that would
+        # retry every few minutes, uncounted, until the TTL. Without the marker, 75
+        # is an ordinary failed attempt (the else branch).
         # A session-end replay YIELDED because a live save holds the save lock
         # (job.sh exits 75 on `flock -n` failure). Not a failed attempt: defer
         # a few minutes without touching ATTEMPTS or the backoff, so a job that
@@ -143,9 +162,11 @@ done
 # than the queue's own layout.
 find "$MQ_ROOT/failed" -mindepth 1 -maxdepth 1 -type d -mtime +30 -exec rm -rf {} + 2>/dev/null || true
 find "$MQ_ROOT/staging" -mindepth 1 -maxdepth 1 -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true
-# last-save/<session-id> holds the excerpt hash of each session's last completed
-# save (sessionend-save.sh skips an unchanged excerpt). One small file per session
-# id, nothing else resets it, so prune after 30 days (QA 2026-10-05, SFH-4/SLA).
+# last-save/<session-id> holds the excerpt hashes of each session's last 20
+# completed saves, one per line (sessionend-save.sh skips an excerpt whose hash is
+# in the set; issue #99 FR-4). One small file per session id; a write or a skip
+# refreshes its age, so prune after 30 days untouched (QA 2026-10-05, SFH-4/SLA;
+# also removes *.tmp.PID files orphaned by a killed writer).
 find "$MQ_ROOT/last-save" -mindepth 1 -maxdepth 1 -type f -mtime +30 -delete 2>/dev/null || true
 
 exit 0

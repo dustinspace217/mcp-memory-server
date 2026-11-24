@@ -125,12 +125,16 @@ CLAUDE_LOG="/tmp/claude/precompact-claude-output-${SESSION_ID}.txt"
 # from this variable so the logged duration can never drift from the real one
 # again (QA 2026-07-02: the 240→420 bump left "after 240s" in the FAIL line).
 INTERNAL_TIMEOUT=420
-echo "$PROMPT" | CLAUDE_LIFECYCLE_AGENT=1 timeout -k 10 "$INTERNAL_TIMEOUT" claude -p \
+# Prompt via a here-string, not `echo | claude` (issue #99 FR-2; same fix as
+# sessionend-save.sh XFK-5): with `echo |` and a prompt larger than the pipe
+# buffer, a claude that exits 0 before reading all of stdin kills the echo with
+# SIGPIPE; pipefail then reports 141 and a successful save is logged as a failure.
+CLAUDE_LIFECYCLE_AGENT=1 timeout -k 10 "$INTERNAL_TIMEOUT" claude -p \
     --permission-mode bypassPermissions \
     --model sonnet \
     --no-session-persistence \
     --output-format text \
-    > "$CLAUDE_LOG" 2>/tmp/claude/precompact-stderr-${SESSION_ID}.txt
+    <<< "$PROMPT" > "$CLAUDE_LOG" 2>/tmp/claude/precompact-stderr-${SESSION_ID}.txt
 PRECOMPACT_RC=$?
 if [ "$PRECOMPACT_RC" -eq 0 ]; then
     log "OK: claude -p completed (trigger=$TRIGGER, skip_saves=$SKIP_SAVES, excerpt=$EXCERPT_LINES lines)"
@@ -196,12 +200,15 @@ if [ "$SKIP_SAVES" = "false" ] && [ "$PRECOMPACT_RC" -ne 0 ]; then
 set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$(cat "$DIR/cwd" 2>/dev/null)" 2>/dev/null || cd "$HOME/Claude" || exit 1
-sed "s|@@EXCERPT@@|$DIR/excerpt.jsonl|g" "$DIR/prompt.txt" | \
+# Prompt via a FILE, not a pipe (issue #99 FR-2): a claude that exits 0 before
+# reading all of stdin would kill a piping sed with SIGPIPE, and pipefail would
+# report 141, counting a successful save as a failed attempt.
+sed "s|@@EXCERPT@@|$DIR/excerpt.jsonl|g" "$DIR/prompt.txt" > "$DIR/prompt.resolved" || exit 1
 CLAUDE_LIFECYCLE_AGENT=1 claude -p \
     --permission-mode bypassPermissions \
     --model sonnet \
     --no-session-persistence \
-    --output-format text
+    --output-format text < "$DIR/prompt.resolved"
 JOBEOF
             if mq_enqueue "$STAGE" 420; then
                 log "QUEUED: failed save enqueued for retry (queue=$(basename "$STAGE"))"
